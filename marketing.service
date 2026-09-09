@@ -1,0 +1,16 @@
+[Unit]
+Description=Marketing Telegram bot
+After=network-online.target
+Wants=network-online.target
+# API не трогаем: только ждём сеть. Autoposter пусть живёт как жил.
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/marketing
+ExecStart=/opt/marketing/venv/bin/python main.py
+Restart=always
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
