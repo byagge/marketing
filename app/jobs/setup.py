@@ -1,16 +1,20 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 from aiogram import Bot
+from telethon import TelegramClient
 
 from app.config import get_settings
 from app.jobs import LogSink, runtime
-from app.models import Account, Chat
+from app.models import Account, Chat, Post
 from app.sender_api import SenderAPI
 from app.store import Store
 from app.tg.client import telethon_client
+from app.tg.resolve import lookup_entity
 from app.tg.scheduler import schedule_chat_posts
+from app.tg.unavailable import format_unavailable, is_chat_unavailable
 from app.utils.chat_ids import chat_ids_match
 from app.utils.entities import entities_loads
 from app.utils.minutes import period_for_interval, suggest_minute
@@ -92,6 +96,181 @@ async def _mute_schedule_on_sender(
             await api.patch_chat(sender_id, cid, active=False)
 
 
+async def _fail_unavailable(
+    store: Store,
+    account: Account,
+    chat: Chat,
+    error: str,
+    log: LogSink,
+    *,
+    max_attempts: int,
+) -> str:
+    state = await store.record_setup_fail(
+        account.id, chat.id, error, max_attempts=max_attempts
+    )
+    if state.is_abandoned:
+        await log.emit(
+            f"Пропуск «{chat.title}»: недоступен ({error}). "
+            f"Попытка {state.fail_count}/{max_attempts} — больше не пробую "
+            f"до начала недели",
+            "error",
+        )
+        return "abandoned"
+    await log.emit(
+        f"Пропуск «{chat.title}»: недоступен ({error}). "
+        f"Попытка {state.fail_count}/{max_attempts}, повтор через "
+        f"{get_settings().setup_retry_days} дн.",
+        "error",
+    )
+    return "skipped"
+
+
+async def schedule_one_chat(
+    store: Store,
+    client: TelegramClient,
+    account: Account,
+    chat: Chat,
+    posts: dict[str, Post],
+    log: LogSink,
+    *,
+    skip_abandoned: bool = False,
+) -> str:
+    """
+    Schedule posts for one chat.
+
+    Returns: ok | skipped | abandoned | config_error | stopped
+    """
+    settings = get_settings()
+    max_attempts = settings.setup_max_attempts
+
+    if skip_abandoned:
+        state = await store.get_setup_state(account.id, chat.id)
+        if state and state.is_abandoned:
+            await log.emit(
+                f"Пропуск «{chat.title}»: уже {state.fail_count} неудачных попыток "
+                f"(ждём начало недели)",
+                "error",
+            )
+            return "abandoned"
+
+    post = posts.get(chat.lang) or posts["ru"]
+    if not post.text.strip():
+        await log.emit(
+            f"Пропуск schedule «{chat.title}»: нет текста для языка {chat.lang}",
+            "error",
+        )
+        return "config_error"
+
+    text, entities = render_post(
+        post.text,
+        entities_loads(post.entities_json),
+        chat.tag,
+    )
+    slot = await store.slot_for(chat.id, account.id)
+    minute = slot.start_minute if slot else await ensure_minute(store, chat, account)
+
+    try:
+        entity = await lookup_entity(client, chat)
+        if entity is None:
+            return await _fail_unavailable(
+                store,
+                account,
+                chat,
+                "чат не найден в аккаунте",
+                log,
+                max_attempts=max_attempts,
+            )
+        result = await schedule_chat_posts(
+            client=client,
+            target=entity,
+            text=text,
+            entities=entities,
+            start_minute=minute,
+            interval_minutes=chat.interval_minutes,
+            start_hour=settings.start_hour,
+            tz=settings.tz,
+            repeat_period=settings.repeat_period or None,
+            photo_path=post.photo_path or None,
+        )
+    except Exception as e:
+        if is_chat_unavailable(e):
+            return await _fail_unavailable(
+                store,
+                account,
+                chat,
+                format_unavailable(e),
+                log,
+                max_attempts=max_attempts,
+            )
+        await log.emit(
+            f"Ошибка schedule «{chat.title}»: {type(e).__name__}: {e}",
+            "error",
+        )
+        await store.record_setup_fail(
+            account.id, chat.id, f"{type(e).__name__}: {e}", max_attempts=max_attempts
+        )
+        return "skipped"
+
+    if result["success"] < result["planned"]:
+        err = result["error"] or f"{result['success']}/{result['planned']}"
+        await log.emit(
+            f"Частично «{chat.title}»: {result['success']}/{result['planned']}"
+            + (f" | {result['error']}" if result["error"] else ""),
+            "error",
+        )
+        await store.record_setup_fail(
+            account.id, chat.id, err, max_attempts=max_attempts
+        )
+        return "skipped"
+
+    await store.record_setup_ok(account.id, chat.id)
+    tag_note = f" | тег {chat.tag}" if chat.tag.strip() else ""
+    await log.emit(
+        f"На аккаунт {account.label} настроил отправку на чат "
+        f"«{result['title']}» | :{minute:02d} | "
+        f"{result['success']} слотов | старт {result['first_time']}"
+        f"{tag_note}"
+        + (f" | очистил {result['cleared']} старых" if result["cleared"] else "")
+    )
+    return "ok"
+
+
+async def schedule_chats_batch(
+    store: Store,
+    client: TelegramClient,
+    account: Account,
+    chats: list[Chat],
+    posts: dict[str, Post],
+    log: LogSink,
+    *,
+    skip_abandoned: bool = False,
+    job_kind: str = "setup",
+) -> dict[str, list[str]]:
+    """Schedule many chats; never aborts the whole batch on a missing chat."""
+    buckets: dict[str, list[str]] = {
+        "ok": [],
+        "skipped": [],
+        "abandoned": [],
+        "config_error": [],
+    }
+    for chat in chats:
+        if runtime.cancelled(job_kind, account.id):
+            raise SetupError("Остановлено")
+        outcome = await schedule_one_chat(
+            store,
+            client,
+            account,
+            chat,
+            posts,
+            log,
+            skip_abandoned=skip_abandoned,
+        )
+        if outcome == "stopped":
+            raise SetupError("Остановлено")
+        buckets.setdefault(outcome, []).append(chat.title)
+    return buckets
+
+
 async def run_setup(store: Store, account_id: int, bot: Bot, admin_chat_id: int) -> None:
     settings = get_settings()
     account = await store.get_account(account_id)
@@ -102,7 +281,8 @@ async def run_setup(store: Store, account_id: int, bot: Bot, admin_chat_id: int)
     await store.update_account(account.id, status="running", last_error="")
 
     scheduled_ok: list[str] = []
-    scheduled_fail: list[str] = []
+    scheduled_skip: list[str] = []
+    scheduled_abandoned: list[str] = []
     sender_count = 0
     report_lines: list[str] = []
 
@@ -140,73 +320,22 @@ async def run_setup(store: Store, account_id: int, bot: Bot, admin_chat_id: int)
                     f"(@{me.username or '-'}) id={me.id}"
                     f"{' | Premium' if getattr(me, 'premium', False) else ''}"
                 )
-                for chat in schedule_chats:
-                    if runtime.cancelled("setup", account.id):
-                        raise SetupError("Остановлено")
-                    post = posts.get(chat.lang) or posts["ru"]
-                    if not post.text.strip():
-                        scheduled_fail.append(chat.title)
-                        await log.emit(
-                            f"Пропуск schedule «{chat.title}»: нет текста для языка {chat.lang}",
-                            "error",
-                        )
-                        continue
-                    text, entities = render_post(
-                        post.text,
-                        entities_loads(post.entities_json),
-                        chat.tag,
-                    )
-                    slot = await store.slot_for(chat.id, account.id)
-                    minute = (
-                        slot.start_minute
-                        if slot
-                        else await ensure_minute(store, chat, account)
-                    )
-                    try:
-                        result = await schedule_chat_posts(
-                            client=client,
-                            target=chat.tg_id,
-                            text=text,
-                            entities=entities,
-                            start_minute=minute,
-                            interval_minutes=chat.interval_minutes,
-                            start_hour=settings.start_hour,
-                            tz=settings.tz,
-                            repeat_period=settings.repeat_period or None,
-                            photo_path=post.photo_path or None,
-                        )
-                    except Exception as e:
-                        scheduled_fail.append(chat.title)
-                        await log.emit(
-                            f"Ошибка schedule «{chat.title}»: {type(e).__name__}: {e}",
-                            "error",
-                        )
-                        continue
-
-                    if result["success"] < result["planned"]:
-                        scheduled_fail.append(chat.title)
-                        await log.emit(
-                            f"Частично «{chat.title}»: {result['success']}/{result['planned']}"
-                            + (f" | {result['error']}" if result["error"] else ""),
-                            "error",
-                        )
-                        continue
-
-                    scheduled_ok.append(chat.title)
-                    tag_note = f" | тег {chat.tag}" if chat.tag.strip() else ""
-                    await log.emit(
-                        f"На аккаунт {account.label} настроил отправку на чат "
-                        f"«{result['title']}» | :{minute:02d} | "
-                        f"{result['success']} слотов | старт {result['first_time']}"
-                        f"{tag_note}"
-                        + (f" | очистил {result['cleared']} старых" if result["cleared"] else "")
-                    )
-
-        if scheduled_fail:
-            raise SetupError(
-                "Sender не запускаю: не все schedule-чаты настроены. "
-                f"Ошибки: {', '.join(scheduled_fail)}"
-            )
+                # Manual setup tries every chat, including previously abandoned.
+                buckets = await schedule_chats_batch(
+                    store,
+                    client,
+                    account,
+                    schedule_chats,
+                    posts,
+                    log,
+                    skip_abandoned=False,
+                    job_kind="setup",
+                )
+                scheduled_ok = buckets.get("ok", [])
+                scheduled_skip = buckets.get("skipped", []) + buckets.get(
+                    "config_error", []
+                )
+                scheduled_abandoned = buckets.get("abandoned", [])
 
         if account.has_sender:
             api = SenderAPI(settings.sender_api_url, settings.sender_api_key)
@@ -248,7 +377,7 @@ async def run_setup(store: Store, account_id: int, bot: Bot, admin_chat_id: int)
                 if not any(chat_ids_match(chat.chat_id, cid) for cid in live_ids):
                     await log.emit(
                         f"Sender: чат каталога «{chat.title}» ({chat.chat_id}) "
-                        f"не найден в диалогах аккаунта",
+                        f"не найден в диалогах аккаунта — пропускаю",
                         "error",
                     )
 
@@ -297,8 +426,19 @@ async def run_setup(store: Store, account_id: int, bot: Bot, admin_chat_id: int)
             report_lines.append(
                 "Настроена отправка (schedule) на чаты: " + ", ".join(scheduled_ok)
             )
+        elif schedule_chats:
+            report_lines.append("Schedule: ни один чат не настроен")
         else:
             report_lines.append("Schedule-чатов не было")
+        if scheduled_skip:
+            report_lines.append(
+                "Пропущены (повтор позже): " + ", ".join(scheduled_skip)
+            )
+        if scheduled_abandoned:
+            report_lines.append(
+                "Больше не пробую до начала недели: "
+                + ", ".join(scheduled_abandoned)
+            )
         report_lines.append(f"Sender настроен на {sender_count} чатов")
         report = "\n".join(report_lines)
         await store.finish_job(job.id, "done", report)
@@ -324,3 +464,65 @@ async def run_setup(store: Store, account_id: int, bot: Bot, admin_chat_id: int)
         current = await store.get_account(account_id)
         if current and current.status == "running":
             await store.update_account(account_id, status="idle")
+
+
+async def run_setup_chats_only(
+    store: Store,
+    account_id: int,
+    chat_pks: list[int],
+    bot: Bot | None,
+    admin_chat_id: int | None,
+    *,
+    job_kind: str = "setup_retry",
+    skip_abandoned: bool = True,
+) -> dict[str, Any]:
+    """Schedule only selected chats for an account (used by retry / weekly)."""
+    account = await store.get_account(account_id)
+    empty = {"ok": [], "skipped": [], "abandoned": [], "config_error": []}
+    if not account or not account.telethon_session or not chat_pks:
+        return empty
+
+    posts = {
+        "ru": await store.get_post(account.id, "ru"),
+        "en": await store.get_post(account.id, "en"),
+    }
+    if not posts["ru"].text.strip() and not posts["en"].text.strip():
+        return empty
+
+    chats: list[Chat] = []
+    for pk in chat_pks:
+        chat = await store.get_chat(pk)
+        if chat and chat.enabled and chat.is_schedule:
+            chats.append(chat)
+    if not chats:
+        return empty
+
+    job = await store.create_job(job_kind, account.id)
+    log = LogSink(store, job.id, bot, admin_chat_id)
+    try:
+        for chat in chats:
+            await ensure_minute(store, chat, account)
+        async with telethon_client(account.telethon_session) as client:
+            buckets = await schedule_chats_batch(
+                store,
+                client,
+                account,
+                chats,
+                posts,
+                log,
+                skip_abandoned=skip_abandoned,
+                job_kind=job_kind,
+            )
+        report = (
+            f"{account.label}: ok={len(buckets.get('ok', []))} "
+            f"skip={len(buckets.get('skipped', []))} "
+            f"abandoned={len(buckets.get('abandoned', []))}"
+        )
+        await store.finish_job(job.id, "done", report)
+        return buckets
+    except SetupError as e:
+        await store.finish_job(job.id, "cancelled" if str(e) == "Остановлено" else "error", str(e))
+        return empty
+    except Exception as e:
+        await store.finish_job(job.id, "error", f"{type(e).__name__}: {e}")
+        return empty

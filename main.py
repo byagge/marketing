@@ -17,7 +17,8 @@ from app.bot import setup_routers
 from app.bot.middlewares import AdminOnlyMiddleware
 from app.config import ensure_dirs, get_settings
 from app.context import ctx
-from app.jobs.health import run_health_all, weekly_cron_args
+from app.jobs.health import weekly_cron_args
+from app.jobs.retry_setup import run_setup_retries, run_weekly_recheck, setup_retry_cron_args
 from app.store import Store
 
 logging.basicConfig(
@@ -50,12 +51,34 @@ async def main() -> None:
     async def weekly():
         admin_id = next(iter(settings.admins), None)
         if admin_id:
-            await run_health_all(store, bot, admin_id)
+            await run_weekly_recheck(store, bot, admin_id)
 
-    scheduler.add_job(weekly, "cron", id="weekly_health", replace_existing=True, **weekly_cron_args())
+    async def daily_retry():
+        # Runs daily; only chats whose last attempt was ≥ retry_days ago are processed.
+        admin_id = next(iter(settings.admins), None)
+        await run_setup_retries(store, bot, admin_id)
+
+    scheduler.add_job(
+        weekly, "cron", id="weekly_health", replace_existing=True, **weekly_cron_args()
+    )
+    scheduler.add_job(
+        daily_retry,
+        "cron",
+        id="setup_retry_daily",
+        replace_existing=True,
+        **setup_retry_cron_args(),
+    )
     scheduler.start()
 
-    log.info("Marketing bot starting")
+    log.info(
+        "Marketing bot starting (weekly=%s %s:00, setup_retry=daily %s:00, "
+        "retry_days=%s, max_attempts=%s)",
+        settings.weekly_health_dow,
+        settings.weekly_health_hour,
+        settings.setup_retry_hour,
+        settings.setup_retry_days,
+        settings.setup_max_attempts,
+    )
     await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
 
 

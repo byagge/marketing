@@ -9,7 +9,7 @@ from typing import Any
 import aiosqlite
 
 from app.config import DB_PATH, POSTS_DIR, ensure_dirs
-from app.models import Account, Chat, Job, JobLog, MinuteSlot, Post, SenderSettings
+from app.models import Account, Chat, Job, JobLog, MinuteSlot, Post, SenderSettings, SetupState
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS accounts (
@@ -57,6 +57,17 @@ CREATE TABLE IF NOT EXISTS minute_slots (
     start_minute INTEGER NOT NULL,
     UNIQUE(chat_pk, account_id),
     UNIQUE(chat_pk, start_minute)
+);
+
+CREATE TABLE IF NOT EXISTS setup_states (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    chat_pk INTEGER NOT NULL REFERENCES chats(id) ON DELETE CASCADE,
+    status TEXT NOT NULL DEFAULT 'pending',
+    fail_count INTEGER NOT NULL DEFAULT 0,
+    last_attempt_at TEXT NOT NULL DEFAULT '',
+    last_error TEXT NOT NULL DEFAULT '',
+    UNIQUE(account_id, chat_pk)
 );
 
 CREATE TABLE IF NOT EXISTS settings (
@@ -188,6 +199,21 @@ def _chat(row: aiosqlite.Row) -> Chat:
     )
 
 
+def _setup_state(row: aiosqlite.Row) -> SetupState:
+    keys = row.keys()
+    return SetupState(
+        id=row["id"],
+        account_id=row["account_id"],
+        chat_pk=row["chat_pk"],
+        status=row["status"] or "pending",
+        fail_count=int(row["fail_count"] or 0),
+        last_attempt_at=row["last_attempt_at"] or "",
+        last_error=row["last_error"] or "",
+        account_label=(row["account_label"] if "account_label" in keys else "") or "",
+        chat_title=(row["chat_title"] if "chat_title" in keys else "") or "",
+    )
+
+
 class Store:
     def __init__(self, path: Path | None = None) -> None:
         self.path = Path(path or DB_PATH)
@@ -313,6 +339,7 @@ class Store:
     async def delete_account(self, account_id: int) -> None:
         async with self._connect() as db:
             await db.execute("PRAGMA foreign_keys = ON")
+            await db.execute("DELETE FROM setup_states WHERE account_id=?", (account_id,))
             await db.execute("DELETE FROM minute_slots WHERE account_id=?", (account_id,))
             await db.execute("DELETE FROM posts WHERE account_id=?", (account_id,))
             await db.execute("DELETE FROM accounts WHERE id=?", (account_id,))
@@ -434,9 +461,150 @@ class Store:
     async def delete_chat(self, chat_pk: int) -> None:
         async with self._connect() as db:
             await db.execute("PRAGMA foreign_keys = ON")
+            await db.execute("DELETE FROM setup_states WHERE chat_pk=?", (chat_pk,))
             await db.execute("DELETE FROM minute_slots WHERE chat_pk=?", (chat_pk,))
             await db.execute("DELETE FROM chats WHERE id=?", (chat_pk,))
             await db.commit()
+
+    async def get_setup_state(self, account_id: int, chat_pk: int) -> SetupState | None:
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                "SELECT s.*, COALESCE(a.label,'') AS account_label, "
+                "COALESCE(c.title,'') AS chat_title "
+                "FROM setup_states s "
+                "LEFT JOIN accounts a ON a.id=s.account_id "
+                "LEFT JOIN chats c ON c.id=s.chat_pk "
+                "WHERE s.account_id=? AND s.chat_pk=?",
+                (account_id, chat_pk),
+            )
+            row = await cur.fetchone()
+        return _setup_state(row) if row else None
+
+    async def record_setup_ok(self, account_id: int, chat_pk: int) -> SetupState:
+        now = _now()
+        async with self._connect() as db:
+            await db.execute(
+                "INSERT INTO setup_states(account_id, chat_pk, status, fail_count, "
+                "last_attempt_at, last_error) VALUES(?, ?, 'ok', 0, ?, '') "
+                "ON CONFLICT(account_id, chat_pk) DO UPDATE SET "
+                "status='ok', fail_count=0, last_attempt_at=excluded.last_attempt_at, "
+                "last_error=''",
+                (account_id, chat_pk, now),
+            )
+            await db.commit()
+        state = await self.get_setup_state(account_id, chat_pk)
+        assert state is not None
+        return state
+
+    async def record_setup_fail(
+        self,
+        account_id: int,
+        chat_pk: int,
+        error: str,
+        *,
+        max_attempts: int = 3,
+    ) -> SetupState:
+        now = _now()
+        existing = await self.get_setup_state(account_id, chat_pk)
+        fail_count = (existing.fail_count if existing else 0) + 1
+        status = "abandoned" if fail_count >= max_attempts else "pending"
+        async with self._connect() as db:
+            await db.execute(
+                "INSERT INTO setup_states(account_id, chat_pk, status, fail_count, "
+                "last_attempt_at, last_error) VALUES(?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(account_id, chat_pk) DO UPDATE SET "
+                "status=excluded.status, fail_count=excluded.fail_count, "
+                "last_attempt_at=excluded.last_attempt_at, last_error=excluded.last_error",
+                (account_id, chat_pk, status, fail_count, now, (error or "")[:500]),
+            )
+            await db.commit()
+        state = await self.get_setup_state(account_id, chat_pk)
+        assert state is not None
+        return state
+
+    async def list_setup_states(
+        self,
+        account_id: int | None = None,
+        *,
+        statuses: list[str] | None = None,
+    ) -> list[SetupState]:
+        sql = (
+            "SELECT s.*, COALESCE(a.label,'') AS account_label, "
+            "COALESCE(c.title,'') AS chat_title "
+            "FROM setup_states s "
+            "LEFT JOIN accounts a ON a.id=s.account_id "
+            "LEFT JOIN chats c ON c.id=s.chat_pk "
+            "WHERE 1=1"
+        )
+        args: list[Any] = []
+        if account_id is not None:
+            sql += " AND s.account_id=?"
+            args.append(account_id)
+        if statuses:
+            placeholders = ",".join("?" for _ in statuses)
+            sql += f" AND s.status IN ({placeholders})"
+            args.extend(statuses)
+        sql += " ORDER BY s.account_id, c.title COLLATE NOCASE"
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(sql, args)
+            return [_setup_state(r) for r in await cur.fetchall()]
+
+    async def list_due_setup_retries(
+        self,
+        *,
+        retry_days: int = 3,
+        max_attempts: int = 3,
+        now: datetime | None = None,
+    ) -> list[SetupState]:
+        """Pending setup states ready for another attempt.
+
+        - Never tried this cycle (fail_count=0 after weekly reset) → due now
+        - Already failed, last attempt ≥ retry_days ago, fail_count < max → due
+        """
+        from datetime import timedelta
+
+        moment = now or datetime.now(timezone.utc)
+        cutoff = (moment - timedelta(days=retry_days)).isoformat(timespec="seconds")
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                "SELECT s.*, COALESCE(a.label,'') AS account_label, "
+                "COALESCE(c.title,'') AS chat_title "
+                "FROM setup_states s "
+                "JOIN chats c ON c.id=s.chat_pk "
+                "LEFT JOIN accounts a ON a.id=s.account_id "
+                "WHERE s.status='pending' "
+                "AND s.fail_count < ? "
+                "AND c.enabled=1 AND c.kind='schedule' "
+                "AND ("
+                "  s.fail_count = 0 "
+                "  OR (s.last_attempt_at <> '' AND s.last_attempt_at <= ?)"
+                ") "
+                "ORDER BY s.account_id, c.title COLLATE NOCASE",
+                (max_attempts, cutoff),
+            )
+            return [_setup_state(r) for r in await cur.fetchall()]
+
+    async def reset_setup_states_for_weekly(
+        self,
+        *,
+        include_abandoned: bool = True,
+    ) -> int:
+        """Clear fail counters so weekly pass can retry missing chats again."""
+        statuses = ["pending"]
+        if include_abandoned:
+            statuses.append("abandoned")
+        placeholders = ",".join("?" for _ in statuses)
+        async with self._connect() as db:
+            cur = await db.execute(
+                f"UPDATE setup_states SET status='pending', fail_count=0, "
+                f"last_error='' WHERE status IN ({placeholders})",
+                statuses,
+            )
+            await db.commit()
+            return int(cur.rowcount or 0)
 
     async def slots_for_chat(self, chat_pk: int) -> list[MinuteSlot]:
         async with self._connect() as db:

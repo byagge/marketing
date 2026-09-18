@@ -102,7 +102,7 @@ async def send_scheduled_post(
 
 async def schedule_chat_posts(
     client: TelegramClient,
-    target: int | str,
+    target: int | str | Any,
     text: str,
     entities: list[dict[str, Any]] | None,
     start_minute: int,
@@ -115,7 +115,11 @@ async def schedule_chat_posts(
     clear_existing: bool = True,
     pause: float = 0.7,
 ) -> dict[str, Any]:
-    entity = await client.get_entity(target)
+    # Accept a resolved Telethon entity or a raw id/username.
+    if isinstance(target, (int, str)):
+        entity = await client.get_entity(target)
+    else:
+        entity = target
     title = (
         getattr(entity, "title", None)
         or getattr(entity, "username", None)

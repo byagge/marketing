@@ -89,6 +89,29 @@ def _looks_like_tg_id(value: str) -> bool:
 
 
 @dataclass
+class SetupState:
+    """Per account×chat schedule setup progress for missing/unavailable chats."""
+
+    id: int
+    account_id: int
+    chat_pk: int
+    status: str = "pending"  # ok | pending | abandoned
+    fail_count: int = 0
+    last_attempt_at: str = ""
+    last_error: str = ""
+    account_label: str = ""
+    chat_title: str = ""
+
+    @property
+    def is_ok(self) -> bool:
+        return self.status == "ok"
+
+    @property
+    def is_abandoned(self) -> bool:
+        return self.status == "abandoned"
+
+
+@dataclass
 class MinuteSlot:
     id: int
     chat_pk: int

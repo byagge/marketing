@@ -3,6 +3,7 @@ from __future__ import annotations
 from telethon import TelegramClient, utils
 
 from app.models import Chat
+from app.tg.resolve import lookup_entity
 from app.tg.scheduler import fetch_scheduled
 from app.utils.schedule import posts_count_for_interval
 
@@ -17,7 +18,9 @@ async def check_schedule_chats(
             continue
         expected = posts_count_for_interval(chat.interval_minutes)
         try:
-            entity = await client.get_entity(chat.tg_id)
+            entity = await lookup_entity(client, chat)
+            if entity is None:
+                raise ValueError("чат не найден в аккаунте")
             scheduled = await fetch_scheduled(client, entity)
             count = len(scheduled)
             if count == 0:

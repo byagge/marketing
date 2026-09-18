@@ -36,6 +36,11 @@ class Settings(BaseSettings):
     weekly_health_dow: str = "mon"
     weekly_health_hour: int = 10
 
+    # Retry schedule setup for chats the account cannot access yet
+    setup_retry_days: int = 3
+    setup_max_attempts: int = 3
+    setup_retry_hour: int = 11
+
     @property
     def admins(self) -> set[int]:
         ids: set[int] = set()
