@@ -5,6 +5,7 @@ from app.bot.handlers.online_settings import router as online_router
 from app.bot.handlers.ops import router as ops_router
 from app.bot.handlers.posts import router as posts_router
 from app.bot.handlers.sender import router as sender_router
+from app.bot.handlers.session_maker import router as session_maker_router
 from app.bot.handlers.table import router as table_router
 
 __all__ = [
@@ -15,5 +16,6 @@ __all__ = [
     "ops_router",
     "posts_router",
     "sender_router",
+    "session_maker_router",
     "table_router",
 ]

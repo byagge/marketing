@@ -45,6 +45,10 @@ async def cmd_panel(message: Message, state: FSMContext) -> None:
 @router.message(F.text == BTN_CANCEL)
 @router.message(F.text.casefold() == "отмена")
 async def cmd_cancel(message: Message, state: FSMContext) -> None:
+    from session_maker.pending import clear_pending
+
+    if message.from_user:
+        await clear_pending(message.from_user.id)
     if await state.get_state() is None:
         await message.answer(
             prompt_html("Отмена", "Нет активного ввода — нечего отменять."),
@@ -63,12 +67,20 @@ async def cmd_cancel(message: Message, state: FSMContext) -> None:
 
 @router.callback_query(MenuCB.filter(F.a == "home"))
 async def cb_home(query: CallbackQuery, state: FSMContext) -> None:
+    from session_maker.pending import clear_pending
+
+    if query.from_user:
+        await clear_pending(query.from_user.id)
     await state.clear()
     await show_home(query)
 
 
 @router.callback_query(MenuCB.filter(F.a == "cancel"))
 async def cb_cancel(query: CallbackQuery, state: FSMContext) -> None:
+    from session_maker.pending import clear_pending
+
+    if query.from_user:
+        await clear_pending(query.from_user.id)
     await state.clear()
     await show_home(query)
 

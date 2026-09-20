@@ -90,8 +90,22 @@ def main_menu() -> InlineKeyboardMarkup:
             [ib("Настройка", "setup", icon="robot"), ib("Чаты", "chats", icon="users")],
             [ib("Таблица", "table", icon="clock"), ib("Sender", "sender", icon="link")],
             [ib("Аккаунты", "accounts", icon="user"), ib("Online", "online", icon="star")],
+            [ib("Session", "mk_session", icon="inbox")],
             [ib("Отчёты", "reports", icon="chart"), ib("Проверка", "health", icon="search")],
             [ib("Инфо", "info", icon="info")],
+        ]
+    )
+
+
+def session_kind_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                ib("Telethon", "mk_tl", icon="lock"),
+                ib("Pyrogram", "mk_pg", icon="monitor"),
+            ],
+            [ib(BTN_CANCEL, "cancel", icon="block")],
+            home_row(),
         ]
     )
 

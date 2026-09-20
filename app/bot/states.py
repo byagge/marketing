@@ -43,3 +43,11 @@ class EditSettings(StatesGroup):
 
 class LeaveFSM(StatesGroup):
     confirm = State()
+
+
+class MakeSession(StatesGroup):
+    kind = State()
+    name = State()
+    phone = State()
+    code = State()
+    password = State()
