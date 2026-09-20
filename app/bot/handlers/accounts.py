@@ -11,6 +11,7 @@ from aiogram.types import CallbackQuery, Message
 from app.bot.keyboards import MenuCB, account_kb, accounts_kb, cancel_kb, confirm_kb
 from app.bot.render import ask_input, finish_input, safe_edit
 from app.bot.states import AccountFile, AddAccount
+from app.ui.emoji import pe
 from app.ui.screens import account_html, accounts_html, prompt_html
 from app.config import SESSIONS_DIR
 from app.context import ctx
@@ -157,6 +158,7 @@ async def on_new_label(message: Message, state: FSMContext) -> None:
                 user_id=info["user_id"],
                 username=info["username"],
                 phone=info["phone"],
+                is_premium=1 if info.get("premium") else 0,
             )
             note = f"Telethon: вошли как {info['first_name']} (@{info['username'] or '-'})"
         except Exception as e:
@@ -217,6 +219,7 @@ async def _save_named_session(message: Message, account_id: int, slot: str) -> N
                 user_id=info["user_id"],
                 username=info["username"],
                 phone=info["phone"],
+                is_premium=1 if info.get("premium") else 0,
             )
             extra = f"\nВошли: {info['first_name']} (@{info['username'] or '-'})"
         except Exception as e:
@@ -258,10 +261,17 @@ async def cb_tok(query: CallbackQuery, callback_data: MenuCB, state: FSMContext)
     await state.update_data(account_id=callback_data.i)
     await safe_edit(
         query,
-        prompt_html("Token", "Пришлите <b>bot token</b> этого аккаунта (Autoposter API).", "link"),
+        prompt_html(
+            "Sender token",
+            "Нужен только если создаёте <b>новый</b> аккаунт в Autoposter "
+            "(вместе с Pyrogram .session).\n\n"
+            "Если аккаунт уже есть в sender — лучше нажмите "
+            "<b>Sender ID</b> и пришлите id.",
+            "link",
+        ),
         cancel_kb(),
     )
-    await ask_input(query, prompt_html("Token", "Жду token", "link"))
+    await ask_input(query, prompt_html("Token", "Жду bot token", "link"))
 
 
 @router.message(AccountFile.bot_token, F.text)
@@ -288,28 +298,87 @@ async def cb_sid(query: CallbackQuery, callback_data: MenuCB, state: FSMContext)
     await safe_edit(
         query,
         prompt_html(
-            "Autoposter ID",
-            "account_id, если аккаунт уже есть в sender.\nИли <code>-</code> чтобы очистить.",
+            "Sender ID",
+            "Пришлите <b>account_id</b> из Autoposter.\n\n"
+            f"{pe('check')} Система <b>не</b> будет заново загружать session — "
+            "подключится к уже существующему аккаунту.\n"
+            f"{pe('pin')} Токен и Pyrogram для sender не нужны.\n"
+            f"{pe('block')} Чтобы отвязать: пришлите <code>-</code>",
             "cube",
         ),
         cancel_kb(),
     )
-    await ask_input(query, prompt_html("ID", "Жду account_id", "cube"))
+    await ask_input(query, prompt_html("Sender ID", "Жду account_id", "cube"))
 
 
 @router.message(AccountFile.sender_id, F.text)
 async def on_sid(message: Message, state: FSMContext) -> None:
+    from html import escape as _esc
+
+    from app.config import get_settings
+    from app.sender_api import SenderAPI, SenderAPIError
+
     value = (message.text or "").strip()
-    if value in {"-", "0", "нет"}:
+    if value in {"-", "0", "нет", "clear", "очистить"}:
         value = ""
     data = await state.get_data()
     await state.clear()
-    acc = await ctx.store.update_account(int(data["account_id"]), sender_account_id=value)
+    if "account_id" not in data:
+        await message.answer("Сессия ввода сброшена. Откройте аккаунт снова.")
+        return
+    account_id = int(data["account_id"])
+
+    note = ""
+    if value:
+        try:
+            api = SenderAPI(get_settings().sender_api_url, get_settings().sender_api_key)
+            info = await api.get_account(value)
+            label = info.get("label") or info.get("account_id") or value
+            live = "live" if info.get("live") else "offline"
+            note = (
+                f"Связал с Autoposter: <b>{_esc(str(label))}</b> "
+                f"(<code>{_esc(value)}</code>, {live}). "
+                f"Session заново не загружается."
+            )
+        except SenderAPIError as e:
+            note = (
+                f"ID сохранён (<code>{_esc(value)}</code>), но Autoposter "
+                f"пока не ответил: {_esc(str(e))}. "
+                f"Проверьте URL/ключ API или что аккаунт существует."
+            )
+        except Exception as e:
+            note = (
+                f"ID сохранён (<code>{_esc(value)}</code>). "
+                f"Проверка API не удалась: {_esc(f'{type(e).__name__}: {e}')}"
+            )
+    else:
+        note = "Sender ID очищен."
+
+    acc = await ctx.store.update_account(account_id, sender_account_id=value)
     if not acc:
         await message.answer("Аккаунт не найден")
         return
     text, markup = await _account_payload(acc)
-    await finish_input(message, text, markup)
+    await finish_input(message, f"{note}\n\n{text}", markup)
+
+
+@router.callback_query(MenuCB.filter(F.a == "acc_online"))
+async def cb_acc_online(query: CallbackQuery, callback_data: MenuCB) -> None:
+    acc = await ctx.store.get_account(callback_data.i)
+    if not acc:
+        await query.answer("Нет аккаунта", show_alert=True)
+        return
+    if not acc.telethon_session:
+        await query.answer("Нужен Telethon session", show_alert=True)
+        return
+    new_val = 0 if acc.online_ping_enabled else 1
+    await ctx.store.update_account(acc.id, online_ping=new_val)
+    acc = await ctx.store.get_account(acc.id)
+    if not acc:
+        await query.answer("Аккаунт не найден", show_alert=True)
+        return
+    await show_account_card(query, acc)
+    await query.answer("Online ping вкл" if new_val else "Online ping выкл")
 
 
 @router.callback_query(MenuCB.filter(F.a == "acc_ren"))

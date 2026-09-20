@@ -31,6 +31,7 @@ class Settings(BaseSettings):
 
     timezone: str = "Asia/Bishkek"
     start_hour: int = 9
+    # Daily Telegram repeat for Premium accounts only (seconds). 0 = never send.
     repeat_period: int = 86400
 
     weekly_health_dow: str = "mon"
@@ -40,6 +41,23 @@ class Settings(BaseSettings):
     setup_retry_days: int = 3
     setup_max_attempts: int = 3
     setup_retry_hour: int = 11
+
+    # Non-Premium: no schedule_repeat_period — re-schedule every day before start_hour.
+    # Empty / unset → start_hour - 1 (wrapped).
+    nonpremium_reschedule_hour: int | None = None
+
+    # Keep Telethon accounts looking active (UpdateStatus online → offline).
+    # Interval ~3.5h ± 30m ≈ каждые 3–4 часа.
+    online_ping_hours: float = 3.5
+    online_ping_jitter_sec: int = 1800
+    online_hold_seconds: float = 4.0
+    online_ping_enabled: bool = True
+
+    @property
+    def nonpremium_hour(self) -> int:
+        if self.nonpremium_reschedule_hour is not None:
+            return int(self.nonpremium_reschedule_hour) % 24
+        return (int(self.start_hour) - 1) % 24
 
     @property
     def admins(self) -> set[int]:

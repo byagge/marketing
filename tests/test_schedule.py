@@ -1,7 +1,7 @@
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-from app.utils.schedule import build_schedule_times, posts_count_for_interval
+from app.utils.schedule import build_schedule_times, posts_count_for_interval, resolve_repeat_period
 
 TZ = ZoneInfo("Asia/Bishkek")
 
@@ -25,3 +25,22 @@ def test_posts_count_hour():
 
 def test_half_hour_count():
     assert posts_count_for_interval(30) == 46
+
+
+def test_resolve_repeat_period_premium_only():
+    assert resolve_repeat_period(True, 86400) == 86400
+    assert resolve_repeat_period(True, 0) is None
+    assert resolve_repeat_period(True, None) is None
+    assert resolve_repeat_period(False, 86400) is None
+    assert resolve_repeat_period(False, 0) is None
+
+
+def test_nonpremium_hour_defaults_before_start():
+    from app.config import Settings
+
+    s = Settings.model_construct(start_hour=9, nonpremium_reschedule_hour=None)
+    assert s.nonpremium_hour == 8
+    s2 = Settings.model_construct(start_hour=0, nonpremium_reschedule_hour=None)
+    assert s2.nonpremium_hour == 23
+    s3 = Settings.model_construct(start_hour=9, nonpremium_reschedule_hour=7)
+    assert s3.nonpremium_hour == 7

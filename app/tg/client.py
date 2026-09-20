@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -9,6 +10,8 @@ from telethon.tl.types import User
 
 from app.config import get_settings
 
+_session_locks: dict[str, asyncio.Lock] = {}
+
 
 def session_stem(path: str | Path) -> str:
     p = Path(path)
@@ -17,21 +20,35 @@ def session_stem(path: str | Path) -> str:
     return str(p)
 
 
+def _lock_for(session_path: str | Path) -> asyncio.Lock:
+    key = str(Path(session_stem(session_path)).resolve())
+    lock = _session_locks.get(key)
+    if lock is None:
+        lock = asyncio.Lock()
+        _session_locks[key] = lock
+    return lock
+
+
 @asynccontextmanager
 async def telethon_client(session_path: str | Path) -> AsyncIterator[TelegramClient]:
+    """Open a Telethon client; one lock per session file to avoid SQLite races."""
     settings = get_settings()
-    client = TelegramClient(
-        session_stem(session_path),
-        settings.api_id,
-        settings.api_hash,
-    )
-    await client.connect()
-    try:
-        if not await client.is_user_authorized():
-            raise RuntimeError("Session не авторизована. Загрузите валидный Telethon .session")
-        yield client
-    finally:
-        await client.disconnect()
+    lock = _lock_for(session_path)
+    async with lock:
+        client = TelegramClient(
+            session_stem(session_path),
+            settings.api_id,
+            settings.api_hash,
+        )
+        await client.connect()
+        try:
+            if not await client.is_user_authorized():
+                raise RuntimeError(
+                    "Session не авторизована. Загрузите валидный Telethon .session"
+                )
+            yield client
+        finally:
+            await client.disconnect()
 
 
 async def inspect_session(session_path: str | Path) -> dict:

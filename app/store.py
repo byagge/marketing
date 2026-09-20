@@ -9,7 +9,7 @@ from typing import Any
 import aiosqlite
 
 from app.config import DB_PATH, POSTS_DIR, ensure_dirs
-from app.models import Account, Chat, Job, JobLog, MinuteSlot, Post, SenderSettings, SetupState
+from app.models import Account, Chat, Job, JobLog, MinuteSlot, OnlinePingSettings, Post, SenderSettings, SetupState
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS accounts (
@@ -22,6 +22,8 @@ CREATE TABLE IF NOT EXISTS accounts (
     pyrogram_session TEXT NOT NULL DEFAULT '',
     sender_bot_token TEXT NOT NULL DEFAULT '',
     sender_account_id TEXT NOT NULL DEFAULT '',
+    is_premium INTEGER NOT NULL DEFAULT 0,
+    online_ping INTEGER NOT NULL DEFAULT 1,
     status TEXT NOT NULL DEFAULT 'idle',
     last_error TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL,
@@ -105,6 +107,12 @@ DEFAULT_SETTINGS = {
     "cloak_enabled": "1",
     "cloak_text": "",
     "keep_extra_ids": "",
+    "online_ping_enabled": "1",
+    "online_ping_hours": "3.5",
+    "online_ping_jitter_sec": "1800",
+    "online_hold_seconds": "4",
+    "online_ping_last_at": "",
+    "online_ping_next_at": "",
 }
 
 
@@ -166,7 +174,26 @@ async def _migrate_posts_table(db: aiosqlite.Connection) -> None:
     await db.execute("DROP TABLE posts_legacy")
 
 
+async def _migrate_accounts_premium(db: aiosqlite.Connection) -> None:
+    cur = await db.execute("PRAGMA table_info(accounts)")
+    cols = [row[1] for row in await cur.fetchall()]
+    if not cols:
+        return
+    if "is_premium" not in cols:
+        await db.execute(
+            "ALTER TABLE accounts ADD COLUMN is_premium INTEGER NOT NULL DEFAULT 0"
+        )
+    if "online_ping" not in cols:
+        await db.execute(
+            "ALTER TABLE accounts ADD COLUMN online_ping INTEGER NOT NULL DEFAULT 1"
+        )
+
+
 def _account(row: aiosqlite.Row) -> Account:
+    keys = row.keys()
+    online_ping = 1
+    if "online_ping" in keys and row["online_ping"] is not None:
+        online_ping = int(row["online_ping"])
     return Account(
         id=row["id"],
         label=row["label"],
@@ -177,6 +204,8 @@ def _account(row: aiosqlite.Row) -> Account:
         pyrogram_session=row["pyrogram_session"] or "",
         sender_bot_token=row["sender_bot_token"] or "",
         sender_account_id=row["sender_account_id"] or "",
+        is_premium=int(row["is_premium"] if "is_premium" in keys else 0) or 0,
+        online_ping=online_ping,
         status=row["status"] or "idle",
         last_error=row["last_error"] or "",
         created_at=row["created_at"] or "",
@@ -225,6 +254,7 @@ class Store:
             await db.executescript(SCHEMA)
             await db.execute("PRAGMA foreign_keys = ON")
             await _migrate_posts_table(db)
+            await _migrate_accounts_premium(db)
             for key, value in DEFAULT_SETTINGS.items():
                 await db.execute(
                     "INSERT OR IGNORE INTO settings(key, value) VALUES(?, ?)",
@@ -297,6 +327,51 @@ class Store:
                 stored = "1" if value else "0"
             await self.set_setting(mapping[key], str(stored))
         return await self.sender_settings()
+
+    async def online_ping_settings(self) -> OnlinePingSettings:
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute("SELECT key, value FROM settings")
+            rows = {r["key"]: r["value"] for r in await cur.fetchall()}
+
+        def _f(key: str, default: float) -> float:
+            try:
+                return float(rows.get(key, default))
+            except (TypeError, ValueError):
+                return default
+
+        def _i(key: str, default: int) -> int:
+            try:
+                return int(float(rows.get(key, default)))
+            except (TypeError, ValueError):
+                return default
+
+        return OnlinePingSettings(
+            enabled=str(rows.get("online_ping_enabled", "1")) not in {"0", "false", "off"},
+            hours=max(0.5, _f("online_ping_hours", 3.5)),
+            jitter_sec=max(0, _i("online_ping_jitter_sec", 1800)),
+            hold_seconds=max(0.5, _f("online_hold_seconds", 4.0)),
+            next_at=rows.get("online_ping_next_at", "") or "",
+            last_at=rows.get("online_ping_last_at", "") or "",
+        )
+
+    async def update_online_ping_settings(self, **kwargs: Any) -> OnlinePingSettings:
+        mapping = {
+            "enabled": "online_ping_enabled",
+            "hours": "online_ping_hours",
+            "jitter_sec": "online_ping_jitter_sec",
+            "hold_seconds": "online_hold_seconds",
+            "next_at": "online_ping_next_at",
+            "last_at": "online_ping_last_at",
+        }
+        for key, value in kwargs.items():
+            if key not in mapping:
+                continue
+            stored = value
+            if isinstance(value, bool):
+                stored = "1" if value else "0"
+            await self.set_setting(mapping[key], str(stored))
+        return await self.online_ping_settings()
 
     async def list_accounts(self) -> list[Account]:
         async with self._connect() as db:

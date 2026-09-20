@@ -3,7 +3,7 @@ from __future__ import annotations
 from html import escape
 
 from app.jobs import runtime
-from app.models import Account, Chat, MinuteSlot
+from app.models import Account, Chat, MinuteSlot, OnlinePingSettings
 from app.ui.emoji import pe
 from app.utils.entities import entities_loads
 from app.utils.minutes import TableFullError, format_minute, period_for_interval, suggest_minute
@@ -33,10 +33,13 @@ async def home_html(store) -> str:
 def info_html() -> str:
     return (
         f"{pe('info')} <b>Marketing</b> 1.0.0\n"
-        f"{pe('folder')} <b>Last Update:</b> 08.09.2026\n"
+        f"{pe('folder')} <b>Last Update:</b> 20.09.2026\n"
         f"{pe('at')} <b>Поддержка:</b> @arxixx\n\n"
         f"{pe('pin')} Пост задаётся отдельно у каждого аккаунта.\n"
-        f"{pe('pin')} Schedule ставится первым. Sender — когда все schedule готовы.\n"
+        f"{pe('pin')} Schedule и sender независимы: сбой чата schedule "
+        f"не блокирует sender.\n"
+        f"{pe('star')} Без Premium — без schedule_repeat; суточный cron "
+        f"переназначает слоты. Premium — Telegram daily repeat.\n"
         f"{pe('robot')} Настройка аккаунта идёт в фоне — можно открыть другой."
     )
 
@@ -69,21 +72,93 @@ def account_html(acc: Account, ru=None, en=None) -> str:
             f"\n{pe('mega')} Пост RU: {on_off(bool((ru.text or '').strip()))} | "
             f"EN: {on_off(bool((en.text or '').strip()))}"
         )
+
+    if acc.sender_account_id:
+        sender_mode = (
+            f"{pe('cube')} <b>Sender:</b> связан по ID "
+            f"<code>{escape(acc.sender_account_id)}</code>\n"
+            f"   {pe('check')} session заново <b>не</b> загружается — "
+            f"используем уже существующий аккаунт в Autoposter"
+        )
+    elif acc.pyrogram_session and acc.sender_bot_token:
+        sender_mode = (
+            f"{pe('link')} <b>Sender:</b> готов создать новый "
+            f"(Pyrogram + token)\n"
+            f"   {pe('info')} если аккаунт уже есть в Autoposter — "
+            f"лучше укажите <b>Sender ID</b>"
+        )
+    elif acc.pyrogram_session or acc.sender_bot_token:
+        missing = []
+        if not acc.pyrogram_session:
+            missing.append("Pyrogram")
+        if not acc.sender_bot_token:
+            missing.append("token")
+        sender_mode = (
+            f"{pe('link')} <b>Sender:</b> неполный "
+            f"(нужен {' + '.join(missing)} или Sender ID)"
+        )
+    else:
+        sender_mode = (
+            f"{pe('cube')} <b>Sender:</b> не задан\n"
+            f"   {pe('pin')} уже есть в Autoposter → кнопка <b>Sender ID</b>\n"
+            f"   {pe('pin')} новый → Pyrogram + <b>Sender token</b>"
+        )
+
     return (
         f"{pe('user')} <b>{escape(acc.label)}</b>\n\n"
         f"{pe('at')} {escape(uname)}\n"
         f"{pe('term')} tg_id: <code>{acc.user_id or '—'}</code>\n"
         f"{pe('bookmark')} статус: <code>{escape(acc.status)}</code>"
         f"{' ' + pe('robot') + ' в фоне' if run else ''}"
-        f"{post_line}\n"
+        f"{post_line}\n\n"
         f"{pe('lock')} Telethon: {on_off(bool(acc.telethon_session))}\n"
+        f"{pe('star')} Premium: {on_off(bool(acc.is_premium))}"
+        f"{'' if acc.is_premium else ' · суточный cron без repeat'}\n"
         f"{pe('monitor')} Pyrogram: {on_off(bool(acc.pyrogram_session))}\n"
-        f"{pe('link')} Sender token: {on_off(bool(acc.sender_bot_token))}\n"
-        f"{pe('cube')} Autoposter ID: <code>{escape(acc.sender_account_id or '—')}</code>"
+        f"{pe('up')} Online ping: {on_off(bool(acc.online_ping_enabled))}"
+        f"{'' if acc.telethon_session else ' (нужен Telethon)'}\n\n"
+        f"{sender_mode}"
         f"{err}\n\n"
-        f"{pe('info')} Пост и Leave — только этого аккаунта. "
-        f"Schedule — чаты из каталога. Sender — все остальные диалоги аккаунта."
+        f"{pe('info')} Schedule — чаты из каталога. "
+        f"Sender — все остальные диалоги аккаунта."
     )
+
+
+def online_html(cfg: OnlinePingSettings, accounts: list[Account]) -> str:
+    with_tl = [a for a in accounts if a.telethon_session]
+    on_n = sum(1 for a in with_tl if a.online_ping_enabled)
+    off_n = len(with_tl) - on_n
+    lines = [
+        f"{pe('star')} <b>Online ping</b>\n",
+        f"Кратко ставит аккаунт Online, чтобы last-seen "
+        f"не был «был месяц назад».\n",
+        f"{pe('check') if cfg.enabled else pe('block')} глобально: "
+        f"<b>{'вкл' if cfg.enabled else 'выкл'}</b>",
+        f"{pe('clock')} интервал: <b>{cfg.hours:g} ч</b> ± {cfg.jitter_sec // 60} мин",
+        f"{pe('pin')} hold Online: <b>{cfg.hold_seconds:g} с</b>",
+    ]
+    if cfg.last_at:
+        lines.append(f"{pe('bookmark')} последний: <code>{escape(cfg.last_at)}</code>")
+    if cfg.next_at:
+        lines.append(f"{pe('up')} следующий: <code>{escape(cfg.next_at)}</code>")
+    lines.append("")
+    lines.append(
+        f"{pe('user')} Telethon-аккаунты: <b>{len(with_tl)}</b> "
+        f"(ping вкл: {on_n}, выкл: {off_n})"
+    )
+    if with_tl:
+        lines.append("")
+        for acc in with_tl[:12]:
+            mark = pe("check") if acc.online_ping_enabled else pe("block")
+            lines.append(f"{mark} {escape(acc.label)}")
+        if len(with_tl) > 12:
+            lines.append(f"… и ещё {len(with_tl) - 12}")
+    lines.append("")
+    lines.append(
+        f"{pe('info')} Пер-аккаунт: карточка аккаунта → "
+        f"<b>Online ping: вкл/выкл</b>."
+    )
+    return "\n".join(lines)
 
 
 def posts_html(acc: Account, ru, en) -> str:
@@ -197,14 +272,23 @@ def setup_html() -> str:
 
 
 def setup_ask_html(acc: Account, n_sch: int, n_snd: int, ru_ok: bool = False, en_ok: bool = False) -> str:
+    if acc.sender_account_id:
+        sender_line = (
+            f"{pe('cube')} Sender: ID <code>{escape(acc.sender_account_id)}</code> "
+            f"(без повторной загрузки)"
+        )
+    elif acc.has_sender:
+        sender_line = f"{pe('link')} Sender: создаст новый в Autoposter (session+token)"
+    else:
+        sender_line = f"{pe('block')} Sender: не готов"
+
     return (
         f"{pe('robot')} Запустить настройку <b>{escape(acc.label)}</b>?\n\n"
         f"{pe('clock')} Schedule: <b>{n_sch}</b> (из каталога)\n"
-        f"{pe('mega')} Sender: остальные чаты аккаунта"
-        f"{f' + {n_snd} из каталога' if n_snd else ''}\n"
+        f"{pe('mega')} Sender-чаты каталога: <b>{n_snd}</b>\n"
         f"{pe('mega')} Пост RU: {on_off(ru_ok)} | EN: {on_off(en_ok)}\n"
         f"{pe('lock')} Telethon: {on_off(bool(acc.telethon_session))}\n"
-        f"{pe('link')} Sender готов: {on_off(acc.has_sender)}"
+        f"{sender_line}"
     )
 
 

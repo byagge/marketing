@@ -38,6 +38,7 @@ class EditSettings(StatesGroup):
     per_chat = State()
     parallel = State()
     keep_ids = State()
+    online_hours = State()
 
 
 class LeaveFSM(StatesGroup):

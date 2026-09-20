@@ -9,6 +9,7 @@ from app.config import get_settings
 from app.jobs.health import run_health_all
 from app.jobs.setup import run_setup_chats_only
 from app.store import Store
+from app.tg.client import telethon_client
 
 log = logging.getLogger("marketing.retry")
 
@@ -78,6 +79,9 @@ async def run_weekly_recheck(store: Store, bot: Bot, admin_chat_id: int) -> None
     1. Reset pending/abandoned counters so chats can be tried again
     2. Re-check every non-ok schedule chat separately
     3. Run the usual health report
+
+    Premium accounts keep Telegram daily repeat — this job does NOT wipe
+    working schedules. Non-Premium renewal is handled by the daily cron.
     """
     settings = get_settings()
     reset_n = await store.reset_setup_states_for_weekly(include_abandoned=True)
@@ -122,10 +126,101 @@ async def run_weekly_recheck(store: Store, bot: Bot, admin_chat_id: int) -> None
     await run_health_all(store, bot, admin_chat_id)
 
 
+async def run_nonpremium_daily_reschedule(
+    store: Store, bot: Bot | None, admin_chat_id: int | None
+) -> str:
+    """
+    Non-Premium accounts cannot use schedule_repeat_period (Telegram 403).
+    Each day, re-clear and re-schedule chats that previously succeeded (status=ok).
+
+    Premium accounts are skipped — their Telegram 24h repeat stays untouched.
+    Pending/abandoned chats stay with the 3-day retry and weekly jobs.
+    """
+    settings = get_settings()
+    schedule_chats = await store.list_chats(kind="schedule", enabled_only=True)
+    accounts = [a for a in await store.list_accounts() if a.telethon_session]
+    if not schedule_chats:
+        return "Суточный schedule (non-Premium): нет schedule-чатов"
+    if not accounts:
+        return "Суточный schedule (non-Premium): нет аккаунтов с Telethon"
+
+    chat_pks = [c.id for c in schedule_chats]
+    if bot and admin_chat_id:
+        try:
+            await bot.send_message(
+                admin_chat_id,
+                f"Суточный schedule (non-Premium) | проверка {len(accounts)} аккаунтов, "
+                f"{len(chat_pks)} чатов | час={settings.nonpremium_hour}:00",
+            )
+        except Exception:
+            pass
+
+    renewed = skipped_premium = 0
+    ok_n = skip_n = abandoned_n = 0
+    enabled_pks = set(chat_pks)
+    for acc in accounts:
+        try:
+            # Peek Premium first so we never wipe Premium schedules with a non-repeat grid.
+            async with telethon_client(acc.telethon_session) as client:
+                me = await client.get_me()
+                is_premium = bool(getattr(me, "premium", False))
+            await store.update_account(acc.id, is_premium=1 if is_premium else 0)
+            if is_premium:
+                skipped_premium += 1
+                continue
+
+            # Only renew chats that already scheduled successfully.
+            # Pending/abandoned stay with retry (3d) and weekly jobs.
+            ok_states = await store.list_setup_states(acc.id, statuses=["ok"])
+            renew_pks = [s.chat_pk for s in ok_states if s.chat_pk in enabled_pks]
+            if not renew_pks:
+                continue
+
+            buckets = await run_setup_chats_only(
+                store,
+                acc.id,
+                renew_pks,
+                bot,
+                admin_chat_id,
+                job_kind="setup_daily_nonpremium",
+                skip_abandoned=True,
+            )
+            renewed += 1
+            ok_n += len(buckets.get("ok", []))
+            skip_n += len(buckets.get("skipped", [])) + len(
+                buckets.get("config_error", [])
+            )
+            abandoned_n += len(buckets.get("abandoned", []))
+        except Exception as e:
+            log.exception("nonpremium daily failed for account %s: %s", acc.id, e)
+            continue
+
+    summary = (
+        f"Суточный schedule (non-Premium): обновлено аккаунтов={renewed}, "
+        f"пропуск Premium={skipped_premium}, "
+        f"чаты ок={ok_n}, пропуск={skip_n}, abandoned={abandoned_n}"
+    )
+    if bot and admin_chat_id:
+        try:
+            await bot.send_message(admin_chat_id, summary)
+        except Exception:
+            pass
+    return summary
+
+
 def setup_retry_cron_args() -> dict:
     settings = get_settings()
     return {
         "hour": settings.setup_retry_hour,
+        "minute": 0,
+        "timezone": settings.timezone,
+    }
+
+
+def nonpremium_reschedule_cron_args() -> dict:
+    settings = get_settings()
+    return {
+        "hour": settings.nonpremium_hour,
         "minute": 0,
         "timezone": settings.timezone,
     }

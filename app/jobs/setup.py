@@ -18,6 +18,7 @@ from app.tg.unavailable import format_unavailable, is_chat_unavailable
 from app.utils.chat_ids import chat_ids_match
 from app.utils.entities import entities_loads
 from app.utils.minutes import period_for_interval, suggest_minute
+from app.utils.schedule import resolve_repeat_period
 from app.utils.templates import render_post
 
 
@@ -36,17 +37,24 @@ async def ensure_minute(store: Store, chat: Chat, account: Account) -> int:
 
 
 async def ensure_sender_account(store: Store, account: Account, api: SenderAPI, log: LogSink) -> str:
-    if account.sender_account_id:
-        info = await api.get_account(account.sender_account_id)
+    sender_id = (account.sender_account_id or "").strip()
+    if sender_id:
+        await log.emit(
+            f"Sender {account.label}: использую существующий ID "
+            f"{sender_id} (без повторной загрузки session)"
+        )
+        info = await api.get_account(sender_id)
         if not info.get("live"):
             await log.emit(f"Sender {account.label}: поднимаю клиент…")
-            await api.start_account(account.sender_account_id)
-        return account.sender_account_id
+            await api.start_account(sender_id)
+        if sender_id != (account.sender_account_id or ""):
+            await store.update_account(account.id, sender_account_id=sender_id)
+        return sender_id
 
-    if not account.pyrogram_session or not account.sender_bot_token:
+    if not account.pyrogram_session or not (account.sender_bot_token or "").strip():
         raise SetupError(
-            "Для sender нужен Pyrogram .session и bot token "
-            "(или уже существующий Autoposter account_id)."
+            "Для sender укажите Sender ID (если аккаунт уже в Autoposter) "
+            "либо Pyrogram .session + bot token для создания нового."
         )
     path = Path(account.pyrogram_session)
     if not path.exists():
@@ -54,15 +62,16 @@ async def ensure_sender_account(store: Store, account: Account, api: SenderAPI, 
     await log.emit(f"Sender {account.label}: создаю аккаунт в Autoposter…")
     created = await api.create_account(
         session_bytes=path.read_bytes(),
-        bot_token=account.sender_bot_token,
+        bot_token=account.sender_bot_token.strip(),
         label=account.label,
         session_name=path.name,
     )
-    sender_id = str(created.get("account_id") or "")
-    if not sender_id:
+    created_id = str(created.get("account_id") or "").strip()
+    if not created_id:
         raise SetupError(f"Autoposter не вернул account_id: {created}")
-    await store.update_account(account.id, sender_account_id=sender_id)
-    return sender_id
+    await store.update_account(account.id, sender_account_id=created_id)
+    await log.emit(f"Sender {account.label}: создан, ID={created_id}")
+    return created_id
 
 
 def match_catalog_chat(cid: str | int | None, chats: list[Chat]) -> Chat | None:
@@ -134,6 +143,7 @@ async def schedule_one_chat(
     log: LogSink,
     *,
     skip_abandoned: bool = False,
+    is_premium: bool = False,
 ) -> str:
     """
     Schedule posts for one chat.
@@ -168,6 +178,7 @@ async def schedule_one_chat(
     )
     slot = await store.slot_for(chat.id, account.id)
     minute = slot.start_minute if slot else await ensure_minute(store, chat, account)
+    repeat_period = resolve_repeat_period(is_premium, settings.repeat_period)
 
     try:
         entity = await lookup_entity(client, chat)
@@ -189,7 +200,7 @@ async def schedule_one_chat(
             interval_minutes=chat.interval_minutes,
             start_hour=settings.start_hour,
             tz=settings.tz,
-            repeat_period=settings.repeat_period or None,
+            repeat_period=repeat_period,
             photo_path=post.photo_path or None,
         )
     except Exception as e:
@@ -225,11 +236,16 @@ async def schedule_one_chat(
 
     await store.record_setup_ok(account.id, chat.id)
     tag_note = f" | тег {chat.tag}" if chat.tag.strip() else ""
+    repeat_note = (
+        f" | repeat {repeat_period}s"
+        if repeat_period
+        else " | без repeat (не Premium — суточный cron)"
+    )
     await log.emit(
         f"На аккаунт {account.label} настроил отправку на чат "
         f"«{result['title']}» | :{minute:02d} | "
         f"{result['success']} слотов | старт {result['first_time']}"
-        f"{tag_note}"
+        f"{tag_note}{repeat_note}"
         + (f" | очистил {result['cleared']} старых" if result["cleared"] else "")
     )
     return "ok"
@@ -245,6 +261,7 @@ async def schedule_chats_batch(
     *,
     skip_abandoned: bool = False,
     job_kind: str = "setup",
+    is_premium: bool = False,
 ) -> dict[str, list[str]]:
     """Schedule many chats; never aborts the whole batch on a missing chat."""
     buckets: dict[str, list[str]] = {
@@ -264,6 +281,7 @@ async def schedule_chats_batch(
             posts,
             log,
             skip_abandoned=skip_abandoned,
+            is_premium=is_premium,
         )
         if outcome == "stopped":
             raise SetupError("Остановлено")
@@ -271,8 +289,98 @@ async def schedule_chats_batch(
     return buckets
 
 
-async def run_setup(store: Store, account_id: int, bot: Bot, admin_chat_id: int) -> None:
+async def _configure_sender(
+    store: Store,
+    account: Account,
+    posts: dict[str, Post],
+    schedule_chats: list[Chat],
+    sender_chats: list[Chat],
+    log: LogSink,
+) -> int:
+    """Configure Autoposter for this account. Returns number of enabled chats."""
     settings = get_settings()
+    api = SenderAPI(settings.sender_api_url, settings.sender_api_key)
+    sender_id = await ensure_sender_account(store, account, api, log)
+    ss = await store.sender_settings()
+    ru_text, _ = render_post(
+        posts["ru"].text,
+        entities_loads(posts["ru"].entities_json),
+        None,
+    )
+    photo_bytes = None
+    if posts["ru"].photo_path and Path(posts["ru"].photo_path).exists():
+        photo_bytes = Path(posts["ru"].photo_path).read_bytes()
+
+    await api.put_post(sender_id, ru_text, photo_bytes)
+    await log.emit(f"{account.label}: настроил пост RU этого аккаунта")
+
+    await api.put_interval(sender_id, "between", ss.between_min, ss.between_max)
+    await api.put_interval(sender_id, "cycle", ss.cycle_min, ss.cycle_max)
+    await api.put_interval(sender_id, "per_chat", ss.per_chat_min, ss.per_chat_max)
+    await api.put_parallel(sender_id, ss.parallel)
+    await log.emit(
+        f"{account.label}: настроил интервалы "
+        f"{ss.between_min}-{ss.between_max}s | parallel={ss.parallel}"
+    )
+
+    await api.put_cloak(sender_id, ss.cloak_enabled, ss.cloak_text)
+    await log.emit(
+        f"{account.label}: настроил клоакинг "
+        f"({'вкл' if ss.cloak_enabled else 'выкл'})"
+    )
+
+    live_chats = await api.list_chats(sender_id)
+    await _mute_schedule_on_sender(api, sender_id, live_chats, schedule_chats)
+
+    targets = pick_sender_live_chats(live_chats, schedule_chats)
+    live_ids = {str(c.get("chat_id") or "") for c in live_chats}
+    for chat in sender_chats:
+        if not any(chat_ids_match(chat.chat_id, cid) for cid in live_ids):
+            await log.emit(
+                f"Sender: чат каталога «{chat.title}» ({chat.chat_id}) "
+                f"не найден в диалогах аккаунта — пропускаю",
+                "error",
+            )
+
+    sender_count = 0
+    for live in targets:
+        if runtime.cancelled("setup", account.id):
+            raise SetupError("Остановлено")
+        cid = str(live.get("chat_id"))
+        catalog = match_catalog_chat(cid, sender_chats)
+        post = posts.get(catalog.lang) if catalog else posts["ru"]
+        post = post or posts["ru"]
+        text, _ = render_post(
+            post.text,
+            entities_loads(post.entities_json),
+            catalog.tag if catalog else None,
+        )
+        title = (catalog.title if catalog else None) or live.get("title") or cid
+        await api.patch_chat(
+            sender_id,
+            cid,
+            active=True,
+            mode="post",
+            text=text,
+        )
+        sender_count += 1
+        await log.emit(f"Sender: включил «{title}»")
+
+    if sender_count:
+        await api.spam_start(sender_id)
+        await _mute_schedule_on_sender(api, sender_id, live_chats, schedule_chats)
+        await log.emit(
+            f"{account.label}: sender запущен на {sender_count} чатов "
+            f"(все кроме schedule)"
+        )
+    else:
+        await log.emit(
+            f"{account.label}: sender — нет чатов кроме schedule, spam/start не вызываю"
+        )
+    return sender_count
+
+
+async def run_setup(store: Store, account_id: int, bot: Bot, admin_chat_id: int) -> None:
     account = await store.get_account(account_id)
     if not account:
         return
@@ -285,6 +393,7 @@ async def run_setup(store: Store, account_id: int, bot: Bot, admin_chat_id: int)
     scheduled_abandoned: list[str] = []
     sender_count = 0
     report_lines: list[str] = []
+    schedule_failed = False
 
     try:
         posts = {
@@ -300,8 +409,6 @@ async def run_setup(store: Store, account_id: int, bot: Bot, admin_chat_id: int)
 
         if not schedule_chats and not account.has_sender:
             raise SetupError("Нет включённых schedule-чатов и sender не готов")
-        if schedule_chats and not account.telethon_session:
-            raise SetupError("Нет Telethon session")
 
         await log.emit(
             f"Старт настройки {account.display}\n"
@@ -313,108 +420,76 @@ async def run_setup(store: Store, account_id: int, bot: Bot, admin_chat_id: int)
             await ensure_minute(store, chat, account)
 
         if schedule_chats:
-            async with telethon_client(account.telethon_session) as client:
-                me = await client.get_me()
+            if not account.telethon_session:
+                schedule_failed = True
                 await log.emit(
-                    f"Telethon: {me.first_name} "
-                    f"(@{me.username or '-'}) id={me.id}"
-                    f"{' | Premium' if getattr(me, 'premium', False) else ''}"
+                    "Нет Telethon session — schedule пропускаю, перехожу к sender",
+                    "error",
                 )
-                # Manual setup tries every chat, including previously abandoned.
-                buckets = await schedule_chats_batch(
-                    store,
-                    client,
-                    account,
-                    schedule_chats,
-                    posts,
-                    log,
-                    skip_abandoned=False,
-                    job_kind="setup",
-                )
-                scheduled_ok = buckets.get("ok", [])
-                scheduled_skip = buckets.get("skipped", []) + buckets.get(
-                    "config_error", []
-                )
-                scheduled_abandoned = buckets.get("abandoned", [])
-
-        if account.has_sender:
-            api = SenderAPI(settings.sender_api_url, settings.sender_api_key)
-            sender_id = await ensure_sender_account(store, account, api, log)
-            ss = await store.sender_settings()
-            ru_text, _ = render_post(
-                posts["ru"].text,
-                entities_loads(posts["ru"].entities_json),
-                None,
-            )
-            photo_bytes = None
-            if posts["ru"].photo_path and Path(posts["ru"].photo_path).exists():
-                photo_bytes = Path(posts["ru"].photo_path).read_bytes()
-
-            await api.put_post(sender_id, ru_text, photo_bytes)
-            await log.emit(f"{account.label}: настроил пост RU этого аккаунта")
-
-            await api.put_interval(sender_id, "between", ss.between_min, ss.between_max)
-            await api.put_interval(sender_id, "cycle", ss.cycle_min, ss.cycle_max)
-            await api.put_interval(sender_id, "per_chat", ss.per_chat_min, ss.per_chat_max)
-            await api.put_parallel(sender_id, ss.parallel)
-            await log.emit(
-                f"{account.label}: настроил интервалы "
-                f"{ss.between_min}-{ss.between_max}s | parallel={ss.parallel}"
-            )
-
-            await api.put_cloak(sender_id, ss.cloak_enabled, ss.cloak_text)
-            await log.emit(
-                f"{account.label}: настроил клоакинг "
-                f"({'вкл' if ss.cloak_enabled else 'выкл'})"
-            )
-
-            live_chats = await api.list_chats(sender_id)
-            await _mute_schedule_on_sender(api, sender_id, live_chats, schedule_chats)
-
-            targets = pick_sender_live_chats(live_chats, schedule_chats)
-            live_ids = {str(c.get("chat_id") or "") for c in live_chats}
-            for chat in sender_chats:
-                if not any(chat_ids_match(chat.chat_id, cid) for cid in live_ids):
+            else:
+                try:
+                    async with telethon_client(account.telethon_session) as client:
+                        me = await client.get_me()
+                        is_premium = bool(getattr(me, "premium", False))
+                        await store.update_account(
+                            account.id, is_premium=1 if is_premium else 0
+                        )
+                        account = await store.get_account(account.id) or account
+                        await log.emit(
+                            f"Telethon: {me.first_name} "
+                            f"(@{me.username or '-'}) id={me.id}"
+                            f"{' | Premium' if is_premium else ' | без Premium'}"
+                        )
+                        if not is_premium:
+                            await log.emit(
+                                "Без Premium: schedule без schedule_repeat_period; "
+                                "суточный cron переназначит слоты"
+                            )
+                        # Manual setup tries every chat, including previously abandoned.
+                        buckets = await schedule_chats_batch(
+                            store,
+                            client,
+                            account,
+                            schedule_chats,
+                            posts,
+                            log,
+                            skip_abandoned=False,
+                            job_kind="setup",
+                            is_premium=is_premium,
+                        )
+                        scheduled_ok = buckets.get("ok", [])
+                        scheduled_skip = buckets.get("skipped", []) + buckets.get(
+                            "config_error", []
+                        )
+                        scheduled_abandoned = buckets.get("abandoned", [])
+                except SetupError:
+                    raise
+                except Exception as e:
+                    schedule_failed = True
                     await log.emit(
-                        f"Sender: чат каталога «{chat.title}» ({chat.chat_id}) "
-                        f"не найден в диалогах аккаунта — пропускаю",
+                        f"Schedule оборвался ({type(e).__name__}: {e}) — "
+                        f"sender всё равно настрою, если готов",
                         "error",
                     )
 
-            for live in targets:
-                if runtime.cancelled("setup", account.id):
-                    raise SetupError("Остановлено")
-                cid = str(live.get("chat_id"))
-                catalog = match_catalog_chat(cid, sender_chats)
-                post = posts.get(catalog.lang) if catalog else posts["ru"]
-                post = post or posts["ru"]
-                text, _ = render_post(
-                    post.text,
-                    entities_loads(post.entities_json),
-                    catalog.tag if catalog else None,
+        if account.has_sender:
+            try:
+                sender_count = await _configure_sender(
+                    store,
+                    account,
+                    posts,
+                    schedule_chats,
+                    sender_chats,
+                    log,
                 )
-                title = (catalog.title if catalog else None) or live.get("title") or cid
-                await api.patch_chat(
-                    sender_id,
-                    cid,
-                    active=True,
-                    mode="post",
-                    text=text,
-                )
-                sender_count += 1
-                await log.emit(f"Sender: включил «{title}»")
-
-            if sender_count:
-                await api.spam_start(sender_id)
-                await _mute_schedule_on_sender(api, sender_id, live_chats, schedule_chats)
-                await log.emit(
-                    f"{account.label}: sender запущен на {sender_count} чатов "
-                    f"(все кроме schedule)"
-                )
-            else:
-                await log.emit(
-                    f"{account.label}: sender — нет чатов кроме schedule, spam/start не вызываю"
-                )
+            except SetupError:
+                raise
+            except Exception as e:
+                err = f"{type(e).__name__}: {e}"
+                await log.emit(f"Ошибка sender {account.label}: {err}", "error")
+                if not scheduled_ok and schedule_failed:
+                    raise SetupError(f"Schedule и sender не настроены: {err}") from e
+                raise SetupError(f"Sender не настроен: {err}") from e
         elif sender_chats:
             await log.emit(
                 f"{account.label}: в каталоге есть sender-чаты, но sender не готов — пропускаю",
@@ -422,6 +497,12 @@ async def run_setup(store: Store, account_id: int, bot: Bot, admin_chat_id: int)
             )
 
         report_lines.append(f"Аккаунт: {account.display}")
+        if account.has_telethon:
+            report_lines.append(
+                "Premium: да"
+                if account.has_premium
+                else "Premium: нет (без repeat, суточный cron)"
+            )
         if scheduled_ok:
             report_lines.append(
                 "Настроена отправка (schedule) на чаты: " + ", ".join(scheduled_ok)
@@ -476,7 +557,7 @@ async def run_setup_chats_only(
     job_kind: str = "setup_retry",
     skip_abandoned: bool = True,
 ) -> dict[str, Any]:
-    """Schedule only selected chats for an account (used by retry / weekly)."""
+    """Schedule only selected chats for an account (used by retry / weekly / daily)."""
     account = await store.get_account(account_id)
     empty = {"ok": [], "skipped": [], "abandoned": [], "config_error": []}
     if not account or not account.telethon_session or not chat_pks:
@@ -503,6 +584,10 @@ async def run_setup_chats_only(
         for chat in chats:
             await ensure_minute(store, chat, account)
         async with telethon_client(account.telethon_session) as client:
+            me = await client.get_me()
+            is_premium = bool(getattr(me, "premium", False))
+            await store.update_account(account.id, is_premium=1 if is_premium else 0)
+            account = await store.get_account(account.id) or account
             buckets = await schedule_chats_batch(
                 store,
                 client,
@@ -512,11 +597,13 @@ async def run_setup_chats_only(
                 log,
                 skip_abandoned=skip_abandoned,
                 job_kind=job_kind,
+                is_premium=is_premium,
             )
         report = (
             f"{account.label}: ok={len(buckets.get('ok', []))} "
             f"skip={len(buckets.get('skipped', []))} "
-            f"abandoned={len(buckets.get('abandoned', []))}"
+            f"abandoned={len(buckets.get('abandoned', []))} "
+            f"premium={int(account.has_premium)}"
         )
         await store.finish_job(job.id, "done", report)
         return buckets

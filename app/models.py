@@ -15,6 +15,8 @@ class Account:
     pyrogram_session: str = ""
     sender_bot_token: str = ""
     sender_account_id: str = ""
+    is_premium: int = 0
+    online_ping: int = 1
     status: str = "idle"
     last_error: str = ""
     created_at: str = ""
@@ -30,10 +32,18 @@ class Account:
         return bool(self.telethon_session)
 
     @property
+    def has_premium(self) -> bool:
+        return bool(self.is_premium)
+
+    @property
+    def online_ping_enabled(self) -> bool:
+        return bool(self.online_ping)
+
+    @property
     def has_sender(self) -> bool:
-        return bool(self.sender_account_id) or (
-            bool(self.pyrogram_session) and bool(self.sender_bot_token)
-        )
+        if (self.sender_account_id or "").strip():
+            return True
+        return bool(self.pyrogram_session) and bool((self.sender_bot_token or "").strip())
 
 
 @dataclass
@@ -155,3 +165,13 @@ class SenderSettings:
     cloak_text: str = ""
     keep_extra_ids: str = ""
     extra: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class OnlinePingSettings:
+    enabled: bool = True
+    hours: float = 3.5
+    jitter_sec: int = 1800
+    hold_seconds: float = 4.0
+    next_at: str = ""
+    last_at: str = ""

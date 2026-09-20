@@ -89,7 +89,7 @@ def main_menu() -> InlineKeyboardMarkup:
         inline_keyboard=[
             [ib("Настройка", "setup", icon="robot"), ib("Чаты", "chats", icon="users")],
             [ib("Таблица", "table", icon="clock"), ib("Sender", "sender", icon="link")],
-            [ib("Аккаунты", "accounts", icon="user")],
+            [ib("Аккаунты", "accounts", icon="user"), ib("Online", "online", icon="star")],
             [ib("Отчёты", "reports", icon="chart"), ib("Проверка", "health", icon="search")],
             [ib("Инфо", "info", icon="info")],
         ]
@@ -115,6 +115,8 @@ def account_kb(acc: Account, running: bool = False) -> InlineKeyboardMarkup:
         if running
         else ib("Старт", "setup_go", acc.id, icon="up")
     )
+    ping_label = "Online ping: вкл" if acc.online_ping_enabled else "Online ping: выкл"
+    ping_icon = "check" if acc.online_ping_enabled else "block"
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [start],
@@ -123,17 +125,37 @@ def account_kb(acc: Account, running: bool = False) -> InlineKeyboardMarkup:
                 ib("Leave", "leave_go", acc.id, icon="block"),
             ],
             [ib("Проверить schedule", "health_go", acc.id, icon="search")],
+            [ib(ping_label, "acc_online", acc.id, icon=ping_icon)],
             [
-                ib("Telethon session", "acc_tl", acc.id, icon="lock"),
-                ib("Pyrogram session", "acc_pg", acc.id, icon="monitor"),
+                ib("Telethon", "acc_tl", acc.id, icon="lock"),
+                ib("Pyrogram", "acc_pg", acc.id, icon="monitor"),
             ],
             [
+                ib("Sender ID", "acc_sid", acc.id, icon="cube"),
                 ib("Sender token", "acc_tok", acc.id, icon="link"),
-                ib("Autoposter ID", "acc_sid", acc.id, icon="cube"),
             ],
             [
                 ib("Переименовать", "acc_ren", acc.id, icon="hammer"),
                 ib("Удалить", "acc_del", acc.id, icon="warn"),
+            ],
+            [ib("Аккаунты", "accounts", icon="user")],
+            home_row(),
+        ]
+    )
+
+
+def online_kb(cfg) -> InlineKeyboardMarkup:
+    toggle = (
+        ib("Выключить глобально", "on_toggle", icon="block")
+        if cfg.enabled
+        else ib("Включить глобально", "on_toggle", icon="check")
+    )
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [toggle],
+            [
+                ib("Интервал", "on_hours", icon="clock"),
+                ib("Пинг сейчас", "on_now", icon="up"),
             ],
             [ib("Аккаунты", "accounts", icon="user")],
             home_row(),

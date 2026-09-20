@@ -8,6 +8,19 @@ COVER_HOURS = 23
 MAX_SCHEDULED = 99
 
 
+def resolve_repeat_period(is_premium: bool, configured: int | None) -> int | None:
+    """
+    schedule_repeat_period is Premium-only (Telegram 403 otherwise).
+    Non-Premium accounts get a one-shot grid; the bot re-schedules daily.
+    """
+    if not is_premium:
+        return None
+    if configured is None:
+        return None
+    period = int(configured)
+    return period if period > 0 else None
+
+
 def posts_count_for_interval(interval_minutes: int) -> int:
     minutes = max(1, int(interval_minutes))
     needed = max(1, math.ceil((COVER_HOURS * 60) / minutes))

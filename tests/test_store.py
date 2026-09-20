@@ -13,6 +13,49 @@ async def store(tmp_path: Path):
     return db
 
 
+async def test_is_premium_persisted(store: Store):
+    acc = await store.add_account("prem")
+    assert acc.is_premium == 0
+    await store.update_account(acc.id, is_premium=1)
+    acc2 = await store.get_account(acc.id)
+    assert acc2 is not None
+    assert acc2.has_premium is True
+    await store.update_account(acc.id, is_premium=0)
+    acc3 = await store.get_account(acc.id)
+    assert acc3 is not None
+    assert acc3.has_premium is False
+
+
+async def test_online_ping_defaults_and_toggle(store: Store):
+    cfg = await store.online_ping_settings()
+    assert cfg.enabled is True
+    assert cfg.hours == 3.5
+    await store.update_online_ping_settings(enabled=False, hours=4.0, next_at="")
+    cfg2 = await store.online_ping_settings()
+    assert cfg2.enabled is False
+    assert cfg2.hours == 4.0
+
+    acc = await store.add_account("ping")
+    assert acc.online_ping_enabled is True
+    await store.update_account(acc.id, online_ping=0)
+    acc2 = await store.get_account(acc.id)
+    assert acc2 is not None
+    assert acc2.online_ping_enabled is False
+
+
+def test_has_sender_ignores_blank_id():
+    from app.models import Account
+
+    assert Account(id=1, label="a", sender_account_id="   ").has_sender is False
+    assert Account(id=1, label="a", sender_account_id="abc").has_sender is True
+    assert Account(
+        id=1, label="a", pyrogram_session="p", sender_bot_token="  "
+    ).has_sender is False
+    assert Account(
+        id=1, label="a", pyrogram_session="p", sender_bot_token="tok"
+    ).has_sender is True
+
+
 async def test_allocate_and_unique(store: Store):
     acc1 = await store.add_account("a1")
     acc2 = await store.add_account("a2")
