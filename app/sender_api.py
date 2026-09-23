@@ -73,13 +73,33 @@ class SenderAPI:
         data = {"bot_token": bot_token, "label": label}
         return await self._request("POST", "/v1/accounts", data=data, files=files)
 
-    async def put_post(self, account_id: str, text: str, photo_bytes: bytes | None = None) -> dict:
-        payload: dict[str, Any] = {"mode": "post", "text": text}
+    async def put_post(
+        self,
+        account_id: str,
+        text: str,
+        photo_bytes: bytes | None = None,
+        *,
+        mode: str = "post",
+        link_chat_id: int | None = None,
+        link_msg_id: int | None = None,
+        entities: list[dict] | None = None,
+        clear_template: bool = False,
+    ) -> dict:
+        # entities намеренно игнорируем — Autoposter API их не сохраняет и
+        # может ответить 422 при extra=forbid.
+        del entities
+        payload: dict[str, Any] = {"mode": mode, "text": text}
         if photo_bytes:
             import base64
 
             payload["photo_base64"] = base64.b64encode(photo_bytes).decode()
             payload["photo_filename"] = "post.jpg"
+        if link_chat_id is not None:
+            payload["link_chat_id"] = int(link_chat_id)
+        if link_msg_id is not None:
+            payload["link_msg_id"] = int(link_msg_id)
+        if clear_template:
+            payload["clear_template"] = True
         return await self._request("PUT", f"/v1/accounts/{account_id}/post", json=payload)
 
     async def put_interval(self, account_id: str, kind: str, min_sec: int, max_sec: int | None = None) -> dict:
@@ -101,11 +121,21 @@ class SenderAPI:
             json={"value": int(value)},
         )
 
-    async def put_cloak(self, account_id: str, enabled: bool, text: str) -> dict:
+    async def put_cloak(
+        self,
+        account_id: str,
+        enabled: bool,
+        text: str,
+        *,
+        entities: list[dict] | None = None,
+    ) -> dict:
+        # entities в cloak API не пишутся — не отправляем, чтобы не словить 422
+        del entities
+        body: dict[str, Any] = {"enabled": bool(enabled), "text": text or ""}
         return await self._request(
             "PUT",
             f"/v1/accounts/{account_id}/cloak",
-            json={"enabled": enabled, "text": text},
+            json=body,
         )
 
     async def list_chats(self, account_id: str) -> list[dict]:

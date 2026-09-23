@@ -66,6 +66,14 @@ class Chat:
     tag: str = ""
     interval_minutes: int = 60
     enabled: int = 1
+    invite_link: str = ""
+    captcha_kind: str = "auto"  # auto | none | poll | verify_btn | math_btn
+    join_mode: str = "direct"  # direct | garant | request
+    garant_bot: str = ""
+    after_join: str = "none"  # none | confirm | bot_captcha
+    after_join_bot: str = ""
+    require_channels: str = ""  # @ch1, @ch2 или ссылки
+    is_join_request: int = 0
     created_at: str = ""
 
     @property
@@ -87,6 +95,14 @@ class Chat:
         if self.username:
             return self.username
         return title or self.chat_id or "чат"
+
+    @property
+    def has_join_link(self) -> bool:
+        return bool((self.invite_link or self.username or "").strip())
+
+    @property
+    def join_request(self) -> bool:
+        return bool(self.is_join_request)
 
 
 def _looks_like_tg_id(value: str) -> bool:
@@ -161,8 +177,9 @@ class SenderSettings:
     per_chat_min: int = 3600
     per_chat_max: int = 3600
     parallel: int = 4
-    cloak_enabled: bool = True
+    cloak_enabled: bool = False
     cloak_text: str = ""
+    cloak_entities_json: str = "[]"
     keep_extra_ids: str = ""
     extra: dict[str, Any] = field(default_factory=dict)
 

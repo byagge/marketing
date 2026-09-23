@@ -25,6 +25,14 @@ class EditChat(StatesGroup):
     tag = State()
     interval = State()
     title = State()
+    invite = State()
+    garant_bot = State()
+    after_bot = State()
+    require_channels = State()
+
+
+class FolderJoin(StatesGroup):
+    link = State()
 
 
 class EditTable(StatesGroup):

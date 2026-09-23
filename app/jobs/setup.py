@@ -20,6 +20,7 @@ from app.utils.entities import entities_loads
 from app.utils.minutes import period_for_interval, suggest_minute
 from app.utils.schedule import resolve_repeat_period
 from app.utils.templates import render_post
+from app.tg.sender_push import has_premium_emoji, normalize_multiline, push_chat_text, push_sender_post
 
 
 class SetupError(Exception):
@@ -30,8 +31,20 @@ async def ensure_minute(store: Store, chat: Chat, account: Account) -> int:
     existing = await store.slot_for(chat.id, account.id)
     if existing:
         return existing.start_minute
+
+    period = period_for_interval(chat.interval_minutes)
     occupied = await store.occupied_minutes(chat.id)
-    minute = suggest_minute(period_for_interval(chat.interval_minutes), occupied)
+    all_slots = await store.all_slots()
+    schedule_ids = {
+        c.id for c in await store.list_chats(kind="schedule") if c.enabled
+    }
+    global_counts: dict[int, int] = {}
+    for slot in all_slots:
+        if slot.chat_pk not in schedule_ids:
+            continue
+        global_counts[slot.start_minute] = global_counts.get(slot.start_minute, 0) + 1
+
+    minute = suggest_minute(period, occupied, global_counts)
     await store.set_slot(chat.id, account.id, minute)
     return minute
 
@@ -297,12 +310,13 @@ async def _configure_sender(
     sender_chats: list[Chat],
     log: LogSink,
 ) -> int:
-    """Configure Autoposter for this account. Returns number of enabled chats."""
+    """Configure Autoposter for this account only (не трогаем другие аккаунты)."""
     settings = get_settings()
     api = SenderAPI(settings.sender_api_url, settings.sender_api_key)
     sender_id = await ensure_sender_account(store, account, api, log)
     ss = await store.sender_settings()
-    ru_text, _ = render_post(
+
+    ru_text, ru_ents = render_post(
         posts["ru"].text,
         entities_loads(posts["ru"].entities_json),
         None,
@@ -311,8 +325,21 @@ async def _configure_sender(
     if posts["ru"].photo_path and Path(posts["ru"].photo_path).exists():
         photo_bytes = Path(posts["ru"].photo_path).read_bytes()
 
-    await api.put_post(sender_id, ru_text, photo_bytes)
-    await log.emit(f"{account.label}: настроил пост RU этого аккаунта")
+    push = await push_sender_post(
+        api,
+        sender_id,
+        ru_text,
+        ru_ents,
+        photo_bytes,
+        telethon_session=account.telethon_session or None,
+    )
+    mode = push.get("mode") or "post"
+    await log.emit(
+        f"{account.label}: настроил пост RU "
+        f"(mode={mode}, premium emoji="
+        f"{'да' if has_premium_emoji(ru_ents) else 'нет'}, "
+        f"переносов={ru_text.count(chr(10))})"
+    )
 
     await api.put_interval(sender_id, "between", ss.between_min, ss.between_max)
     await api.put_interval(sender_id, "cycle", ss.cycle_min, ss.cycle_max)
@@ -323,10 +350,15 @@ async def _configure_sender(
         f"{ss.between_min}-{ss.between_max}s | parallel={ss.parallel}"
     )
 
-    await api.put_cloak(sender_id, ss.cloak_enabled, ss.cloak_text)
+    # Клоакинг — только на этот sender-аккаунт, без apply-all / глобальных флагов.
+    cloak_text = normalize_multiline(ss.cloak_text)
+    cloak_ents = entities_loads(ss.cloak_entities_json)
+    cloak_on = bool(ss.cloak_enabled and cloak_text.strip())
+    await api.put_cloak(sender_id, cloak_on, cloak_text, entities=cloak_ents)
     await log.emit(
-        f"{account.label}: настроил клоакинг "
-        f"({'вкл' if ss.cloak_enabled else 'выкл'})"
+        f"{account.label}: клоакинг "
+        f"{'вкл' if cloak_on else 'выкл'}"
+        + (f" ({len(cloak_text)} симв.)" if cloak_on else "")
     )
 
     live_chats = await api.list_chats(sender_id)
@@ -350,24 +382,19 @@ async def _configure_sender(
         catalog = match_catalog_chat(cid, sender_chats)
         post = posts.get(catalog.lang) if catalog else posts["ru"]
         post = post or posts["ru"]
-        text, _ = render_post(
+        text, ents = render_post(
             post.text,
             entities_loads(post.entities_json),
             catalog.tag if catalog else None,
         )
         title = (catalog.title if catalog else None) or live.get("title") or cid
-        await api.patch_chat(
-            sender_id,
-            cid,
-            active=True,
-            mode="post",
-            text=text,
-        )
+        await push_chat_text(api, sender_id, cid, text, ents)
         sender_count += 1
         await log.emit(f"Sender: включил «{title}»")
 
     if sender_count:
         await api.spam_start(sender_id)
+        # spam/start включает spam_enabled у всех — снова глушим schedule
         await _mute_schedule_on_sender(api, sender_id, live_chats, schedule_chats)
         await log.emit(
             f"{account.label}: sender запущен на {sender_count} чатов "

@@ -138,6 +138,9 @@ def account_kb(acc: Account, running: bool = False) -> InlineKeyboardMarkup:
                 ib("Пост", "posts", acc.id, icon="mega"),
                 ib("Leave", "leave_go", acc.id, icon="block"),
             ],
+            [ib("Проверка чатов", "acc_chats", acc.id, icon="users")],
+            [ib("Вступить во все чаты", "acc_join_all", acc.id, icon="up")],
+            [ib("Вступить по папке", "acc_folder", acc.id, icon="folder")],
             [ib("Проверить schedule", "health_go", acc.id, icon="search")],
             [ib(ping_label, "acc_online", acc.id, icon=ping_icon)],
             [
@@ -222,6 +225,16 @@ def chats_kb(chats: list[Chat], page: int = 0) -> InlineKeyboardMarkup:
 
 
 def chat_kb(chat: Chat) -> InlineKeyboardMarkup:
+    from app.tg.join_presets import (
+        AFTER_JOIN_LABEL,
+        CAPTCHA_KIND_LABEL,
+        JOIN_MODE_LABEL,
+    )
+
+    cap = CAPTCHA_KIND_LABEL.get(chat.captcha_kind or "auto", chat.captcha_kind or "auto")
+    mode = JOIN_MODE_LABEL.get(chat.join_mode or "direct", chat.join_mode or "direct")
+    after = AFTER_JOIN_LABEL.get(chat.after_join or "none", chat.after_join or "none")
+    req = "заявка: да" if chat.is_join_request else "заявка: нет"
     rows = [
         [
             ib(
@@ -237,7 +250,19 @@ def chat_kb(chat: Chat) -> InlineKeyboardMarkup:
             ib("Интервал", "chat_int", chat.id, icon="clock"),
         ],
         [
+            ib("Ссылка вступления", "chat_invite", chat.id, icon="link"),
             ib("Название", "chat_title", chat.id, icon="hammer"),
+        ],
+        [ib(f"Капча: {cap}", "chat_cap", chat.id, icon="shield")],
+        [ib(f"Вступление: {mode}", "chat_jmode", chat.id, icon="users")],
+        [ib(f"После: {after}", "chat_after", chat.id, icon="check")],
+        [
+            ib("Гарант-бот", "chat_gbot", chat.id, icon="robot"),
+            ib("Бот после", "chat_abot", chat.id, icon="cube"),
+        ],
+        [ib("Обязат. каналы", "chat_rch", chat.id, icon="pin")],
+        [
+            ib(req, "chat_req", chat.id, icon="warn"),
             ib(
                 "Включён" if chat.enabled else "Выключен",
                 "chat_on",
@@ -256,6 +281,8 @@ def chat_kb(chat: Chat) -> InlineKeyboardMarkup:
 
 def table_chats_kb(chats: list[Chat]) -> InlineKeyboardMarkup:
     rows = [[ib(c.display_name, "tbl", c.id, icon="clock")] for c in chats]
+    rows.append([ib("Перенастроить все", "tbl_reall", icon="robot")])
+    rows.append([ib("Только таблицу", "tbl_rebal", icon="stack")])
     rows.append([ib("Скачать Excel", "tbl_dl", icon="inbox")])
     rows.append([ib("Загрузить Excel", "tbl_ul", icon="folder")])
     rows.append(home_row())
@@ -291,10 +318,24 @@ def sender_kb() -> InlineKeyboardMarkup:
             [ib("Between", "s_between", icon="clock"), ib("Cycle", "s_cycle", icon="stack")],
             [ib("Per-chat", "s_pchat", icon="pin"), ib("Parallel", "s_par", icon="users")],
             [ib("Текст клоакинга", "s_cloak", icon="shield")],
+            [ib("Клоакинг → все аккаунты", "s_cloak_all", icon="up")],
             [ib("Keep extra ids", "s_keep", icon="lock")],
             home_row(),
         ]
     )
+
+
+def membership_kb(account_id: int, missing_n: int) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    if missing_n:
+        rows.append(
+            [ib(f"Вступить во все ({missing_n})", "acc_join_miss", account_id, icon="up")]
+        )
+    rows.append([ib("Вступить во все чаты списка", "acc_join_all", account_id, icon="users")])
+    rows.append([ib("Проверить снова", "acc_chats", account_id, icon="search")])
+    rows.append([ib("Аккаунт", "acc", account_id, icon="user")])
+    rows.append(home_row())
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def setup_kb(accounts: list[Account], running_ids: set[int]) -> InlineKeyboardMarkup:
@@ -304,6 +345,8 @@ def setup_kb(accounts: list[Account], running_ids: set[int]) -> InlineKeyboardMa
             rows.append([ib(acc.label, "setup_stop", acc.id, icon="down")])
         else:
             rows.append([ib(acc.label, "setup_ask", acc.id, icon="up")])
+    rows.append([ib("Перенастроить все", "tbl_reall", icon="robot")])
+    rows.append([ib("Вступить все аккаунты", "join_all_acc", icon="users")])
     rows.append(home_row())
     return InlineKeyboardMarkup(inline_keyboard=rows)
 

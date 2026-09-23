@@ -6,11 +6,13 @@ from aiogram import F, Router
 from aiogram.fsm.context import FSMContext
 from aiogram.types import BufferedInputFile, CallbackQuery, Message
 
-from app.bot.keyboards import MenuCB, cancel_kb, table_chats_kb, table_kb
+from app.bot.keyboards import MenuCB, cancel_kb, confirm_kb, table_chats_kb, table_kb
 from app.bot.render import ask_input, finish_input, safe_edit
 from app.bot.states import EditTable
 from app.context import ctx
 from app.excel_table import export_tables, parse_import
+from app.jobs import runtime
+from app.jobs.reconfigure import rebalance_minute_table, run_reconfigure_all
 from app.tg.resolve import refresh_chat_titles_quiet
 from app.ui.screens import prompt_html, table_html, table_index_html
 from app.ui.table_image import try_chat_png, try_overview_png
@@ -60,8 +62,18 @@ async def cb_add(query: CallbackQuery, callback_data: MenuCB) -> None:
         return
     account_id = callback_data.p
     occupied = await ctx.store.occupied_minutes(chat.id)
+    all_slots = await ctx.store.all_slots()
+    schedule_ids = {
+        c.id for c in await ctx.store.list_chats(kind="schedule") if c.enabled
+    }
+    global_counts: dict[int, int] = {}
+    for slot in all_slots:
+        if slot.chat_pk in schedule_ids:
+            global_counts[slot.start_minute] = global_counts.get(slot.start_minute, 0) + 1
     try:
-        minute = suggest_minute(period_for_interval(chat.interval_minutes), occupied)
+        minute = suggest_minute(
+            period_for_interval(chat.interval_minutes), occupied, global_counts
+        )
         await ctx.store.set_slot(chat.id, account_id, minute)
     except TableFullError:
         await query.answer("Таблица заполнена", show_alert=True)
@@ -166,3 +178,86 @@ async def on_xlsx(message: Message, state: FSMContext) -> None:
         text += "\n" + "\n".join(errors[:20])
     chats, photo = await _index_photo()
     await finish_input(message, prompt_html("Импорт", escape(text), "inbox"), table_chats_kb(chats), photo)
+
+
+@router.callback_query(MenuCB.filter(F.a == "tbl_rebal"))
+async def cb_rebal(query: CallbackQuery) -> None:
+    await safe_edit(
+        query,
+        prompt_html(
+            "Пересобрать таблицу",
+            "Минуты будут распределены равномерно по всем schedule-чатам "
+            "(со сдвигом фазы, без пустых колонок). Аккаунты не трогаем.",
+            "stack",
+        ),
+        confirm_kb(MenuCB(a="tbl_rebal_go"), MenuCB(a="table"), yes_text="Пересобрать"),
+    )
+
+
+@router.callback_query(MenuCB.filter(F.a == "tbl_rebal_go"))
+async def cb_rebal_go(query: CallbackQuery) -> None:
+    await query.answer("Пересобираю…")
+    stats = await rebalance_minute_table(ctx.store)
+    chats, photo = await _index_photo()
+    await safe_edit(
+        query,
+        prompt_html(
+            "Таблица",
+            f"Готово: <b>{stats['slots']}</b> слотов "
+            f"({stats['accounts']} акк. × {stats['chats']} чатов).\n"
+            f"Откройте таблицу снова, чтобы увидеть PNG.",
+            "check",
+        ),
+        table_chats_kb(chats),
+        photo=photo,
+    )
+
+
+@router.callback_query(MenuCB.filter(F.a == "tbl_reall"))
+async def cb_reall(query: CallbackQuery) -> None:
+    await safe_edit(
+        query,
+        prompt_html(
+            "Перенастроить все",
+            "1) Пересобрать минутную таблицу равномерно\n"
+            "2) По очереди перенастроить каждый аккаунт "
+            "(schedule + sender + клоакинг)\n\n"
+            "Займёт время — логи придут в чат.",
+            "robot",
+        ),
+        confirm_kb(MenuCB(a="tbl_reall_go"), MenuCB(a="table"), yes_text="Запустить"),
+    )
+
+
+@router.callback_query(MenuCB.filter(F.a == "tbl_reall_go"))
+async def cb_reall_go(query: CallbackQuery) -> None:
+    if runtime.is_running("reconfigure_all", 0):
+        await query.answer("Уже запущено", show_alert=True)
+        return
+    await query.answer("Запускаю")
+
+    async def _job():
+        await run_reconfigure_all(
+            ctx.store,
+            query.bot,
+            query.from_user.id,
+            rebalance=True,
+            setup_accounts=True,
+        )
+
+    try:
+        runtime.spawn("reconfigure_all", 0, _job())
+    except RuntimeError as e:
+        await query.answer(str(e), show_alert=True)
+        return
+    chats, photo = await _index_photo()
+    await safe_edit(
+        query,
+        prompt_html(
+            "Перенастройка",
+            "Запущено в фоне: сначала таблица, затем каждый аккаунт отдельно.",
+            "robot",
+        ),
+        table_chats_kb(chats),
+        photo=photo,
+    )

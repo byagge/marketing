@@ -49,6 +49,14 @@ CREATE TABLE IF NOT EXISTS chats (
     tag TEXT NOT NULL DEFAULT '',
     interval_minutes INTEGER NOT NULL DEFAULT 60,
     enabled INTEGER NOT NULL DEFAULT 1,
+    invite_link TEXT NOT NULL DEFAULT '',
+    captcha_kind TEXT NOT NULL DEFAULT 'auto',
+    join_mode TEXT NOT NULL DEFAULT 'direct',
+    garant_bot TEXT NOT NULL DEFAULT '',
+    after_join TEXT NOT NULL DEFAULT 'none',
+    after_join_bot TEXT NOT NULL DEFAULT '',
+    require_channels TEXT NOT NULL DEFAULT '',
+    is_join_request INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL
 );
 
@@ -104,8 +112,9 @@ DEFAULT_SETTINGS = {
     "per_chat_min": "3600",
     "per_chat_max": "3600",
     "parallel": "4",
-    "cloak_enabled": "1",
+    "cloak_enabled": "0",
     "cloak_text": "",
+    "cloak_entities_json": "[]",
     "keep_extra_ids": "",
     "online_ping_enabled": "1",
     "online_ping_hours": "3.5",
@@ -189,6 +198,26 @@ async def _migrate_accounts_premium(db: aiosqlite.Connection) -> None:
         )
 
 
+async def _migrate_chats_invite(db: aiosqlite.Connection) -> None:
+    cur = await db.execute("PRAGMA table_info(chats)")
+    cols = [row[1] for row in await cur.fetchall()]
+    if not cols:
+        return
+    alters = {
+        "invite_link": "ALTER TABLE chats ADD COLUMN invite_link TEXT NOT NULL DEFAULT ''",
+        "captcha_kind": "ALTER TABLE chats ADD COLUMN captcha_kind TEXT NOT NULL DEFAULT 'auto'",
+        "join_mode": "ALTER TABLE chats ADD COLUMN join_mode TEXT NOT NULL DEFAULT 'direct'",
+        "garant_bot": "ALTER TABLE chats ADD COLUMN garant_bot TEXT NOT NULL DEFAULT ''",
+        "after_join": "ALTER TABLE chats ADD COLUMN after_join TEXT NOT NULL DEFAULT 'none'",
+        "after_join_bot": "ALTER TABLE chats ADD COLUMN after_join_bot TEXT NOT NULL DEFAULT ''",
+        "require_channels": "ALTER TABLE chats ADD COLUMN require_channels TEXT NOT NULL DEFAULT ''",
+        "is_join_request": "ALTER TABLE chats ADD COLUMN is_join_request INTEGER NOT NULL DEFAULT 0",
+    }
+    for name, sql in alters.items():
+        if name not in cols:
+            await db.execute(sql)
+
+
 def _account(row: aiosqlite.Row) -> Account:
     keys = row.keys()
     online_ping = 1
@@ -214,6 +243,16 @@ def _account(row: aiosqlite.Row) -> Account:
 
 
 def _chat(row: aiosqlite.Row) -> Chat:
+    keys = row.keys()
+
+    def _s(name: str, default: str = "") -> str:
+        return (row[name] if name in keys else default) or default
+
+    def _i(name: str, default: int = 0) -> int:
+        if name not in keys or row[name] is None:
+            return default
+        return int(row[name])
+
     return Chat(
         id=row["id"],
         title=row["title"],
@@ -224,6 +263,14 @@ def _chat(row: aiosqlite.Row) -> Chat:
         tag=row["tag"] or "",
         interval_minutes=int(row["interval_minutes"] or 60),
         enabled=int(row["enabled"] or 0),
+        invite_link=_s("invite_link"),
+        captcha_kind=_s("captcha_kind", "auto") or "auto",
+        join_mode=_s("join_mode", "direct") or "direct",
+        garant_bot=_s("garant_bot"),
+        after_join=_s("after_join", "none") or "none",
+        after_join_bot=_s("after_join_bot"),
+        require_channels=_s("require_channels"),
+        is_join_request=_i("is_join_request", 0),
         created_at=row["created_at"] or "",
     )
 
@@ -255,6 +302,7 @@ class Store:
             await db.execute("PRAGMA foreign_keys = ON")
             await _migrate_posts_table(db)
             await _migrate_accounts_premium(db)
+            await _migrate_chats_invite(db)
             for key, value in DEFAULT_SETTINGS.items():
                 await db.execute(
                     "INSERT OR IGNORE INTO settings(key, value) VALUES(?, ?)",
@@ -301,8 +349,9 @@ class Store:
             per_chat_min=_i("per_chat_min", 3600),
             per_chat_max=_i("per_chat_max", 3600),
             parallel=_i("parallel", 4),
-            cloak_enabled=str(rows.get("cloak_enabled", "1")) not in {"0", "false", "off"},
+            cloak_enabled=str(rows.get("cloak_enabled", "0")) not in {"0", "false", "off", ""},
             cloak_text=rows.get("cloak_text", "") or "",
+            cloak_entities_json=rows.get("cloak_entities_json", "[]") or "[]",
             keep_extra_ids=rows.get("keep_extra_ids", "") or "",
         )
 
@@ -317,6 +366,7 @@ class Store:
             "parallel": "parallel",
             "cloak_enabled": "cloak_enabled",
             "cloak_text": "cloak_text",
+            "cloak_entities_json": "cloak_entities_json",
             "keep_extra_ids": "keep_extra_ids",
         }
         for key, value in kwargs.items():
@@ -490,11 +540,36 @@ class Store:
         lang: str = "ru",
         tag: str = "",
         interval_minutes: int = 60,
+        invite_link: str = "",
+        captcha_kind: str = "auto",
+        join_mode: str = "direct",
+        garant_bot: str = "",
+        after_join: str = "none",
+        after_join_bot: str = "",
+        require_channels: str = "",
+        is_join_request: int = 0,
     ) -> Chat:
+        from app.tg.join_presets import match_preset
+
+        preset = match_preset(
+            chat_id=str(chat_id), title=title, username=username, invite_link=invite_link
+        )
+        if preset:
+            captcha_kind = captcha_kind if captcha_kind != "auto" else preset.get("captcha_kind", captcha_kind)
+            join_mode = join_mode if join_mode != "direct" else preset.get("join_mode", join_mode)
+            garant_bot = garant_bot or preset.get("garant_bot", "")
+            after_join = after_join if after_join != "none" else preset.get("after_join", after_join)
+            after_join_bot = after_join_bot or preset.get("after_join_bot", "")
+            require_channels = require_channels or preset.get("require_channels", "")
+            is_join_request = is_join_request or int(preset.get("is_join_request") or 0)
+
         async with self._connect() as db:
             cur = await db.execute(
                 "INSERT INTO chats(title, chat_id, username, kind, lang, tag, "
-                "interval_minutes, enabled, created_at) VALUES(?,?,?,?,?,?,?,1,?)",
+                "interval_minutes, enabled, invite_link, captcha_kind, join_mode, "
+                "garant_bot, after_join, after_join_bot, require_channels, "
+                "is_join_request, created_at) "
+                "VALUES(?,?,?,?,?,?,?,1,?,?,?,?,?,?,?,?,?)",
                 (
                     title,
                     str(chat_id),
@@ -503,6 +578,14 @@ class Store:
                     lang,
                     tag or "",
                     int(interval_minutes),
+                    invite_link or "",
+                    captcha_kind or "auto",
+                    join_mode or "direct",
+                    (garant_bot or "").lstrip("@"),
+                    after_join or "none",
+                    (after_join_bot or "").lstrip("@"),
+                    require_channels or "",
+                    int(is_join_request or 0),
                     _now(),
                 ),
             )
@@ -522,8 +605,20 @@ class Store:
             "tag",
             "interval_minutes",
             "enabled",
+            "invite_link",
+            "captcha_kind",
+            "join_mode",
+            "garant_bot",
+            "after_join",
+            "after_join_bot",
+            "require_channels",
+            "is_join_request",
         }
         fields = {k: v for k, v in fields.items() if k in allowed}
+        if "garant_bot" in fields and fields["garant_bot"] is not None:
+            fields["garant_bot"] = str(fields["garant_bot"]).lstrip("@")
+        if "after_join_bot" in fields and fields["after_join_bot"] is not None:
+            fields["after_join_bot"] = str(fields["after_join_bot"]).lstrip("@")
         if not fields:
             return await self.get_chat(chat_pk)
         cols = ", ".join(f"{k}=?" for k in fields)

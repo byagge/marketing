@@ -198,18 +198,38 @@ def chats_html(chats: list[Chat]) -> str:
 
 
 def chat_html(chat: Chat) -> str:
+    from app.tg.join_presets import (
+        AFTER_JOIN_LABEL,
+        CAPTCHA_KIND_LABEL,
+        JOIN_MODE_LABEL,
+        match_preset,
+    )
+
     kind = "schedule" if chat.is_schedule else "sender"
+    invite = (chat.invite_link or "").strip() or "—"
+    preset = match_preset(chat)
+    preset_note = f"{pe('star')} пресет: да\n" if preset else ""
     return (
         f"{pe('users')} <b>{escape(chat.display_name)}</b>\n\n"
         f"{pe('term')} id: <code>{escape(chat.chat_id)}</code>\n"
         f"{pe('at')} {escape(chat.username or '—')}\n"
+        f"{pe('link')} invite: <code>{escape(invite)}</code>\n"
+        f"{preset_note}"
         f"{pe('cube')} тип: <b>{kind}</b>\n"
         f"{pe('bookmark')} язык: <b>{escape(chat.lang)}</b>\n"
         f"{pe('pin')} тег/гарант: <code>{escape(chat.tag or '—')}</code>\n"
         f"{pe('clock')} интервал: <b>{chat.interval_minutes} мин</b>\n"
+        f"{pe('shield')} капча: <b>{escape(CAPTCHA_KIND_LABEL.get(chat.captcha_kind, chat.captcha_kind))}</b>\n"
+        f"{pe('users')} вступление: <b>{escape(JOIN_MODE_LABEL.get(chat.join_mode, chat.join_mode))}</b>\n"
+        f"{pe('robot')} гарант-бот: <code>@{escape(chat.garant_bot or '—')}</code>\n"
+        f"{pe('check')} после: <b>{escape(AFTER_JOIN_LABEL.get(chat.after_join, chat.after_join))}</b>\n"
+        f"{pe('cube')} бот после: <code>@{escape(chat.after_join_bot or '—')}</code>\n"
+        f"{pe('pin')} каналы: <code>{escape(chat.require_channels or '—')}</code>\n"
+        f"{pe('warn')} заявка: <b>{'да' if chat.is_join_request else 'нет'}</b>\n"
         f"{pe('check') if chat.enabled else pe('block')} "
         f"{'включён' if chat.enabled else 'выключен'}\n\n"
-        f"{pe('info')} Чаты общие для всех аккаунтов."
+        f"{pe('info')} Lustify/LSA подхватываются пресетом по id — "
+        f"при создании связывать вручную не нужно."
     )
 
 
@@ -218,7 +238,9 @@ def table_index_html(n: int) -> str:
         f"{pe('clock')} <b>Таблица минут</b>\n"
         f"Schedule-чатов: <b>{n}</b>\n\n"
         f"Колонки — названия чатов, строки — минуты, в ячейке аккаунт.\n"
-        f"Пусто {pe('pin')} :00, дальше :30, :15, :45."
+        f"{pe('robot')} <b>Перенастроить все</b> — равномерная таблица + "
+        f"настройка каждого аккаунта.\n"
+        f"{pe('stack')} <b>Только таблицу</b> — пересобрать минуты со сдвигом фазы."
     )
 
 
@@ -247,15 +269,27 @@ def table_html(chat: Chat, slots: list[MinuteSlot]) -> str:
 
 
 def sender_html(ss) -> str:
-    cloak = escape(ss.cloak_text.replace("\n", " ")[:200] or "—")
+    cloak = escape((ss.cloak_text or "").replace("\n", " ↵ ")[:200] or "—")
+    ents = 0
+    try:
+        from app.utils.entities import entities_loads
+
+        ents = sum(
+            1
+            for e in entities_loads(getattr(ss, "cloak_entities_json", None))
+            if "emoji" in str(e.get("type"))
+        )
+    except Exception:
+        pass
     return (
         f"{pe('link')} <b>Sender / клоакинг</b>\n"
-        f"Общие настройки для всех аккаунтов\n\n"
+        f"Интервалы и клоакинг пишутся в каждый аккаунт отдельно при настройке.\n\n"
         f"{pe('clock')} between: <b>{ss.between_min}–{ss.between_max}</b> сек\n"
         f"{pe('stack')} cycle: <b>{ss.cycle_min}–{ss.cycle_max}</b> сек\n"
         f"{pe('pin')} per-chat: <b>{ss.per_chat_min}–{ss.per_chat_max}</b> сек\n"
         f"{pe('users')} parallel: <b>{ss.parallel}</b>\n"
-        f"{pe('shield')} клоакинг: {on_off(ss.cloak_enabled)}\n"
+        f"{pe('shield')} клоакинг: {on_off(ss.cloak_enabled)}"
+        f"{f' | premium emoji: {ents}' if ents else ''}\n"
         f"<i>{cloak}</i>\n\n"
         f"{pe('lock')} keep extra ids: <code>{escape(ss.keep_extra_ids or '—')}</code>"
     )

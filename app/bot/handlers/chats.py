@@ -30,6 +30,11 @@ async def cb_chat(query: CallbackQuery, callback_data: MenuCB, state: FSMContext
     if not chat:
         await query.answer("Нет чата", show_alert=True)
         return
+    from app.tg.join_presets import apply_preset_fields
+
+    fields = apply_preset_fields(chat)
+    if fields:
+        chat = await ctx.store.update_chat(chat.id, **fields) or chat
     await safe_edit(query, chat_html(chat), chat_kb(chat))
 
 
@@ -199,6 +204,189 @@ async def on_title(message: Message, state: FSMContext) -> None:
     data = await state.get_data()
     await state.clear()
     chat = await ctx.store.update_chat(int(data["chat_pk"]), title=(message.text or "").strip())
+    if not chat:
+        await message.answer("Чат не найден")
+        return
+    await finish_input(message, chat_html(chat), chat_kb(chat))
+
+
+@router.callback_query(MenuCB.filter(F.a == "chat_invite"))
+async def cb_invite(query: CallbackQuery, callback_data: MenuCB, state: FSMContext) -> None:
+    await state.set_state(EditChat.invite)
+    await state.update_data(chat_pk=callback_data.i)
+    text = prompt_html(
+        "Ссылка вступления",
+        "https://t.me/+… / joinchat / @username\n"
+        "или <code>-</code> чтобы очистить.\n"
+        "Нужна для автовступления аккаунтов.",
+        "link",
+    )
+    await safe_edit(query, text, cancel_kb())
+    await ask_input(query, text)
+
+
+@router.message(EditChat.invite, F.text)
+async def on_invite(message: Message, state: FSMContext) -> None:
+    data = await state.get_data()
+    await state.clear()
+    raw = (message.text or "").strip()
+    if raw in {"-", "нет", "0", "clear"}:
+        raw = ""
+    chat = await ctx.store.update_chat(int(data["chat_pk"]), invite_link=raw)
+    if not chat:
+        await message.answer("Чат не найден")
+        return
+    # подтянуть пресет по новой ссылке (MARKET 404 и т.п.)
+    from app.tg.join_presets import apply_preset_fields
+
+    fields = apply_preset_fields(chat)
+    if fields:
+        chat = await ctx.store.update_chat(chat.id, **fields) or chat
+    await finish_input(message, chat_html(chat), chat_kb(chat))
+
+
+def _cycle(value: str, options: tuple[str, ...]) -> str:
+    cur = value or options[0]
+    try:
+        idx = options.index(cur)
+    except ValueError:
+        idx = 0
+    return options[(idx + 1) % len(options)]
+
+
+@router.callback_query(MenuCB.filter(F.a == "chat_cap"))
+async def cb_cap(query: CallbackQuery, callback_data: MenuCB) -> None:
+    from app.tg.join_presets import CAPTCHA_KIND_CYCLE
+
+    chat = await ctx.store.get_chat(callback_data.i)
+    if not chat:
+        await query.answer("Нет чата", show_alert=True)
+        return
+    nxt = _cycle(chat.captcha_kind or "auto", CAPTCHA_KIND_CYCLE)
+    chat = await ctx.store.update_chat(chat.id, captcha_kind=nxt)
+    await safe_edit(query, chat_html(chat), chat_kb(chat))
+
+
+@router.callback_query(MenuCB.filter(F.a == "chat_jmode"))
+async def cb_jmode(query: CallbackQuery, callback_data: MenuCB) -> None:
+    from app.tg.join_presets import JOIN_MODE_CYCLE
+
+    chat = await ctx.store.get_chat(callback_data.i)
+    if not chat:
+        await query.answer("Нет чата", show_alert=True)
+        return
+    nxt = _cycle(chat.join_mode or "direct", JOIN_MODE_CYCLE)
+    chat = await ctx.store.update_chat(chat.id, join_mode=nxt)
+    await safe_edit(query, chat_html(chat), chat_kb(chat))
+
+
+@router.callback_query(MenuCB.filter(F.a == "chat_after"))
+async def cb_after(query: CallbackQuery, callback_data: MenuCB) -> None:
+    from app.tg.join_presets import AFTER_JOIN_CYCLE
+
+    chat = await ctx.store.get_chat(callback_data.i)
+    if not chat:
+        await query.answer("Нет чата", show_alert=True)
+        return
+    nxt = _cycle(chat.after_join or "none", AFTER_JOIN_CYCLE)
+    chat = await ctx.store.update_chat(chat.id, after_join=nxt)
+    await safe_edit(query, chat_html(chat), chat_kb(chat))
+
+
+@router.callback_query(MenuCB.filter(F.a == "chat_req"))
+async def cb_req(query: CallbackQuery, callback_data: MenuCB) -> None:
+    chat = await ctx.store.get_chat(callback_data.i)
+    if not chat:
+        await query.answer("Нет чата", show_alert=True)
+        return
+    chat = await ctx.store.update_chat(chat.id, is_join_request=0 if chat.is_join_request else 1)
+    await safe_edit(query, chat_html(chat), chat_kb(chat))
+
+
+@router.callback_query(MenuCB.filter(F.a == "chat_gbot"))
+async def cb_gbot(query: CallbackQuery, callback_data: MenuCB, state: FSMContext) -> None:
+    await state.set_state(EditChat.garant_bot)
+    await state.update_data(chat_pk=callback_data.i)
+    text = prompt_html(
+        "Гарант-бот",
+        "@LustifyGarant_bot / @GUARD_LSA_BOT\n"
+        "Бот, который выдаёт временную ссылку.\n"
+        "<code>-</code> — очистить.",
+        "robot",
+    )
+    await safe_edit(query, text, cancel_kb())
+    await ask_input(query, text)
+
+
+@router.message(EditChat.garant_bot, F.text)
+async def on_gbot(message: Message, state: FSMContext) -> None:
+    data = await state.get_data()
+    await state.clear()
+    raw = (message.text or "").strip().lstrip("@")
+    if raw in {"-", "нет", "0", "clear"}:
+        raw = ""
+    fields: dict = {"garant_bot": raw}
+    if raw:
+        fields["join_mode"] = "garant"
+    chat = await ctx.store.update_chat(int(data["chat_pk"]), **fields)
+    if not chat:
+        await message.answer("Чат не найден")
+        return
+    await finish_input(message, chat_html(chat), chat_kb(chat))
+
+
+@router.callback_query(MenuCB.filter(F.a == "chat_abot"))
+async def cb_abot(query: CallbackQuery, callback_data: MenuCB, state: FSMContext) -> None:
+    await state.set_state(EditChat.after_bot)
+    await state.update_data(chat_pk=callback_data.i)
+    text = prompt_html(
+        "Бот после вступления",
+        "@LSA_GRNT_BOT — капча в боте\n"
+        "или тот же гарант для кнопки «Я вступил».\n"
+        "<code>-</code> — очистить.",
+        "cube",
+    )
+    await safe_edit(query, text, cancel_kb())
+    await ask_input(query, text)
+
+
+@router.message(EditChat.after_bot, F.text)
+async def on_abot(message: Message, state: FSMContext) -> None:
+    data = await state.get_data()
+    await state.clear()
+    raw = (message.text or "").strip().lstrip("@")
+    if raw in {"-", "нет", "0", "clear"}:
+        raw = ""
+    chat = await ctx.store.update_chat(int(data["chat_pk"]), after_join_bot=raw)
+    if not chat:
+        await message.answer("Чат не найден")
+        return
+    await finish_input(message, chat_html(chat), chat_kb(chat))
+
+
+@router.callback_query(MenuCB.filter(F.a == "chat_rch"))
+async def cb_rch(query: CallbackQuery, callback_data: MenuCB, state: FSMContext) -> None:
+    await state.set_state(EditChat.require_channels)
+    await state.update_data(chat_pk=callback_data.i)
+    text = prompt_html(
+        "Обязательные каналы",
+        "Через запятую: <code>@market404chat</code> или ссылки.\n"
+        "Подписка нужна, чтобы писать в чат.\n"
+        "<code>-</code> — очистить.",
+        "pin",
+    )
+    await safe_edit(query, text, cancel_kb())
+    await ask_input(query, text)
+
+
+@router.message(EditChat.require_channels, F.text)
+async def on_rch(message: Message, state: FSMContext) -> None:
+    data = await state.get_data()
+    await state.clear()
+    raw = (message.text or "").strip()
+    if raw in {"-", "нет", "0", "clear"}:
+        raw = ""
+    chat = await ctx.store.update_chat(int(data["chat_pk"]), require_channels=raw)
     if not chat:
         await message.answer("Чат не найден")
         return
