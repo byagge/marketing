@@ -113,6 +113,69 @@ async def push_sender_post(
     )
 
 
+async def push_cloak(
+    api: SenderAPI,
+    sender_id: str,
+    *,
+    enabled: bool,
+    text: str,
+) -> dict[str, Any]:
+    """Полный пуш клоакинга на один sender-аккаунт + проверка."""
+    body = normalize_multiline(text)
+    on = bool(enabled and body.strip())
+    await api.put_cloak(sender_id, on, body if on else "")
+    try:
+        got = await api.get_cloak(sender_id)
+    except SenderAPIError:
+        return {"ok": True, "enabled": on, "verified": False, "text_len": len(body)}
+    got_on = bool(got.get("enabled"))
+    got_text = normalize_multiline(str(got.get("text") or ""))
+    ok = (got_on == on) and ((got_text == body) if on else True)
+    if not ok and on:
+        # повтор, если Autoposter не принял с первого раза
+        await api.put_cloak(sender_id, True, body)
+        got = await api.get_cloak(sender_id)
+        got_on = bool(got.get("enabled"))
+        got_text = normalize_multiline(str(got.get("text") or ""))
+        ok = got_on and got_text == body
+    return {
+        "ok": ok,
+        "enabled": on,
+        "verified": True,
+        "text_len": len(body),
+        "remote_enabled": got_on,
+        "remote_len": len(got_text),
+    }
+
+
+async def disable_mentions_everywhere(
+    api: SenderAPI,
+    sender_id: str,
+    live_chats: list[dict[str, Any]] | None = None,
+) -> int:
+    """
+    Выключить глобальные отметки аккаунта и mention у каждого чата.
+    Autoposter по умолчанию часто ставит mention=\"global\" — это и есть
+    «глобальная отметка во всех чатах».
+    """
+    await api.put_mentions(sender_id, False)
+    chats = live_chats if live_chats is not None else await api.list_chats(sender_id)
+    patched = 0
+    for live in chats:
+        cid = str(live.get("chat_id") or "")
+        if not cid:
+            continue
+        try:
+            await api.patch_chat(sender_id, cid, mention=False)
+            patched += 1
+        except SenderAPIError:
+            try:
+                await api.patch_chat(sender_id, cid, mention=False)
+            except SenderAPIError:
+                continue
+    return patched
+
+
 async def push_chat_text(
     api: SenderAPI,
     sender_id: str,
@@ -120,19 +183,23 @@ async def push_chat_text(
     text: str,
     entities: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    """Текст чата без entities — Autoposter их не принимает в PATCH."""
-    del entities  # сохраняем сигнатуру, но в API не шлём
+    """Текст чата: mode=post, упоминания выкл, active=true."""
+    del entities  # Autoposter entities в PATCH не принимает
     body = normalize_multiline(text)
+    payload = {
+        "active": True,
+        "mode": "post",
+        "text": body,
+        "mention": False,  # не "global" и не true
+    }
     try:
-        return await api.patch_chat(
-            sender_id,
-            chat_id,
-            active=True,
-            mode="post",
-            text=body,
-        )
+        return await api.patch_chat(sender_id, chat_id, **payload)
     except SenderAPIError as e:
         if e.status != 422:
             raise
-        # fallback: только text (mode мог конфликтовать)
+        # fallback по шагам: сначала mention off, потом текст
+        try:
+            await api.patch_chat(sender_id, chat_id, mention=False)
+        except SenderAPIError:
+            pass
         return await api.patch_chat(sender_id, chat_id, active=True, text=body)

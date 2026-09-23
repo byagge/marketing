@@ -11,7 +11,7 @@ from app.config import get_settings
 from app.context import ctx
 from app.jobs import LogSink, runtime
 from app.sender_api import SenderAPI, SenderAPIError
-from app.tg.sender_push import normalize_multiline
+from app.tg.sender_push import normalize_multiline, push_cloak
 from app.ui.screens import prompt_html, sender_html
 from app.utils.entities import entities_dumps, entities_loads, from_aiogram_message
 
@@ -146,7 +146,6 @@ async def cb_cloak_all(query: CallbackQuery) -> None:
         job = await ctx.store.create_job("cloak_all", None)
         log = LogSink(ctx.store, job.id, query.bot, query.from_user.id)
         cloak_text = normalize_multiline(ss.cloak_text)
-        ents = entities_loads(ss.cloak_entities_json)
         ok = err = skip = 0
         await log.emit("Клоакинг → каждый sender-аккаунт отдельно…")
         for acc in await ctx.store.list_accounts():
@@ -159,9 +158,17 @@ async def cb_cloak_all(query: CallbackQuery) -> None:
                 await log.emit(f"Пропуск {acc.label}: нет Sender ID", "error")
                 continue
             try:
-                await api.put_cloak(sender_id, True, cloak_text, entities=ents)
-                ok += 1
-                await log.emit(f"✓ {acc.label}")
+                res = await push_cloak(api, sender_id, enabled=True, text=cloak_text)
+                if res.get("ok"):
+                    ok += 1
+                    await log.emit(f"✓ {acc.label} ({res.get('text_len', 0)} симв.)")
+                else:
+                    err += 1
+                    await log.emit(
+                        f"✗ {acc.label}: не подтвердился "
+                        f"(remote_enabled={res.get('remote_enabled')})",
+                        "error",
+                    )
             except SenderAPIError as e:
                 err += 1
                 await log.emit(f"✗ {acc.label}: {e}", "error")

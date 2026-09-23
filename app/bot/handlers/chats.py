@@ -309,8 +309,9 @@ async def cb_gbot(query: CallbackQuery, callback_data: MenuCB, state: FSMContext
     await state.update_data(chat_pk=callback_data.i)
     text = prompt_html(
         "Гарант-бот",
-        "@LustifyGarant_bot / @GUARD_LSA_BOT\n"
+        "@LustifyGarant_bot / @GUARD_LSA_BOT / @WsGuardBot\n"
         "Бот, который выдаёт временную ссылку.\n"
+        "WsGuardBot: Mini App terms → Помощь → ссылка (авто).\n"
         "<code>-</code> — очистить.",
         "robot",
     )

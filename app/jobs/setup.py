@@ -20,7 +20,14 @@ from app.utils.entities import entities_loads
 from app.utils.minutes import period_for_interval, suggest_minute
 from app.utils.schedule import resolve_repeat_period
 from app.utils.templates import render_post
-from app.tg.sender_push import has_premium_emoji, normalize_multiline, push_chat_text, push_sender_post
+from app.tg.sender_push import (
+    disable_mentions_everywhere,
+    has_premium_emoji,
+    normalize_multiline,
+    push_chat_text,
+    push_cloak,
+    push_sender_post,
+)
 
 
 class SetupError(Exception):
@@ -115,7 +122,8 @@ async def _mute_schedule_on_sender(
     for live in live_chats:
         cid = str(live.get("chat_id") or "")
         if cid and match_catalog_chat(cid, schedule_chats):
-            await api.patch_chat(sender_id, cid, active=False)
+            # schedule не в рассылке + без отметок
+            await api.patch_chat(sender_id, cid, active=False, mention=False)
 
 
 async def _fail_unavailable(
@@ -347,21 +355,44 @@ async def _configure_sender(
     await api.put_parallel(sender_id, ss.parallel)
     await log.emit(
         f"{account.label}: настроил интервалы "
-        f"{ss.between_min}-{ss.between_max}s | parallel={ss.parallel}"
+        f"between {ss.between_min}-{ss.between_max}s | "
+        f"cycle {ss.cycle_min}-{ss.cycle_max}s | "
+        f"per-chat {ss.per_chat_min}-{ss.per_chat_max}s | "
+        f"parallel={ss.parallel}"
     )
 
-    # Клоакинг — только на этот sender-аккаунт, без apply-all / глобальных флагов.
+    # Упоминания / «глобальная отметка» — всегда OFF на этом аккаунте.
+    live_chats = await api.list_chats(sender_id)
+    ment_n = await disable_mentions_everywhere(api, sender_id, live_chats)
+    await log.emit(
+        f"{account.label}: упоминания выкл (аккаунт + {ment_n} чатов, не global)"
+    )
+
+    # Клоакинг — полный пуш на этот аккаунт (без apply-all).
     cloak_text = normalize_multiline(ss.cloak_text)
-    cloak_ents = entities_loads(ss.cloak_entities_json)
     cloak_on = bool(ss.cloak_enabled and cloak_text.strip())
-    await api.put_cloak(sender_id, cloak_on, cloak_text, entities=cloak_ents)
+    cloak_res = await push_cloak(
+        api, sender_id, enabled=cloak_on, text=cloak_text
+    )
+    if cloak_on and not cloak_res.get("ok"):
+        await log.emit(
+            f"{account.label}: клоакинг не подтвердился в Autoposter — повторяю",
+            "error",
+        )
+        cloak_res = await push_cloak(
+            api, sender_id, enabled=True, text=cloak_text
+        )
     await log.emit(
         f"{account.label}: клоакинг "
-        f"{'вкл' if cloak_on else 'выкл'}"
-        + (f" ({len(cloak_text)} симв.)" if cloak_on else "")
+        f"{'вкл' if cloak_res.get('enabled') else 'выкл'}"
+        + (
+            f" ({cloak_res.get('text_len', 0)} симв."
+            f", ok={cloak_res.get('ok')})"
+            if cloak_res.get("enabled")
+            else ""
+        )
     )
 
-    live_chats = await api.list_chats(sender_id)
     await _mute_schedule_on_sender(api, sender_id, live_chats, schedule_chats)
 
     targets = pick_sender_live_chats(live_chats, schedule_chats)
@@ -390,15 +421,23 @@ async def _configure_sender(
         title = (catalog.title if catalog else None) or live.get("title") or cid
         await push_chat_text(api, sender_id, cid, text, ents)
         sender_count += 1
-        await log.emit(f"Sender: включил «{title}»")
+        await log.emit(f"Sender: включил «{title}» (mention=off)")
 
     if sender_count:
         await api.spam_start(sender_id)
         # spam/start включает spam_enabled у всех — снова глушим schedule
+        live_chats = await api.list_chats(sender_id)
         await _mute_schedule_on_sender(api, sender_id, live_chats, schedule_chats)
+        # после старта снова глушим отметки (на случай дефолтов Autoposter)
+        await disable_mentions_everywhere(api, sender_id, live_chats)
+        # и снова клоакинг — spam/start не должен его сбрасывать, но проверяем
+        cloak_res = await push_cloak(
+            api, sender_id, enabled=cloak_on, text=cloak_text
+        )
         await log.emit(
             f"{account.label}: sender запущен на {sender_count} чатов "
-            f"(все кроме schedule)"
+            f"(schedule mute, mention=off, cloak="
+            f"{'on' if cloak_res.get('enabled') else 'off'})"
         )
     else:
         await log.emit(

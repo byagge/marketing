@@ -122,6 +122,11 @@ async def find_invite_from_bot(
     wait_sec: float = 8.0,
 ) -> str | None:
     """Пишет /start боту и ищет URL-кнопку / ссылку приглашения."""
+    from app.tg.ws_guard import find_invite_from_ws_guard, is_ws_guard_bot
+
+    if is_ws_guard_bot(bot_username):
+        return await find_invite_from_ws_guard(client, bot_username)
+
     bot = await ensure_started_with_bot(client, bot_username)
     found: list[str] = []
 

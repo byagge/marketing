@@ -6,7 +6,15 @@ from app.tg.join import (
     extract_public_username,
     needs_bot_flow,
 )
-from app.tg.sender_push import has_premium_emoji, normalize_multiline
+from app.tg.sender_push import (
+    disable_mentions_everywhere,
+    has_premium_emoji,
+    normalize_multiline,
+    push_chat_text,
+    push_cloak,
+)
+
+import pytest
 
 
 def test_invite_hash():
@@ -58,3 +66,65 @@ def test_premium_emoji_detect():
         [{"type": "custom_emoji", "offset": 0, "length": 2, "custom_emoji_id": "1"}]
     )
     assert not has_premium_emoji([{"type": "bold", "offset": 0, "length": 2}])
+
+
+@pytest.mark.asyncio
+async def test_push_cloak_verifies_and_retries():
+    class FakeAPI:
+        def __init__(self):
+            self.puts = []
+            self.state = {"enabled": False, "text": ""}
+
+        async def put_cloak(self, account_id, enabled, text, **kwargs):
+            self.puts.append((account_id, enabled, text))
+            self.state = {"enabled": bool(enabled), "text": text}
+
+        async def get_cloak(self, account_id):
+            return dict(self.state)
+
+    api = FakeAPI()
+    res = await push_cloak(api, "acc1", enabled=True, text="привет\nмир")
+    assert res["ok"] is True
+    assert res["enabled"] is True
+    assert api.puts[0] == ("acc1", True, "привет\nмир")
+
+
+@pytest.mark.asyncio
+async def test_disable_mentions_everywhere():
+    class FakeAPI:
+        def __init__(self):
+            self.mentions = None
+            self.patches = []
+
+        async def put_mentions(self, account_id, enabled):
+            self.mentions = enabled
+
+        async def list_chats(self, account_id):
+            return [{"chat_id": "-1001"}, {"chat_id": "-1002"}]
+
+        async def patch_chat(self, account_id, chat_id, **fields):
+            self.patches.append((chat_id, fields))
+
+    api = FakeAPI()
+    n = await disable_mentions_everywhere(api, "acc1")
+    assert api.mentions is False
+    assert n == 2
+    assert all(p[1].get("mention") is False for p in api.patches)
+
+
+@pytest.mark.asyncio
+async def test_push_chat_text_forces_mention_off():
+    class FakeAPI:
+        def __init__(self):
+            self.fields = None
+
+        async def patch_chat(self, account_id, chat_id, **fields):
+            self.fields = fields
+            return {"ok": True}
+
+    api = FakeAPI()
+    await push_chat_text(api, "acc1", "-1001", "hi\nthere")
+    assert api.fields["mention"] is False
+    assert api.fields["active"] is True
+    assert api.fields["mode"] == "post"
+    assert api.fields["text"] == "hi\nthere"

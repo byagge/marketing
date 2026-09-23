@@ -121,6 +121,9 @@ class SenderAPI:
             json={"value": int(value)},
         )
 
+    async def get_cloak(self, account_id: str) -> dict:
+        return await self._request("GET", f"/v1/accounts/{account_id}/cloak")
+
     async def put_cloak(
         self,
         account_id: str,
@@ -136,6 +139,17 @@ class SenderAPI:
             "PUT",
             f"/v1/accounts/{account_id}/cloak",
             json=body,
+        )
+
+    async def get_mentions(self, account_id: str) -> dict:
+        return await self._request("GET", f"/v1/accounts/{account_id}/mentions")
+
+    async def put_mentions(self, account_id: str, enabled: bool) -> dict:
+        """Глобальные «отметки» аккаунта (👁 Упоминания). Нужно держать выкл."""
+        return await self._request(
+            "PUT",
+            f"/v1/accounts/{account_id}/mentions",
+            json={"enabled": bool(enabled)},
         )
 
     async def list_chats(self, account_id: str) -> list[dict]:

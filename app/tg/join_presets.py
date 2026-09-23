@@ -25,6 +25,7 @@ PRESETS: list[dict[str, Any]] = [
         "captcha_kind": "auto",
         "require_channels": "",
         "is_join_request": 0,
+        "garant_flow": "lustify",
     },
     {
         "ids": {"-1002415711408", "1002415711408"},
@@ -37,6 +38,21 @@ PRESETS: list[dict[str, Any]] = [
         "captcha_kind": "math_btn",
         "require_channels": "",
         "is_join_request": 0,
+        "garant_flow": "lsa",
+    },
+    {
+        "ids": set(),
+        "titles": ("ws guard", "wsguard", "ws garant", "wsgarant"),
+        "usernames": ("wsguardbot",),
+        "garant_bots": ("WsGuardBot",),
+        "join_mode": "garant",
+        "garant_bot": "WsGuardBot",
+        "after_join": "none",
+        "after_join_bot": "",
+        "captcha_kind": "auto",
+        "require_channels": "",
+        "is_join_request": 0,
+        "garant_flow": "ws_guard",
     },
     {
         "ids": set(),
@@ -49,6 +65,7 @@ PRESETS: list[dict[str, Any]] = [
         "captcha_kind": "auto",
         "require_channels": "market404chat",
         "is_join_request": 0,
+        "garant_flow": "",
     },
 ]
 
@@ -86,6 +103,9 @@ def match_preset(chat: Chat | None = None, **hints: str) -> dict[str, Any] | Non
     title = (hints.get("title") or (chat.title if chat else "") or "").casefold()
     username = (hints.get("username") or (chat.username if chat else "") or "").casefold().lstrip("@")
     invite = hints.get("invite_link") or (chat.invite_link if chat else "") or ""
+    garant = (
+        hints.get("garant_bot") or (chat.garant_bot if chat else "") or ""
+    ).casefold().lstrip("@")
 
     for preset in PRESETS:
         ids = {_norm_id(x) for x in preset.get("ids") or set()}
@@ -96,6 +116,15 @@ def match_preset(chat: Chat | None = None, **hints: str) -> dict[str, Any] | Non
                 return preset
         for uname in preset.get("usernames") or ():
             if uname and uname.casefold().lstrip("@") == username:
+                return preset
+        for gb in preset.get("garant_bots") or ():
+            if gb and gb.casefold().lstrip("@") == garant:
+                return preset
+        # чат с уже прописанным WsGuardBot
+        if garant and preset.get("garant_flow") == "ws_guard":
+            from app.tg.ws_guard import is_ws_guard_bot
+
+            if is_ws_guard_bot(garant):
                 return preset
         for h in preset.get("invite_hashes") or ():
             if h and h in invite:
@@ -159,4 +188,5 @@ def effective_join_config(chat: Chat) -> dict[str, Any]:
         "is_join_request": bool(chat.is_join_request or preset.get("is_join_request")),
         "invite_link": (chat.invite_link or "").strip(),
         "preset": bool(preset),
+        "garant_flow": preset.get("garant_flow") or "",
     }
