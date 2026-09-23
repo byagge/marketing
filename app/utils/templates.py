@@ -3,9 +3,33 @@
 from __future__ import annotations
 
 import re
-from typing import Any
+from typing import Any, Mapping
+
+from app.models import Chat, Post
 
 PLACEHOLDER_RE = re.compile(r"\{\{\s*(GARANT|TAG)\s*\}\}", re.IGNORECASE)
+SHORT_POST_MAX_CHARS = 500
+
+
+def short_lang(lang: str) -> str:
+    base = (lang or "ru").split("_", 1)[0].casefold() or "ru"
+    if base not in {"ru", "en"}:
+        base = "ru"
+    return f"{base}_short"
+
+
+def pick_post_for_chat(posts: Mapping[str, Post], chat: Chat) -> Post:
+    """Выбрать полный или короткий пост по настройке чата."""
+    lang = (chat.lang or "ru").split("_", 1)[0].casefold() or "ru"
+    if chat.uses_short_text:
+        for key in (short_lang(lang), "ru_short", "en_short"):
+            post = posts.get(key)
+            if post and (post.text or "").strip():
+                return post
+    post = posts.get(lang) or posts.get("ru")
+    if post is not None:
+        return post
+    return Post(lang=lang)
 
 
 def utf16_len(text: str) -> int:

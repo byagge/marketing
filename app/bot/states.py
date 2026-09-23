@@ -17,6 +17,8 @@ class AccountFile(StatesGroup):
 class EditPost(StatesGroup):
     ru = State()
     en = State()
+    ru_short = State()
+    en_short = State()
     cloak = State()
 
 

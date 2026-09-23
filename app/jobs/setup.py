@@ -19,7 +19,7 @@ from app.utils.chat_ids import chat_ids_match
 from app.utils.entities import entities_loads
 from app.utils.minutes import period_for_interval, suggest_minute
 from app.utils.schedule import resolve_repeat_period
-from app.utils.templates import render_post
+from app.utils.templates import pick_post_for_chat, render_post
 from app.tg.sender_push import (
     disable_mentions_everywhere,
     has_premium_emoji,
@@ -184,10 +184,11 @@ async def schedule_one_chat(
             )
             return "abandoned"
 
-    post = posts.get(chat.lang) or posts["ru"]
+    post = pick_post_for_chat(posts, chat)
     if not post.text.strip():
         await log.emit(
-            f"Пропуск schedule «{chat.title}»: нет текста для языка {chat.lang}",
+            f"Пропуск schedule «{chat.title}»: нет текста "
+            f"({'короткий ' if chat.uses_short_text else ''}{chat.lang})",
             "error",
         )
         return "config_error"
@@ -411,17 +412,24 @@ async def _configure_sender(
             raise SetupError("Остановлено")
         cid = str(live.get("chat_id"))
         catalog = match_catalog_chat(cid, sender_chats)
-        post = posts.get(catalog.lang) if catalog else posts["ru"]
-        post = post or posts["ru"]
+        if catalog:
+            post = pick_post_for_chat(posts, catalog)
+            tag = catalog.tag
+            title = catalog.title or live.get("title") or cid
+            kind_note = "кор." if catalog.uses_short_text else "полн."
+        else:
+            post = posts.get("ru") or next(iter(posts.values()))
+            tag = None
+            title = live.get("title") or cid
+            kind_note = "полн."
         text, ents = render_post(
             post.text,
             entities_loads(post.entities_json),
-            catalog.tag if catalog else None,
+            tag,
         )
-        title = (catalog.title if catalog else None) or live.get("title") or cid
         await push_chat_text(api, sender_id, cid, text, ents)
         sender_count += 1
-        await log.emit(f"Sender: включил «{title}» (mention=off)")
+        await log.emit(f"Sender: включил «{title}» ({kind_note}, mention=off)")
 
     if sender_count:
         await api.spam_start(sender_id)
@@ -465,6 +473,8 @@ async def run_setup(store: Store, account_id: int, bot: Bot, admin_chat_id: int)
         posts = {
             "ru": await store.get_post(account.id, "ru"),
             "en": await store.get_post(account.id, "en"),
+            "ru_short": await store.get_post(account.id, "ru_short"),
+            "en_short": await store.get_post(account.id, "en_short"),
         }
         if not posts["ru"].text.strip() and not posts["en"].text.strip():
             raise SetupError("Сначала задайте пост этого аккаунта (RU/EN)")
@@ -632,6 +642,8 @@ async def run_setup_chats_only(
     posts = {
         "ru": await store.get_post(account.id, "ru"),
         "en": await store.get_post(account.id, "en"),
+        "ru_short": await store.get_post(account.id, "ru_short"),
+        "en_short": await store.get_post(account.id, "en_short"),
     }
     if not posts["ru"].text.strip() and not posts["en"].text.strip():
         return empty

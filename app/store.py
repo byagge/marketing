@@ -57,6 +57,7 @@ CREATE TABLE IF NOT EXISTS chats (
     after_join_bot TEXT NOT NULL DEFAULT '',
     require_channels TEXT NOT NULL DEFAULT '',
     is_join_request INTEGER NOT NULL DEFAULT 0,
+    text_kind TEXT NOT NULL DEFAULT 'full',
     created_at TEXT NOT NULL
 );
 
@@ -212,6 +213,7 @@ async def _migrate_chats_invite(db: aiosqlite.Connection) -> None:
         "after_join_bot": "ALTER TABLE chats ADD COLUMN after_join_bot TEXT NOT NULL DEFAULT ''",
         "require_channels": "ALTER TABLE chats ADD COLUMN require_channels TEXT NOT NULL DEFAULT ''",
         "is_join_request": "ALTER TABLE chats ADD COLUMN is_join_request INTEGER NOT NULL DEFAULT 0",
+        "text_kind": "ALTER TABLE chats ADD COLUMN text_kind TEXT NOT NULL DEFAULT 'full'",
     }
     for name, sql in alters.items():
         if name not in cols:
@@ -271,6 +273,7 @@ def _chat(row: aiosqlite.Row) -> Chat:
         after_join_bot=_s("after_join_bot"),
         require_channels=_s("require_channels"),
         is_join_request=_i("is_join_request", 0),
+        text_kind=_s("text_kind", "full") or "full",
         created_at=row["created_at"] or "",
     )
 
@@ -613,12 +616,16 @@ class Store:
             "after_join_bot",
             "require_channels",
             "is_join_request",
+            "text_kind",
         }
         fields = {k: v for k, v in fields.items() if k in allowed}
         if "garant_bot" in fields and fields["garant_bot"] is not None:
             fields["garant_bot"] = str(fields["garant_bot"]).lstrip("@")
         if "after_join_bot" in fields and fields["after_join_bot"] is not None:
             fields["after_join_bot"] = str(fields["after_join_bot"]).lstrip("@")
+        if "text_kind" in fields and fields["text_kind"] is not None:
+            raw = str(fields["text_kind"]).strip().casefold()
+            fields["text_kind"] = "short" if raw in {"short", "короткий", "1", "true"} else "full"
         if not fields:
             return await self.get_chat(chat_pk)
         cols = ", ".join(f"{k}=?" for k in fields)

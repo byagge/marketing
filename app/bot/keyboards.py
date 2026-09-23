@@ -196,6 +196,10 @@ def posts_kb(account_id: int) -> InlineKeyboardMarkup:
                 ib("Задать RU", "post_ru", account_id, icon="bookmark"),
                 ib("Задать EN", "post_en", account_id, icon="pin"),
             ],
+            [
+                ib("Короткий RU", "post_rus", account_id, icon="mega"),
+                ib("Короткий EN", "post_ens", account_id, icon="mega"),
+            ],
             [ib("Превью с тегом", "post_prev", account_id, icon="search")],
             [ib("Аккаунт", "acc", account_id, icon="user")],
             home_row(),
@@ -213,9 +217,10 @@ def chats_kb(chats: list[Chat], page: int = 0) -> InlineKeyboardMarkup:
             icon = "clock"
         else:
             icon = "mega"
-        title = (chat.display_name or "чат")[:28]
+        title = (chat.display_name or "чат")[:26]
+        mark = f"{chat.lang}{'·s' if chat.uses_short_text else ''}"
         rows.append(
-            [ib(f"{title} {chat.lang} {chat.interval_minutes}m", "chat", chat.id, icon=icon)]
+            [ib(f"{title} {mark} {chat.interval_minutes}m", "chat", chat.id, icon=icon)]
         )
     total_pages = max(1, (len(chats) + 7) // 8)
     if total_pages > 1:
@@ -235,6 +240,7 @@ def chat_kb(chat: Chat) -> InlineKeyboardMarkup:
     mode = JOIN_MODE_LABEL.get(chat.join_mode or "direct", chat.join_mode or "direct")
     after = AFTER_JOIN_LABEL.get(chat.after_join or "none", chat.after_join or "none")
     req = "заявка: да" if chat.is_join_request else "заявка: нет"
+    text_kind_label = "короткий текст" if chat.uses_short_text else "полный текст"
     rows = [
         [
             ib(
@@ -244,6 +250,9 @@ def chat_kb(chat: Chat) -> InlineKeyboardMarkup:
                 icon="clock" if chat.is_schedule else "mega",
             ),
             ib(chat.lang, "chat_lang", chat.id, icon="bookmark"),
+        ],
+        [
+            ib(text_kind_label, "chat_tkind", chat.id, icon="mega"),
         ],
         [
             ib("Тег / гарант", "chat_tag", chat.id, icon="pin"),

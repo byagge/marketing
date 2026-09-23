@@ -161,26 +161,34 @@ def online_html(cfg: OnlinePingSettings, accounts: list[Account]) -> str:
     return "\n".join(lines)
 
 
-def posts_html(acc: Account, ru, en) -> str:
-    def block(lang, post) -> str:
+def posts_html(acc: Account, ru, en, ru_short=None, en_short=None) -> str:
+    def block(lang, post, *, short: bool = False) -> str:
         ents = entities_loads(post.entities_json)
         emoji_n = sum(1 for e in ents if "emoji" in str(e.get("type")))
         preview = escape((post.text or "").replace("\n", " ")[:140] or "—")
         photo = on_off(bool(post.photo_path))
+        title = f"{lang.upper()} коротк." if short else lang.upper()
+        limit = " | max 500" if short else ""
         return (
-            f"{pe('mega')} <b>{lang.upper()}</b>\n"
-            f"{pe('pin')} {len(post.text or '')} симв. | premium: {emoji_n} | фото: {photo}\n"
+            f"{pe('mega')} <b>{title}</b>\n"
+            f"{pe('pin')} {len(post.text or '')} симв.{limit} | premium: {emoji_n} | фото: {photo}\n"
             f"<i>{preview}</i>"
         )
 
-    return (
+    parts = [
         f"{pe('mega')} <b>Пост</b> {escape(acc.label)}\n"
         f"{pe('user')} Только этот аккаунт. Другие аккаунты не используют этот текст.\n"
-        f"{pe('pin')} <code>{{{{GARANT}}}}</code> {pe('pin')} тег чата, иначе пропуск.\n\n"
+        f"{pe('pin')} <code>{{{{GARANT}}}}</code> {pe('pin')} тег чата, иначе пропуск.\n"
+        f"{pe('info')} Короткий текст — до 500 символов; в чате можно выбрать «короткий текст».\n\n"
         + block("ru", ru)
         + "\n\n"
         + block("en", en)
-    )
+    ]
+    if ru_short is not None:
+        parts.append("\n\n" + block("ru", ru_short, short=True))
+    if en_short is not None:
+        parts.append("\n\n" + block("en", en_short, short=True))
+    return "".join(parts)
 
 
 def chats_html(chats: list[Chat]) -> str:
@@ -217,6 +225,7 @@ def chat_html(chat: Chat) -> str:
         f"{preset_note}"
         f"{pe('cube')} тип: <b>{kind}</b>\n"
         f"{pe('bookmark')} язык: <b>{escape(chat.lang)}</b>\n"
+        f"{pe('mega')} текст: <b>{'короткий' if chat.uses_short_text else 'полный'}</b>\n"
         f"{pe('pin')} тег/гарант: <code>{escape(chat.tag or '—')}</code>\n"
         f"{pe('clock')} интервал: <b>{chat.interval_minutes} мин</b>\n"
         f"{pe('shield')} капча: <b>{escape(CAPTCHA_KIND_LABEL.get(chat.captcha_kind, chat.captcha_kind))}</b>\n"

@@ -133,6 +133,21 @@ async def cb_lang(query: CallbackQuery, callback_data: MenuCB) -> None:
     await safe_edit(query, chat_html(chat), chat_kb(chat))
 
 
+@router.callback_query(MenuCB.filter(F.a == "chat_tkind"))
+async def cb_text_kind(query: CallbackQuery, callback_data: MenuCB) -> None:
+    chat = await ctx.store.get_chat(callback_data.i)
+    if not chat:
+        await query.answer("Нет чата", show_alert=True)
+        return
+    nxt = "full" if chat.uses_short_text else "short"
+    chat = await ctx.store.update_chat(chat.id, text_kind=nxt)
+    if not chat:
+        await query.answer("Нет чата", show_alert=True)
+        return
+    await query.answer("Короткий" if chat.uses_short_text else "Полный")
+    await safe_edit(query, chat_html(chat), chat_kb(chat))
+
+
 @router.callback_query(MenuCB.filter(F.a == "chat_on"))
 async def cb_on(query: CallbackQuery, callback_data: MenuCB) -> None:
     chat = await ctx.store.get_chat(callback_data.i)

@@ -54,6 +54,10 @@ class Post:
     photo_path: str = ""
     account_id: int = 0
 
+    @property
+    def is_short(self) -> bool:
+        return (self.lang or "").endswith("_short")
+
 
 @dataclass
 class Chat:
@@ -74,11 +78,16 @@ class Chat:
     after_join_bot: str = ""
     require_channels: str = ""  # @ch1, @ch2 или ссылки
     is_join_request: int = 0
+    text_kind: str = "full"  # full | short
     created_at: str = ""
 
     @property
     def is_schedule(self) -> bool:
         return self.kind == "schedule"
+
+    @property
+    def uses_short_text(self) -> bool:
+        return (self.text_kind or "full") == "short"
 
     @property
     def tg_id(self) -> int | str:
