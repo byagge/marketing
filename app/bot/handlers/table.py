@@ -12,7 +12,11 @@ from app.bot.states import EditTable
 from app.context import ctx
 from app.excel_table import export_tables, parse_import
 from app.jobs import runtime
-from app.jobs.reconfigure import rebalance_minute_table, run_reconfigure_all
+from app.jobs.reconfigure import (
+    rebalance_minute_table,
+    run_fix_assigned_minutes,
+    run_reconfigure_all,
+)
 from app.tg.resolve import refresh_chat_titles_quiet
 from app.ui.screens import prompt_html, table_html, table_index_html
 from app.ui.table_image import try_chat_png, try_overview_png
@@ -186,8 +190,10 @@ async def cb_rebal(query: CallbackQuery) -> None:
         query,
         prompt_html(
             "Пересобрать таблицу",
-            "Минуты будут распределены равномерно по всем schedule-чатам "
-            "(со сдвигом фазы, без пустых колонок). Аккаунты не трогаем.",
+            "Минуты будут распределены <b>равномерно по часу</b> "
+            "(0–59, равные промежутки, сдвиг фазы между чатами).\n"
+            "Полная сетка: все аккаунты × все schedule-чаты. "
+            "В Telegram расписание не трогаем.",
             "stack",
         ),
         confirm_kb(MenuCB(a="tbl_rebal_go"), MenuCB(a="table"), yes_text="Пересобрать"),
@@ -197,7 +203,7 @@ async def cb_rebal(query: CallbackQuery) -> None:
 @router.callback_query(MenuCB.filter(F.a == "tbl_rebal_go"))
 async def cb_rebal_go(query: CallbackQuery) -> None:
     await query.answer("Пересобираю…")
-    stats = await rebalance_minute_table(ctx.store)
+    stats = await rebalance_minute_table(ctx.store, only_assigned=False)
     chats, photo = await _index_photo()
     await safe_edit(
         query,
@@ -213,15 +219,65 @@ async def cb_rebal_go(query: CallbackQuery) -> None:
     )
 
 
+@router.callback_query(MenuCB.filter(F.a == "tbl_fix"))
+async def cb_fix(query: CallbackQuery) -> None:
+    await safe_edit(
+        query,
+        prompt_html(
+            "Выровнять минуты",
+            "1) Уже назначенные слоты — равные промежутки по часу\n"
+            "2) Переназначить schedule в Telegram\n"
+            "   пачками по <b>5</b> аккаунтов (анти-Flood)\n\n"
+            "Новые пары аккаунт×чат не создаём.",
+            "clock",
+        ),
+        confirm_kb(MenuCB(a="tbl_fix_go"), MenuCB(a="table"), yes_text="Выровнять"),
+    )
+
+
+@router.callback_query(MenuCB.filter(F.a == "tbl_fix_go"))
+async def cb_fix_go(query: CallbackQuery) -> None:
+    if runtime.is_running("fix_minutes", 0):
+        await query.answer("Уже запущено", show_alert=True)
+        return
+    if runtime.is_running("reconfigure_all", 0):
+        await query.answer("Сначала дождитесь «Перенастроить все»", show_alert=True)
+        return
+    await query.answer("Запускаю")
+
+    async def _job():
+        await run_fix_assigned_minutes(
+            ctx.store,
+            query.bot,
+            query.from_user.id,
+        )
+
+    try:
+        runtime.spawn("fix_minutes", 0, _job())
+    except RuntimeError as e:
+        await query.answer(str(e), show_alert=True)
+        return
+    chats, photo = await _index_photo()
+    await safe_edit(
+        query,
+        prompt_html(
+            "Выравнивание",
+            "Запущено в фоне: таблица → schedule пачками по 5. Логи придут сюда.",
+            "clock",
+        ),
+        table_chats_kb(chats),
+        photo=photo,
+    )
+
+
 @router.callback_query(MenuCB.filter(F.a == "tbl_reall"))
 async def cb_reall(query: CallbackQuery) -> None:
     await safe_edit(
         query,
         prompt_html(
             "Перенастроить все",
-            "1) Пересобрать минутную таблицу равномерно\n"
-            "2) По очереди перенастроить каждый аккаунт "
-            "(schedule + sender + клоакинг)\n\n"
+            "1) Полная минутная таблица равномерно по часу\n"
+            "2) Пачками по 5: schedule + sender + клоакинг\n\n"
             "Займёт время — логи придут в чат.",
             "robot",
         ),

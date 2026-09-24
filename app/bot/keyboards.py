@@ -290,6 +290,7 @@ def chat_kb(chat: Chat) -> InlineKeyboardMarkup:
 
 def table_chats_kb(chats: list[Chat]) -> InlineKeyboardMarkup:
     rows = [[ib(c.display_name, "tbl", c.id, icon="clock")] for c in chats]
+    rows.append([ib("Выровнять минуты", "tbl_fix", icon="clock")])
     rows.append([ib("Перенастроить все", "tbl_reall", icon="robot")])
     rows.append([ib("Только таблицу", "tbl_rebal", icon="stack")])
     rows.append([ib("Скачать Excel", "tbl_dl", icon="inbox")])
