@@ -164,14 +164,22 @@ async def run_fix_assigned_minutes(
                     skip_abandoned=False,
                 )
                 n_ok = len(buckets.get("ok") or [])
-                await log.emit(f"✓ acc#{aid}: schedule ok={n_ok}", notify=False)
+                acc = await store.get_account(aid)
+                label = acc.label if acc else f"acc#{aid}"
+                await log.emit(f"✓ {label}: schedule ok={n_ok}", notify=False)
                 return True
             except Exception as e:
-                await log.emit(f"✗ acc#{aid}: {type(e).__name__}: {e}", "error")
+                acc = await store.get_account(aid)
+                label = acc.label if acc else f"acc#{aid}"
+                await log.emit(f"✗ {label}: {type(e).__name__}: {e}", "error")
                 return False
 
         async def _on_batch(n: int, batch):
-            await log.emit(f"Пачка {n}: {', '.join(str(a) for a in batch)}")
+            labels = []
+            for a in batch:
+                acc = await store.get_account(a)
+                labels.append(acc.label if acc else str(a))
+            await log.emit(f"Пачка {n}: {', '.join(labels)}")
 
         results = await map_batches(
             account_ids,
@@ -183,10 +191,17 @@ async def run_fix_assigned_minutes(
         )
         ok_total = sum(1 for r in results if r is True)
         err_total = len(results) - ok_total
+        stopped = runtime.cancelled("fix_minutes", 0)
         lines.append(f"Schedule: ok={ok_total}, ошибок={err_total}")
+        if stopped:
+            lines.append("Остановлено пользователем")
         report = "\n".join(lines)
-        await store.finish_job(job.id, "done", report)
-        await log.emit("Выравнивание минут завершено.\n" + report)
+        status = "cancelled" if stopped else "done"
+        await store.finish_job(job.id, status, report)
+        await log.emit(
+            ("Выравнивание остановлено.\n" if stopped else "Выравнивание минут завершено.\n")
+            + report
+        )
         return report
     except Exception as e:
         err = f"{type(e).__name__}: {e}"
@@ -279,10 +294,16 @@ async def run_reconfigure_all(
             ok = sum(1 for r in results if r is True)
             err = len(results) - ok
             lines.append(f"Аккаунты: ok={ok}, ошибок={err}")
+            if runtime.cancelled("reconfigure_all", 0):
+                lines.append("Остановлено пользователем")
 
         report = "\n".join(lines) or "Нечего делать"
-        await store.finish_job(job.id, "done", report)
-        await log.emit("Перенастройка всех завершена.\n" + report)
+        stopped = runtime.cancelled("reconfigure_all", 0)
+        await store.finish_job(job.id, "cancelled" if stopped else "done", report)
+        await log.emit(
+            ("Перенастройка остановлена.\n" if stopped else "Перенастройка всех завершена.\n")
+            + report
+        )
         return report
     except Exception as e:
         err = f"{type(e).__name__}: {e}"

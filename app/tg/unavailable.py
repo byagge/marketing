@@ -39,14 +39,41 @@ _UNAVAILABLE_MARKERS = (
     "peer id invalid",
     "chat not found",
     "channel not found",
+    "чат не найден",
+    "you're banned from sending",
+    "banned from sending messages",
 )
+
+_UNAVAILABLE_NAME_MARKERS = (
+    "userbannedinchannel",
+    "channelprivate",
+    "channelinvalid",
+    "chatwriteforbidden",
+    "chatadminrequired",
+    "peeridinvalid",
+    "usernameinvalid",
+    "usernamenotoccupied",
+    "invitehashexpired",
+    "invitehashinvalid",
+)
+
+
+def is_unavailable_text(text: str) -> bool:
+    """Распознать unavailable по тексту ошибки (в т.ч. из result['error'])."""
+    msg = (text or "").casefold()
+    if not msg:
+        return False
+    if any(marker in msg for marker in _UNAVAILABLE_MARKERS):
+        return True
+    compact = msg.replace(" ", "").replace("_", "")
+    head = compact.split(":", 1)[0]
+    return any(n in head or n in compact for n in _UNAVAILABLE_NAME_MARKERS)
 
 
 def is_chat_unavailable(exc: BaseException) -> bool:
     if isinstance(exc, _UNAVAILABLE_TYPES):
         return True
-    msg = str(exc).casefold()
-    return any(marker in msg for marker in _UNAVAILABLE_MARKERS)
+    return is_unavailable_text(str(exc))
 
 
 def format_unavailable(exc: BaseException) -> str:

@@ -112,3 +112,13 @@ def test_is_chat_unavailable_classifies_common_errors():
     assert is_chat_unavailable(ValueError("Cannot find any entity corresponding to"))
     assert is_chat_unavailable(TypeError("Cannot cast InputPeer"))
     assert not is_chat_unavailable(RuntimeError("flood wait weird"))
+
+    from app.tg.unavailable import is_unavailable_text
+
+    banned = (
+        "UserBannedInChannelError: You're banned from sending messages "
+        "in supergroups/channels (caused by SendMediaRequest)"
+    )
+    assert is_unavailable_text(banned)
+    assert is_unavailable_text("чат не найден в аккаунте")
+    assert not is_unavailable_text("FloodWaitError: wait 30")

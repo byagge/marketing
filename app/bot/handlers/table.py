@@ -25,6 +25,14 @@ from app.utils.minutes import TableFullError, period_for_interval, suggest_minut
 router = Router()
 
 
+def _table_kb(chats):
+    return table_chats_kb(
+        chats,
+        fix_running=runtime.is_running("fix_minutes", 0),
+        reall_running=runtime.is_running("reconfigure_all", 0),
+    )
+
+
 async def _index_photo():
     await refresh_chat_titles_quiet(ctx.store)
     chats = [c for c in await ctx.store.list_chats(kind="schedule") if c.enabled]
@@ -44,7 +52,7 @@ async def cb_table(query: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
     await query.answer("Названия из Telegram…")
     chats, photo = await _index_photo()
-    await safe_edit(query, table_index_html(len(chats)), table_chats_kb(chats), photo=photo)
+    await safe_edit(query, table_index_html(len(chats)), _table_kb(chats), photo=photo)
 
 
 @router.callback_query(MenuCB.filter(F.a == "tbl"))
@@ -181,7 +189,7 @@ async def on_xlsx(message: Message, state: FSMContext) -> None:
     if errors:
         text += "\n" + "\n".join(errors[:20])
     chats, photo = await _index_photo()
-    await finish_input(message, prompt_html("Импорт", escape(text), "inbox"), table_chats_kb(chats), photo)
+    await finish_input(message, prompt_html("Импорт", escape(text), "inbox"), _table_kb(chats), photo)
 
 
 @router.callback_query(MenuCB.filter(F.a == "tbl_rebal"))
@@ -214,13 +222,28 @@ async def cb_rebal_go(query: CallbackQuery) -> None:
             f"Откройте таблицу снова, чтобы увидеть PNG.",
             "check",
         ),
-        table_chats_kb(chats),
+        _table_kb(chats),
         photo=photo,
     )
 
 
 @router.callback_query(MenuCB.filter(F.a == "tbl_fix"))
 async def cb_fix(query: CallbackQuery) -> None:
+    if runtime.is_running("fix_minutes", 0):
+        await safe_edit(
+            query,
+            prompt_html(
+                "Выравнивание идёт",
+                "Можно остановить — текущий аккаунт допишет чат и остановится.",
+                "clock",
+            ),
+            confirm_kb(
+                MenuCB(a="tbl_fix_stop"),
+                MenuCB(a="table"),
+                yes_text="Остановить",
+            ),
+        )
+        return
     await safe_edit(
         query,
         prompt_html(
@@ -262,16 +285,61 @@ async def cb_fix_go(query: CallbackQuery) -> None:
         query,
         prompt_html(
             "Выравнивание",
-            "Запущено в фоне: таблица → schedule пачками по 5. Логи придут сюда.",
+            "Запущено в фоне. В логах будет имя аккаунта у каждого чата.\n"
+            "Кнопка «Остановить выравнивание» — на экране таблицы.",
             "clock",
         ),
-        table_chats_kb(chats),
+        _table_kb(chats),
+        photo=photo,
+    )
+
+
+@router.callback_query(MenuCB.filter(F.a == "tbl_fix_stop"))
+async def cb_fix_stop(query: CallbackQuery) -> None:
+    if not runtime.is_running("fix_minutes", 0):
+        await query.answer("Уже не запущено")
+        chats, photo = await _index_photo()
+        await safe_edit(
+            query,
+            table_index_html(len(chats)),
+            _table_kb(chats),
+            photo=photo,
+        )
+        return
+    runtime.request_cancel("fix_minutes", 0)
+    await query.answer("Останавливаю…")
+    chats, photo = await _index_photo()
+    await safe_edit(
+        query,
+        prompt_html(
+            "Остановка",
+            "Запросил остановку выравнивания минут. "
+            "Текущая пачка допишет и выйдет.",
+            "down",
+        ),
+        _table_kb(chats),
         photo=photo,
     )
 
 
 @router.callback_query(MenuCB.filter(F.a == "tbl_reall"))
 async def cb_reall(query: CallbackQuery) -> None:
+    if runtime.is_running("reconfigure_all", 0):
+        await safe_edit(
+            query,
+            prompt_html(
+                "Перенастройка идёт",
+                "Можно остановить набор новых аккаунтов "
+                "(уже запущенные setup доработают).",
+                "robot",
+            ),
+            confirm_kb(
+                MenuCB(a="tbl_reall_stop"),
+                MenuCB(a="table"),
+                yes_text="Остановить",
+            ),
+        )
+        return
     await safe_edit(
         query,
         prompt_html(
@@ -289,6 +357,9 @@ async def cb_reall(query: CallbackQuery) -> None:
 async def cb_reall_go(query: CallbackQuery) -> None:
     if runtime.is_running("reconfigure_all", 0):
         await query.answer("Уже запущено", show_alert=True)
+        return
+    if runtime.is_running("fix_minutes", 0):
+        await query.answer("Сначала остановите выравнивание минут", show_alert=True)
         return
     await query.answer("Запускаю")
 
@@ -311,9 +382,38 @@ async def cb_reall_go(query: CallbackQuery) -> None:
         query,
         prompt_html(
             "Перенастройка",
-            "Запущено в фоне: сначала таблица, затем каждый аккаунт отдельно.",
+            "Запущено в фоне: сначала таблица, затем аккаунты пачками.\n"
+            "Кнопка «Остановить перенастройку» — на экране таблицы.",
             "robot",
         ),
-        table_chats_kb(chats),
+        _table_kb(chats),
+        photo=photo,
+    )
+
+
+@router.callback_query(MenuCB.filter(F.a == "tbl_reall_stop"))
+async def cb_reall_stop(query: CallbackQuery) -> None:
+    if not runtime.is_running("reconfigure_all", 0):
+        await query.answer("Уже не запущено")
+        chats, photo = await _index_photo()
+        await safe_edit(
+            query,
+            table_index_html(len(chats)),
+            _table_kb(chats),
+            photo=photo,
+        )
+        return
+    runtime.request_cancel("reconfigure_all", 0)
+    await query.answer("Останавливаю…")
+    chats, photo = await _index_photo()
+    await safe_edit(
+        query,
+        prompt_html(
+            "Остановка",
+            "Запросил остановку «Перенастроить все». "
+            "Новые аккаунты не стартуют; уже идущие setup можно стопнуть на карточке.",
+            "down",
+        ),
+        _table_kb(chats),
         photo=photo,
     )

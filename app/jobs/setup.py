@@ -14,7 +14,7 @@ from app.store import Store
 from app.tg.client import telethon_client
 from app.tg.resolve import lookup_entity
 from app.tg.scheduler import schedule_chat_forwards, schedule_chat_posts
-from app.tg.unavailable import format_unavailable, is_chat_unavailable
+from app.tg.unavailable import format_unavailable, is_chat_unavailable, is_unavailable_text
 from app.utils.chat_ids import chat_ids_match
 from app.utils.entities import entities_loads
 from app.utils.minutes import period_for_interval, suggest_minute
@@ -139,16 +139,17 @@ async def _fail_unavailable(
     state = await store.record_setup_fail(
         account.id, chat.id, error, max_attempts=max_attempts
     )
+    prefix = f"{account.label}: "
     if state.is_abandoned:
         await log.emit(
-            f"Пропуск «{chat.title}»: недоступен ({error}). "
+            f"{prefix}Пропуск «{chat.title}»: недоступен ({error}). "
             f"Попытка {state.fail_count}/{max_attempts} — больше не пробую "
             f"до начала недели",
             "error",
         )
         return "abandoned"
     await log.emit(
-        f"Пропуск «{chat.title}»: недоступен ({error}). "
+        f"{prefix}Пропуск «{chat.title}»: недоступен ({error}). "
         f"Попытка {state.fail_count}/{max_attempts}, повтор через "
         f"{get_settings().setup_retry_days} дн.",
         "error",
@@ -179,8 +180,8 @@ async def schedule_one_chat(
         state = await store.get_setup_state(account.id, chat.id)
         if state and state.is_abandoned:
             await log.emit(
-                f"Пропуск «{chat.title}»: уже {state.fail_count} неудачных попыток "
-                f"(ждём начало недели)",
+                f"{account.label}: Пропуск «{chat.title}»: уже {state.fail_count} "
+                f"неудачных попыток (ждём начало недели)",
                 "error",
             )
             return "abandoned"
@@ -189,7 +190,7 @@ async def schedule_one_chat(
     use_link = post.is_link_mode and (post.has_text_link or post.has_photo_link)
     if not use_link and not post.text.strip():
         await log.emit(
-            f"Пропуск schedule «{chat.title}»: нет текста "
+            f"{account.label}: Пропуск schedule «{chat.title}»: нет текста "
             f"({'короткий ' if chat.uses_short_text else ''}{chat.lang})",
             "error",
         )
@@ -199,7 +200,7 @@ async def schedule_one_chat(
         fwd = post.pick_forward(want_photo=want_photo)
         if not fwd:
             await log.emit(
-                f"Пропуск schedule «{chat.title}»: нет ссылки "
+                f"{account.label}: Пропуск schedule «{chat.title}»: нет ссылки "
                 f"({'фото' if want_photo else 'текст'})",
                 "error",
             )
@@ -253,7 +254,8 @@ async def schedule_one_chat(
                     from_peer2, msg_id2 = post.pick_forward(want_photo=False)  # type: ignore[misc]
                     assert from_peer2 is not None
                     await log.emit(
-                        f"«{chat.title}»: медиа нельзя — переключаюсь на текстовую ссылку"
+                        f"{account.label}: «{chat.title}»: медиа нельзя — "
+                        f"переключаюсь на текстовую ссылку"
                     )
                     result = await schedule_chat_forwards(
                         client=client,
@@ -286,7 +288,7 @@ async def schedule_one_chat(
             if result.get("media_blocked") and chat.media_allowed:
                 await store.update_chat(chat.id, allow_media=0)
                 await log.emit(
-                    f"«{chat.title}»: фото запрещено — дальше только текст"
+                    f"{account.label}: «{chat.title}»: фото запрещено — дальше только текст"
                 )
     except Exception as e:
         if is_chat_unavailable(e):
@@ -299,7 +301,8 @@ async def schedule_one_chat(
                 max_attempts=max_attempts,
             )
         await log.emit(
-            f"Ошибка schedule «{chat.title}»: {type(e).__name__}: {e}",
+            f"{account.label}: Ошибка schedule «{chat.title}»: "
+            f"{type(e).__name__}: {e}",
             "error",
         )
         await store.record_setup_fail(
@@ -309,8 +312,19 @@ async def schedule_one_chat(
 
     if result["success"] < result["planned"]:
         err = result["error"] or f"{result['success']}/{result['planned']}"
+        # Бан / нет прав писать — как «недоступен», а не «частично»
+        if is_unavailable_text(err):
+            return await _fail_unavailable(
+                store,
+                account,
+                chat,
+                err,
+                log,
+                max_attempts=max_attempts,
+            )
         await log.emit(
-            f"Частично «{chat.title}»: {result['success']}/{result['planned']}"
+            f"{account.label}: Частично «{chat.title}»: "
+            f"{result['success']}/{result['planned']}"
             + (f" | {result['error']}" if result["error"] else ""),
             "error",
         )
@@ -361,7 +375,8 @@ async def schedule_chats_batch(
         "config_error": [],
     }
     for chat in chats:
-        if runtime.cancelled(job_kind, account.id):
+        # setup:cancel по account.id; глобальные jobs (fix_minutes и т.п.) — :0
+        if runtime.cancelled(job_kind, account.id) or runtime.cancelled(job_kind, 0):
             raise SetupError("Остановлено")
         outcome = await schedule_one_chat(
             store,

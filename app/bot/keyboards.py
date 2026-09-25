@@ -309,10 +309,21 @@ def chat_kb(chat: Chat) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def table_chats_kb(chats: list[Chat]) -> InlineKeyboardMarkup:
+def table_chats_kb(
+    chats: list[Chat],
+    *,
+    fix_running: bool = False,
+    reall_running: bool = False,
+) -> InlineKeyboardMarkup:
     rows = [[ib(c.display_name, "tbl", c.id, icon="clock")] for c in chats]
-    rows.append([ib("Выровнять минуты", "tbl_fix", icon="clock")])
-    rows.append([ib("Перенастроить все", "tbl_reall", icon="robot")])
+    if fix_running:
+        rows.append([ib("Остановить выравнивание", "tbl_fix_stop", icon="down")])
+    else:
+        rows.append([ib("Выровнять минуты", "tbl_fix", icon="clock")])
+    if reall_running:
+        rows.append([ib("Остановить перенастройку", "tbl_reall_stop", icon="down")])
+    else:
+        rows.append([ib("Перенастроить все", "tbl_reall", icon="robot")])
     rows.append([ib("Только таблицу", "tbl_rebal", icon="stack")])
     rows.append([ib("Скачать Excel", "tbl_dl", icon="inbox")])
     rows.append([ib("Загрузить Excel", "tbl_ul", icon="folder")])
