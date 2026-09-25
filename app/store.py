@@ -36,6 +36,13 @@ CREATE TABLE IF NOT EXISTS posts (
     text TEXT NOT NULL DEFAULT '',
     entities_json TEXT NOT NULL DEFAULT '[]',
     photo_path TEXT NOT NULL DEFAULT '',
+    delivery TEXT NOT NULL DEFAULT 'post',
+    link_url TEXT NOT NULL DEFAULT '',
+    link_chat_id TEXT NOT NULL DEFAULT '',
+    link_msg_id INTEGER NOT NULL DEFAULT 0,
+    link_photo_url TEXT NOT NULL DEFAULT '',
+    link_photo_chat_id TEXT NOT NULL DEFAULT '',
+    link_photo_msg_id INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (account_id, lang)
 );
 
@@ -116,6 +123,7 @@ DEFAULT_SETTINGS = {
     "cloak_enabled": "0",
     "cloak_text": "",
     "cloak_entities_json": "[]",
+    "mentions_enabled": "0",
     "keep_extra_ids": "",
     "online_ping_enabled": "1",
     "online_ping_hours": "3.5",
@@ -133,13 +141,49 @@ def _now() -> str:
 def _post(row: aiosqlite.Row | None, *, account_id: int, lang: str) -> Post:
     if not row:
         return Post(lang=lang, account_id=account_id)
+    keys = row.keys()
+
+    def _s(name: str, default: str = "") -> str:
+        return (row[name] if name in keys else default) or default
+
+    def _i(name: str, default: int = 0) -> int:
+        if name not in keys or row[name] is None:
+            return default
+        return int(row[name])
+
     return Post(
         lang=row["lang"],
         text=row["text"] or "",
         entities_json=row["entities_json"] or "[]",
         photo_path=row["photo_path"] or "",
-        account_id=int(row["account_id"] if "account_id" in row.keys() else account_id),
+        account_id=int(row["account_id"] if "account_id" in keys else account_id),
+        delivery=_s("delivery", "post") or "post",
+        link_url=_s("link_url"),
+        link_chat_id=_s("link_chat_id"),
+        link_msg_id=_i("link_msg_id", 0),
+        link_photo_url=_s("link_photo_url"),
+        link_photo_chat_id=_s("link_photo_chat_id"),
+        link_photo_msg_id=_i("link_photo_msg_id", 0),
     )
+
+
+async def _migrate_posts_columns(db: aiosqlite.Connection) -> None:
+    cur = await db.execute("PRAGMA table_info(posts)")
+    cols = {row[1] for row in await cur.fetchall()}
+    if not cols:
+        return
+    alters = {
+        "delivery": "ALTER TABLE posts ADD COLUMN delivery TEXT NOT NULL DEFAULT 'post'",
+        "link_url": "ALTER TABLE posts ADD COLUMN link_url TEXT NOT NULL DEFAULT ''",
+        "link_chat_id": "ALTER TABLE posts ADD COLUMN link_chat_id TEXT NOT NULL DEFAULT ''",
+        "link_msg_id": "ALTER TABLE posts ADD COLUMN link_msg_id INTEGER NOT NULL DEFAULT 0",
+        "link_photo_url": "ALTER TABLE posts ADD COLUMN link_photo_url TEXT NOT NULL DEFAULT ''",
+        "link_photo_chat_id": "ALTER TABLE posts ADD COLUMN link_photo_chat_id TEXT NOT NULL DEFAULT ''",
+        "link_photo_msg_id": "ALTER TABLE posts ADD COLUMN link_photo_msg_id INTEGER NOT NULL DEFAULT 0",
+    }
+    for name, sql in alters.items():
+        if name not in cols:
+            await db.execute(sql)
 
 
 async def _migrate_posts_table(db: aiosqlite.Connection) -> None:
@@ -214,6 +258,7 @@ async def _migrate_chats_invite(db: aiosqlite.Connection) -> None:
         "require_channels": "ALTER TABLE chats ADD COLUMN require_channels TEXT NOT NULL DEFAULT ''",
         "is_join_request": "ALTER TABLE chats ADD COLUMN is_join_request INTEGER NOT NULL DEFAULT 0",
         "text_kind": "ALTER TABLE chats ADD COLUMN text_kind TEXT NOT NULL DEFAULT 'full'",
+        "allow_media": "ALTER TABLE chats ADD COLUMN allow_media INTEGER NOT NULL DEFAULT 1",
     }
     for name, sql in alters.items():
         if name not in cols:
@@ -274,6 +319,7 @@ def _chat(row: aiosqlite.Row) -> Chat:
         require_channels=_s("require_channels"),
         is_join_request=_i("is_join_request", 0),
         text_kind=_s("text_kind", "full") or "full",
+        allow_media=_i("allow_media", 1),
         created_at=row["created_at"] or "",
     )
 
@@ -304,6 +350,7 @@ class Store:
             await db.executescript(SCHEMA)
             await db.execute("PRAGMA foreign_keys = ON")
             await _migrate_posts_table(db)
+            await _migrate_posts_columns(db)
             await _migrate_accounts_premium(db)
             await _migrate_chats_invite(db)
             for key, value in DEFAULT_SETTINGS.items():
@@ -355,6 +402,8 @@ class Store:
             cloak_enabled=str(rows.get("cloak_enabled", "0")) not in {"0", "false", "off", ""},
             cloak_text=rows.get("cloak_text", "") or "",
             cloak_entities_json=rows.get("cloak_entities_json", "[]") or "[]",
+            mentions_enabled=str(rows.get("mentions_enabled", "0"))
+            not in {"0", "false", "off", ""},
             keep_extra_ids=rows.get("keep_extra_ids", "") or "",
         )
 
@@ -370,6 +419,7 @@ class Store:
             "cloak_enabled": "cloak_enabled",
             "cloak_text": "cloak_text",
             "cloak_entities_json": "cloak_entities_json",
+            "mentions_enabled": "mentions_enabled",
             "keep_extra_ids": "keep_extra_ids",
         }
         for key, value in kwargs.items():
@@ -489,22 +539,115 @@ class Store:
         text: str,
         entities: list[dict[str, Any]],
         photo_path: str | None = None,
+        *,
+        delivery: str | None = None,
+        clear_photo: bool = False,
     ) -> Post:
-        photo = (
-            photo_path
-            if photo_path is not None
-            else (await self.get_post(account_id, lang)).photo_path
-        )
+        existing = await self.get_post(account_id, lang)
+        if clear_photo:
+            photo = ""
+        elif photo_path is not None:
+            photo = photo_path
+        else:
+            photo = existing.photo_path
+        deliv = delivery if delivery is not None else (existing.delivery or "post")
+        if deliv not in {"post", "link"}:
+            deliv = "post"
         async with self._connect() as db:
             await db.execute(
-                "INSERT INTO posts(account_id, lang, text, entities_json, photo_path) "
-                "VALUES(?, ?, ?, ?, ?) "
+                "INSERT INTO posts(account_id, lang, text, entities_json, photo_path, delivery) "
+                "VALUES(?, ?, ?, ?, ?, ?) "
                 "ON CONFLICT(account_id, lang) DO UPDATE SET text=excluded.text, "
-                "entities_json=excluded.entities_json, photo_path=excluded.photo_path",
-                (account_id, lang, text, json.dumps(entities, ensure_ascii=False), photo),
+                "entities_json=excluded.entities_json, photo_path=excluded.photo_path, "
+                "delivery=excluded.delivery",
+                (
+                    account_id,
+                    lang,
+                    text,
+                    json.dumps(entities, ensure_ascii=False),
+                    photo,
+                    deliv,
+                ),
             )
             await db.commit()
         return await self.get_post(account_id, lang)
+
+    async def save_post_link(
+        self,
+        account_id: int,
+        lang: str,
+        *,
+        kind: str = "text",  # text | photo
+        url: str,
+        chat_ref: str | int,
+        msg_id: int,
+    ) -> Post:
+        """Сохранить ссылку на сообщение канала (text или photo вариант)."""
+        existing = await self.get_post(account_id, lang)
+        chat_s = str(chat_ref).strip()
+        msg_i = int(msg_id)
+        url_s = (url or "").strip()
+        async with self._connect() as db:
+            if kind == "photo":
+                await db.execute(
+                    "INSERT INTO posts(account_id, lang, delivery, "
+                    "link_photo_url, link_photo_chat_id, link_photo_msg_id, "
+                    "text, entities_json, photo_path) "
+                    "VALUES(?,?,?,?,?,?,?,?,?) "
+                    "ON CONFLICT(account_id, lang) DO UPDATE SET "
+                    "delivery='link', "
+                    "link_photo_url=excluded.link_photo_url, "
+                    "link_photo_chat_id=excluded.link_photo_chat_id, "
+                    "link_photo_msg_id=excluded.link_photo_msg_id",
+                    (
+                        account_id,
+                        lang,
+                        "link",
+                        url_s,
+                        chat_s,
+                        msg_i,
+                        existing.text or "",
+                        existing.entities_json or "[]",
+                        existing.photo_path or "",
+                    ),
+                )
+            else:
+                await db.execute(
+                    "INSERT INTO posts(account_id, lang, delivery, "
+                    "link_url, link_chat_id, link_msg_id, "
+                    "text, entities_json, photo_path) "
+                    "VALUES(?,?,?,?,?,?,?,?,?) "
+                    "ON CONFLICT(account_id, lang) DO UPDATE SET "
+                    "delivery='link', "
+                    "link_url=excluded.link_url, "
+                    "link_chat_id=excluded.link_chat_id, "
+                    "link_msg_id=excluded.link_msg_id",
+                    (
+                        account_id,
+                        lang,
+                        "link",
+                        url_s,
+                        chat_s,
+                        msg_i,
+                        existing.text or "",
+                        existing.entities_json or "[]",
+                        existing.photo_path or "",
+                    ),
+                )
+            await db.commit()
+        return await self.get_post(account_id, lang)
+
+    async def set_posts_delivery(self, account_id: int, delivery: str) -> None:
+        deliv = "link" if delivery == "link" else "post"
+        langs = ("ru", "en", "ru_short", "en_short")
+        async with self._connect() as db:
+            for lang in langs:
+                await db.execute(
+                    "INSERT INTO posts(account_id, lang, delivery) VALUES(?,?,?) "
+                    "ON CONFLICT(account_id, lang) DO UPDATE SET delivery=excluded.delivery",
+                    (account_id, lang, deliv),
+                )
+            await db.commit()
 
     async def list_chats(self, kind: str | None = None, enabled_only: bool = False) -> list[Chat]:
         sql = "SELECT * FROM chats WHERE 1=1"
@@ -617,6 +760,7 @@ class Store:
             "require_channels",
             "is_join_request",
             "text_kind",
+            "allow_media",
         }
         fields = {k: v for k, v in fields.items() if k in allowed}
         if "garant_bot" in fields and fields["garant_bot"] is not None:

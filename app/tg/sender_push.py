@@ -148,32 +148,50 @@ async def push_cloak(
     }
 
 
-async def disable_mentions_everywhere(
+async def apply_mentions_everywhere(
     api: SenderAPI,
     sender_id: str,
+    *,
+    enabled: bool,
     live_chats: list[dict[str, Any]] | None = None,
 ) -> int:
     """
-    Выключить глобальные отметки аккаунта и mention у каждого чата.
-    Autoposter по умолчанию часто ставит mention=\"global\" — это и есть
-    «глобальная отметка во всех чатах».
+    Глобальные отметки аккаунта + mention у каждого чата.
+    enabled=False → выкл (не \"global\").
+    enabled=True → аккаунт вкл, чаты mention=\"global\" (как в Autoposter).
     """
-    await api.put_mentions(sender_id, False)
+    await api.put_mentions(sender_id, bool(enabled))
     chats = live_chats if live_chats is not None else await api.list_chats(sender_id)
     patched = 0
+    chat_mention: bool | str = "global" if enabled else False
     for live in chats:
         cid = str(live.get("chat_id") or "")
         if not cid:
             continue
         try:
-            await api.patch_chat(sender_id, cid, mention=False)
+            await api.patch_chat(sender_id, cid, mention=chat_mention)
             patched += 1
         except SenderAPIError:
             try:
-                await api.patch_chat(sender_id, cid, mention=False)
+                # fallback: bool
+                await api.patch_chat(
+                    sender_id, cid, mention=True if enabled else False
+                )
+                patched += 1
             except SenderAPIError:
                 continue
     return patched
+
+
+async def disable_mentions_everywhere(
+    api: SenderAPI,
+    sender_id: str,
+    live_chats: list[dict[str, Any]] | None = None,
+) -> int:
+    """Совместимость: всегда выключить отметки."""
+    return await apply_mentions_everywhere(
+        api, sender_id, enabled=False, live_chats=live_chats
+    )
 
 
 async def push_chat_text(
@@ -182,24 +200,28 @@ async def push_chat_text(
     chat_id: str,
     text: str,
     entities: list[dict[str, Any]] | None = None,
+    *,
+    mentions_enabled: bool = False,
 ) -> dict[str, Any]:
-    """Текст чата: mode=post, упоминания выкл, active=true."""
+    """Текст чата: mode=post, active=true, mention по настройке."""
     del entities  # Autoposter entities в PATCH не принимает
     body = normalize_multiline(text)
+    mention: bool | str = "global" if mentions_enabled else False
     payload = {
         "active": True,
         "mode": "post",
         "text": body,
-        "mention": False,  # не "global" и не true
+        "mention": mention,
     }
     try:
         return await api.patch_chat(sender_id, chat_id, **payload)
     except SenderAPIError as e:
         if e.status != 422:
             raise
-        # fallback по шагам: сначала mention off, потом текст
         try:
-            await api.patch_chat(sender_id, chat_id, mention=False)
+            await api.patch_chat(
+                sender_id, chat_id, mention=True if mentions_enabled else False
+            )
         except SenderAPIError:
             pass
         return await api.patch_chat(sender_id, chat_id, active=True, text=body)

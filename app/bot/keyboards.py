@@ -189,9 +189,29 @@ def confirm_kb(yes: MenuCB, no: MenuCB, yes_text: str = "Запустить") ->
     )
 
 
-def posts_kb(account_id: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
+def posts_kb(account_id: int, *, delivery: str = "post") -> InlineKeyboardMarkup:
+    if delivery == "link":
+        rows = [
+            [
+                ib("Ссылка RU", "pl_ru", account_id, icon="link"),
+                ib("Ссылка EN", "pl_en", account_id, icon="link"),
+            ],
+            [
+                ib("RU фото", "pl_rup", account_id, icon="mega"),
+                ib("EN фото", "pl_enp", account_id, icon="mega"),
+            ],
+            [
+                ib("Кор. RU", "pl_rus", account_id, icon="link"),
+                ib("Кор. EN", "pl_ens", account_id, icon="link"),
+            ],
+            [
+                ib("Кор. RU фото", "pl_rusp", account_id, icon="mega"),
+                ib("Кор. EN фото", "pl_ensp", account_id, icon="mega"),
+            ],
+            [ib("Режим: ссылка → пост", "post_mode", account_id, icon="cube")],
+        ]
+    else:
+        rows = [
             [
                 ib("Задать RU", "post_ru", account_id, icon="bookmark"),
                 ib("Задать EN", "post_en", account_id, icon="pin"),
@@ -200,11 +220,12 @@ def posts_kb(account_id: int) -> InlineKeyboardMarkup:
                 ib("Короткий RU", "post_rus", account_id, icon="mega"),
                 ib("Короткий EN", "post_ens", account_id, icon="mega"),
             ],
-            [ib("Превью с тегом", "post_prev", account_id, icon="search")],
-            [ib("Аккаунт", "acc", account_id, icon="user")],
-            home_row(),
+            [ib("Режим: пост → ссылка", "post_mode", account_id, icon="link")],
         ]
-    )
+    rows.append([ib("Превью с тегом", "post_prev", account_id, icon="search")])
+    rows.append([ib("Аккаунт", "acc", account_id, icon="user")])
+    rows.append(home_row())
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def chats_kb(chats: list[Chat], page: int = 0) -> InlineKeyboardMarkup:
@@ -322,13 +343,19 @@ def table_kb(chat: Chat, slots: list[MinuteSlot], accounts: list[Account]) -> In
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def sender_kb() -> InlineKeyboardMarkup:
+def sender_kb(*, mentions_enabled: bool = False) -> InlineKeyboardMarkup:
+    if mentions_enabled:
+        ment_btn = ib("Выключить упоминания", "s_mentions", icon="block")
+    else:
+        ment_btn = ib("Включить упоминания", "s_mentions", icon="check")
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [ib("Between", "s_between", icon="clock"), ib("Cycle", "s_cycle", icon="stack")],
             [ib("Per-chat", "s_pchat", icon="pin"), ib("Parallel", "s_par", icon="users")],
             [ib("Текст клоакинга", "s_cloak", icon="shield")],
-            [ib("Клоакинг → все аккаунты", "s_cloak_all", icon="up")],
+            [ib("Обновить клоакинг для всех аккаунтов", "s_cloak_all", icon="up")],
+            [ment_btn],
+            [ib("Применить упоминания ко всем", "s_mentions_all", icon="users")],
             [ib("Keep extra ids", "s_keep", icon="lock")],
             home_row(),
         ]

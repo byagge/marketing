@@ -193,15 +193,21 @@ async def run_join_all_accounts(
     bot: Bot,
     admin_chat_id: int,
 ) -> str:
+    from app.jobs.parallel import map_batches, setup_parallel_defaults
+
     accounts = [a for a in await store.list_accounts() if a.telethon_session]
     job = await store.create_job("join_all_accounts", None)
     log = LogSink(store, job.id, bot, admin_chat_id)
     lines: list[str] = []
+    batch_size, batch_pause = setup_parallel_defaults()
     try:
-        await log.emit(f"Вступление во все чаты на {len(accounts)} аккаунтах…")
-        for acc in accounts:
+        await log.emit(
+            f"Вступление во все чаты: {len(accounts)} акк., параллельно ×{batch_size}…"
+        )
+
+        async def _one(acc: Account) -> str:
             if runtime.cancelled("join_all_accounts", 0):
-                raise RuntimeError("Остановлено")
+                return f"{acc.label}: остановлено"
             try:
                 results = await run_join_chats(
                     store, acc.id, None, bot, admin_chat_id, job_kind="join_chats"
@@ -209,10 +215,30 @@ async def run_join_all_accounts(
                 ok = sum(
                     1 for r in results if r.status in {"joined", "already", "captcha_ok"}
                 )
-                lines.append(f"{acc.label}: ok={ok}/{len(results)}")
+                line = f"{acc.label}: ok={ok}/{len(results)}"
+                await log.emit(f"✓ {line}", notify=False)
+                return line
             except Exception as e:
-                lines.append(f"{acc.label}: {type(e).__name__}: {e}")
-                await log.emit(f"✗ {acc.label}: {e}", "error")
+                line = f"{acc.label}: {type(e).__name__}: {e}"
+                await log.emit(f"✗ {line}", "error")
+                return line
+
+        async def _on_batch(n: int, batch):
+            await log.emit(f"Пачка {n}: " + ", ".join(a.label for a in batch))
+
+        results = await map_batches(
+            accounts,
+            _one,
+            batch_size=batch_size,
+            batch_pause=batch_pause,
+            is_cancelled=lambda: runtime.cancelled("join_all_accounts", 0),
+            on_batch=_on_batch,
+        )
+        for r in results:
+            if isinstance(r, BaseException):
+                lines.append(f"error: {r}")
+            else:
+                lines.append(str(r))
         report = "\n".join(lines)
         await store.finish_job(job.id, "done", report)
         await log.emit("Массовое вступление завершено.\n" + report)

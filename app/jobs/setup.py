@@ -13,7 +13,7 @@ from app.sender_api import SenderAPI
 from app.store import Store
 from app.tg.client import telethon_client
 from app.tg.resolve import lookup_entity
-from app.tg.scheduler import schedule_chat_posts
+from app.tg.scheduler import schedule_chat_forwards, schedule_chat_posts
 from app.tg.unavailable import format_unavailable, is_chat_unavailable
 from app.utils.chat_ids import chat_ids_match
 from app.utils.entities import entities_loads
@@ -21,7 +21,7 @@ from app.utils.minutes import period_for_interval, suggest_minute
 from app.utils.schedule import resolve_repeat_period
 from app.utils.templates import pick_post_for_chat, render_post
 from app.tg.sender_push import (
-    disable_mentions_everywhere,
+    apply_mentions_everywhere,
     has_premium_emoji,
     normalize_multiline,
     push_chat_text,
@@ -123,6 +123,7 @@ async def _mute_schedule_on_sender(
         cid = str(live.get("chat_id") or "")
         if cid and match_catalog_chat(cid, schedule_chats):
             # schedule не в рассылке + без отметок
+            # schedule не в рассылке; mention по общей настройке не трогаем здесь
             await api.patch_chat(sender_id, cid, active=False, mention=False)
 
 
@@ -185,19 +186,30 @@ async def schedule_one_chat(
             return "abandoned"
 
     post = pick_post_for_chat(posts, chat)
-    if not post.text.strip():
+    use_link = post.is_link_mode and (post.has_text_link or post.has_photo_link)
+    if not use_link and not post.text.strip():
         await log.emit(
             f"Пропуск schedule «{chat.title}»: нет текста "
             f"({'короткий ' if chat.uses_short_text else ''}{chat.lang})",
             "error",
         )
         return "config_error"
-
-    text, entities = render_post(
-        post.text,
-        entities_loads(post.entities_json),
-        chat.tag,
-    )
+    if use_link:
+        want_photo = chat.media_allowed
+        fwd = post.pick_forward(want_photo=want_photo)
+        if not fwd:
+            await log.emit(
+                f"Пропуск schedule «{chat.title}»: нет ссылки "
+                f"({'фото' if want_photo else 'текст'})",
+                "error",
+            )
+            return "config_error"
+    else:
+        text, entities = render_post(
+            post.text,
+            entities_loads(post.entities_json),
+            chat.tag,
+        )
     slot = await store.slot_for(chat.id, account.id)
     minute = slot.start_minute if slot else await ensure_minute(store, chat, account)
     repeat_period = resolve_repeat_period(is_premium, settings.repeat_period)
@@ -213,18 +225,69 @@ async def schedule_one_chat(
                 log,
                 max_attempts=max_attempts,
             )
-        result = await schedule_chat_posts(
-            client=client,
-            target=entity,
-            text=text,
-            entities=entities,
-            start_minute=minute,
-            interval_minutes=chat.interval_minutes,
-            start_hour=settings.start_hour,
-            tz=settings.tz,
-            repeat_period=repeat_period,
-            photo_path=post.photo_path or None,
-        )
+        if use_link:
+            from_peer, msg_id = post.pick_forward(want_photo=chat.media_allowed)  # type: ignore[misc]
+            assert from_peer is not None
+            result = await schedule_chat_forwards(
+                client=client,
+                target=entity,
+                from_peer=from_peer,
+                message_id=msg_id,
+                start_minute=minute,
+                interval_minutes=chat.interval_minutes,
+                start_hour=settings.start_hour,
+                tz=settings.tz,
+                repeat_period=repeat_period,
+            )
+            # если фото-ссылка не прошла из-за медиа — пробуем text-link
+            if (
+                result["success"] < result["planned"]
+                and chat.media_allowed
+                and post.has_photo_link
+                and post.has_text_link
+            ):
+                err_l = (result.get("error") or "").casefold()
+                if "media" in err_l or "forbidden" in err_l or result["success"] == 0:
+                    await store.update_chat(chat.id, allow_media=0)
+                    chat = await store.get_chat(chat.id) or chat
+                    from_peer2, msg_id2 = post.pick_forward(want_photo=False)  # type: ignore[misc]
+                    assert from_peer2 is not None
+                    await log.emit(
+                        f"«{chat.title}»: медиа нельзя — переключаюсь на текстовую ссылку"
+                    )
+                    result = await schedule_chat_forwards(
+                        client=client,
+                        target=entity,
+                        from_peer=from_peer2,
+                        message_id=msg_id2,
+                        start_minute=minute,
+                        interval_minutes=chat.interval_minutes,
+                        start_hour=settings.start_hour,
+                        tz=settings.tz,
+                        repeat_period=repeat_period,
+                    )
+        else:
+            photo = post.photo_path or None
+            if not chat.media_allowed:
+                photo = None
+            result = await schedule_chat_posts(
+                client=client,
+                target=entity,
+                text=text,
+                entities=entities,
+                start_minute=minute,
+                interval_minutes=chat.interval_minutes,
+                start_hour=settings.start_hour,
+                tz=settings.tz,
+                repeat_period=repeat_period,
+                photo_path=photo,
+                allow_media=chat.media_allowed,
+            )
+            if result.get("media_blocked") and chat.media_allowed:
+                await store.update_chat(chat.id, allow_media=0)
+                await log.emit(
+                    f"«{chat.title}»: фото запрещено — дальше только текст"
+                )
     except Exception as e:
         if is_chat_unavailable(e):
             return await _fail_unavailable(
@@ -258,6 +321,10 @@ async def schedule_one_chat(
 
     await store.record_setup_ok(account.id, chat.id)
     tag_note = f" | тег {chat.tag}" if chat.tag.strip() else ""
+    mode_note = " | forward" if result.get("mode") == "forward" else ""
+    photo_note = ""
+    if result.get("mode") != "forward":
+        photo_note = " | фото" if result.get("used_photo") else " | без фото"
     repeat_note = (
         f" | repeat {repeat_period}s"
         if repeat_period
@@ -267,8 +334,9 @@ async def schedule_one_chat(
         f"На аккаунт {account.label} настроил отправку на чат "
         f"«{result['title']}» | :{minute:02d} | "
         f"{result['success']} слотов | старт {result['first_time']}"
-        f"{tag_note}{repeat_note}"
-        + (f" | очистил {result['cleared']} старых" if result["cleared"] else "")
+        f"{tag_note}{mode_note}{photo_note}{repeat_note}"
+        + (f" | очистил {result['cleared']} старых" if result["cleared"] else ""),
+        notify=False,
     )
     return "ok"
 
@@ -362,11 +430,16 @@ async def _configure_sender(
         f"parallel={ss.parallel}"
     )
 
-    # Упоминания / «глобальная отметка» — всегда OFF на этом аккаунте.
+    # Упоминания / «глобальная отметка» — по настройке Sender (по умолчанию выкл).
     live_chats = await api.list_chats(sender_id)
-    ment_n = await disable_mentions_everywhere(api, sender_id, live_chats)
+    mentions_on = bool(getattr(ss, "mentions_enabled", False))
+    ment_n = await apply_mentions_everywhere(
+        api, sender_id, enabled=mentions_on, live_chats=live_chats
+    )
     await log.emit(
-        f"{account.label}: упоминания выкл (аккаунт + {ment_n} чатов, не global)"
+        f"{account.label}: упоминания "
+        f"{'вкл (global)' if mentions_on else 'выкл'} "
+        f"(аккаунт + {ment_n} чатов)"
     )
 
     # Клоакинг — полный пуш на этот аккаунт (без apply-all).
@@ -427,9 +500,15 @@ async def _configure_sender(
             entities_loads(post.entities_json),
             tag,
         )
-        await push_chat_text(api, sender_id, cid, text, ents)
+        await push_chat_text(
+            api, sender_id, cid, text, ents, mentions_enabled=mentions_on
+        )
         sender_count += 1
-        await log.emit(f"Sender: включил «{title}» ({kind_note}, mention=off)")
+        await log.emit(
+            f"Sender: включил «{title}» ({kind_note}, "
+            f"mention={'on' if mentions_on else 'off'})",
+            notify=False,
+        )
 
     if sender_count:
         await api.spam_start(sender_id)
@@ -437,7 +516,9 @@ async def _configure_sender(
         live_chats = await api.list_chats(sender_id)
         await _mute_schedule_on_sender(api, sender_id, live_chats, schedule_chats)
         # после старта снова глушим отметки (на случай дефолтов Autoposter)
-        await disable_mentions_everywhere(api, sender_id, live_chats)
+        await apply_mentions_everywhere(
+            api, sender_id, enabled=mentions_on, live_chats=live_chats
+        )
         # и снова клоакинг — spam/start не должен его сбрасывать, но проверяем
         cloak_res = await push_cloak(
             api, sender_id, enabled=cloak_on, text=cloak_text
@@ -476,8 +557,14 @@ async def run_setup(store: Store, account_id: int, bot: Bot, admin_chat_id: int)
             "ru_short": await store.get_post(account.id, "ru_short"),
             "en_short": await store.get_post(account.id, "en_short"),
         }
-        if not posts["ru"].text.strip() and not posts["en"].text.strip():
-            raise SetupError("Сначала задайте пост этого аккаунта (RU/EN)")
+        has_any = any(
+            (p.text or "").strip()
+            or p.has_text_link
+            or p.has_photo_link
+            for p in posts.values()
+        )
+        if not has_any:
+            raise SetupError("Сначала задайте пост или ссылку (RU/EN)")
 
         chats = await store.list_chats(enabled_only=True)
         schedule_chats = [c for c in chats if c.is_schedule]
@@ -645,7 +732,10 @@ async def run_setup_chats_only(
         "ru_short": await store.get_post(account.id, "ru_short"),
         "en_short": await store.get_post(account.id, "en_short"),
     }
-    if not posts["ru"].text.strip() and not posts["en"].text.strip():
+    has_any = any(
+        (p.text or "").strip() or p.has_text_link or p.has_photo_link for p in posts.values()
+    )
+    if not has_any:
         return empty
 
     chats: list[Chat] = []

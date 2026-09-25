@@ -7,6 +7,7 @@ from aiogram import Bot
 
 from app.config import get_settings
 from app.jobs.health import run_health_all
+from app.jobs.parallel import map_batches, setup_parallel_defaults
 from app.jobs.setup import run_setup_chats_only
 from app.store import Store
 from app.tg.client import telethon_client
@@ -42,10 +43,14 @@ async def run_setup_retries(store: Store, bot: Bot | None, admin_chat_id: int | 
         except Exception:
             pass
 
+    batch_size, batch_pause = setup_parallel_defaults()
+    items = list(by_account.items())
     ok_n = skip_n = abandoned_n = 0
-    for account_id, chat_pks in by_account.items():
+
+    async def _one(item: tuple[int, list[int]]):
+        account_id, chat_pks = item
         try:
-            buckets = await run_setup_chats_only(
+            return await run_setup_chats_only(
                 store,
                 account_id,
                 chat_pks,
@@ -56,6 +61,13 @@ async def run_setup_retries(store: Store, bot: Bot | None, admin_chat_id: int | 
             )
         except Exception as e:
             log.exception("setup retry failed for account %s: %s", account_id, e)
+            return {"ok": [], "skipped": [], "abandoned": [], "config_error": []}
+
+    results = await map_batches(
+        items, _one, batch_size=batch_size, batch_pause=batch_pause
+    )
+    for buckets in results:
+        if isinstance(buckets, BaseException):
             continue
         ok_n += len(buckets.get("ok", []))
         skip_n += len(buckets.get("skipped", [])) + len(buckets.get("config_error", []))
@@ -99,10 +111,14 @@ async def run_weekly_recheck(store: Store, bot: Bot, admin_chat_id: int) -> None
         f"к проверке: {len(pending)} чатов",
     )
 
+    batch_size, batch_pause = setup_parallel_defaults()
+    items = list(by_account.items())
     ok_n = skip_n = abandoned_n = 0
-    for account_id, chat_pks in by_account.items():
+
+    async def _one(item: tuple[int, list[int]]):
+        account_id, chat_pks = item
         try:
-            buckets = await run_setup_chats_only(
+            return await run_setup_chats_only(
                 store,
                 account_id,
                 chat_pks,
@@ -113,6 +129,13 @@ async def run_weekly_recheck(store: Store, bot: Bot, admin_chat_id: int) -> None
             )
         except Exception as e:
             log.exception("weekly recheck failed for account %s: %s", account_id, e)
+            return {"ok": [], "skipped": [], "abandoned": [], "config_error": []}
+
+    results = await map_batches(
+        items, _one, batch_size=batch_size, batch_pause=batch_pause
+    )
+    for buckets in results:
+        if isinstance(buckets, BaseException):
             continue
         ok_n += len(buckets.get("ok", []))
         skip_n += len(buckets.get("skipped", [])) + len(buckets.get("config_error", []))
@@ -158,24 +181,21 @@ async def run_nonpremium_daily_reschedule(
     renewed = skipped_premium = 0
     ok_n = skip_n = abandoned_n = 0
     enabled_pks = set(chat_pks)
-    for acc in accounts:
+    batch_size, batch_pause = setup_parallel_defaults()
+
+    async def _one(acc):
+        nonlocal skipped_premium
         try:
-            # Peek Premium first so we never wipe Premium schedules with a non-repeat grid.
             async with telethon_client(acc.telethon_session) as client:
                 me = await client.get_me()
                 is_premium = bool(getattr(me, "premium", False))
             await store.update_account(acc.id, is_premium=1 if is_premium else 0)
             if is_premium:
-                skipped_premium += 1
-                continue
-
-            # Only renew chats that already scheduled successfully.
-            # Pending/abandoned stay with retry (3d) and weekly jobs.
+                return ("premium", None)
             ok_states = await store.list_setup_states(acc.id, statuses=["ok"])
             renew_pks = [s.chat_pk for s in ok_states if s.chat_pk in enabled_pks]
             if not renew_pks:
-                continue
-
+                return ("skip", None)
             buckets = await run_setup_chats_only(
                 store,
                 acc.id,
@@ -185,15 +205,27 @@ async def run_nonpremium_daily_reschedule(
                 job_kind="setup_daily_nonpremium",
                 skip_abandoned=True,
             )
+            return ("ok", buckets)
+        except Exception as e:
+            log.exception("nonpremium daily failed for account %s: %s", acc.id, e)
+            return ("err", None)
+
+    results = await map_batches(
+        accounts, _one, batch_size=batch_size, batch_pause=batch_pause
+    )
+    for r in results:
+        if isinstance(r, BaseException):
+            continue
+        kind, buckets = r
+        if kind == "premium":
+            skipped_premium += 1
+        elif kind == "ok" and buckets:
             renewed += 1
             ok_n += len(buckets.get("ok", []))
             skip_n += len(buckets.get("skipped", [])) + len(
                 buckets.get("config_error", [])
             )
             abandoned_n += len(buckets.get("abandoned", []))
-        except Exception as e:
-            log.exception("nonpremium daily failed for account %s: %s", acc.id, e)
-            continue
 
     summary = (
         f"Суточный schedule (non-Premium): обновлено аккаунтов={renewed}, "

@@ -162,7 +162,20 @@ def online_html(cfg: OnlinePingSettings, accounts: list[Account]) -> str:
 
 
 def posts_html(acc: Account, ru, en, ru_short=None, en_short=None) -> str:
+    delivery = (ru.delivery if ru else "post") or "post"
+
     def block(lang, post, *, short: bool = False) -> str:
+        if post is None:
+            return ""
+        if (post.delivery or delivery) == "link":
+            t_link = escape((post.link_url or "—")[:60])
+            p_link = escape((post.link_photo_url or "—")[:60])
+            title = f"{lang.upper()} коротк." if short else lang.upper()
+            return (
+                f"{pe('link')} <b>{title}</b> (ссылка)\n"
+                f"{pe('pin')} текст: <code>{t_link}</code>\n"
+                f"{pe('mega')} фото: <code>{p_link}</code>"
+            )
         ents = entities_loads(post.entities_json)
         emoji_n = sum(1 for e in ents if "emoji" in str(e.get("type")))
         preview = escape((post.text or "").replace("\n", " ")[:140] or "—")
@@ -175,11 +188,18 @@ def posts_html(acc: Account, ru, en, ru_short=None, en_short=None) -> str:
             f"<i>{preview}</i>"
         )
 
+    mode_line = (
+        f"{pe('link')} режим: <b>ссылка</b> (пересылка с «Переслано из»)\n"
+        if delivery == "link"
+        else f"{pe('mega')} режим: <b>пост</b> (свой текст/фото)\n"
+    )
     parts = [
         f"{pe('mega')} <b>Пост</b> {escape(acc.label)}\n"
-        f"{pe('user')} Только этот аккаунт. Другие аккаунты не используют этот текст.\n"
-        f"{pe('pin')} <code>{{{{GARANT}}}}</code> {pe('pin')} тег чата, иначе пропуск.\n"
-        f"{pe('info')} Короткий текст — до 500 символов; в чате можно выбрать «короткий текст».\n\n"
+        f"{pe('user')} Только этот аккаунт.\n"
+        f"{mode_line}"
+        f"{pe('pin')} <code>{{{{GARANT}}}}</code> — тег чата (режим пост).\n"
+        f"{pe('info')} Короткий — до 500 симв. В чате: полный/короткий.\n"
+        f"{pe('info')} Нет фото в чате → текст или текстовая ссылка.\n\n"
         + block("ru", ru)
         + "\n\n"
         + block("en", en)
@@ -226,6 +246,7 @@ def chat_html(chat: Chat) -> str:
         f"{pe('cube')} тип: <b>{kind}</b>\n"
         f"{pe('bookmark')} язык: <b>{escape(chat.lang)}</b>\n"
         f"{pe('mega')} текст: <b>{'короткий' if chat.uses_short_text else 'полный'}</b>\n"
+        f"{pe('mega')} медиа: <b>{'да' if chat.media_allowed else 'нет (только текст)'}</b>\n"
         f"{pe('pin')} тег/гарант: <code>{escape(chat.tag or '—')}</code>\n"
         f"{pe('clock')} интервал: <b>{chat.interval_minutes} мин</b>\n"
         f"{pe('shield')} капча: <b>{escape(CAPTCHA_KIND_LABEL.get(chat.captcha_kind, chat.captcha_kind))}</b>\n"
@@ -301,7 +322,9 @@ def sender_html(ss) -> str:
         f"{pe('users')} parallel: <b>{ss.parallel}</b>\n"
         f"{pe('shield')} клоакинг: {on_off(ss.cloak_enabled)}"
         f"{f' | premium emoji: {ents}' if ents else ''}\n"
-        f"<i>{cloak}</i>\n\n"
+        f"<i>{cloak}</i>\n"
+        f"{pe('users')} глобальные упоминания: "
+        f"{on_off(bool(getattr(ss, 'mentions_enabled', False)))}\n\n"
         f"{pe('lock')} keep extra ids: <code>{escape(ss.keep_extra_ids or '—')}</code>"
     )
 
@@ -310,7 +333,8 @@ def setup_html() -> str:
     return (
         f"{pe('robot')} <b>Старт настройки</b>\n\n"
         f"Сначала все schedule-чаты из каталога, затем sender:\n"
-        f"пост, интервалы, клоакинг, чаты; упоминания/отметки — всегда выкл.\n"
+        f"пост, интервалы, клоакинг, чаты; упоминания — по настройке Sender "
+        f"(по умолчанию выкл).\n"
         f"На карточке аккаунта: Старт → Стоп, ошибка вернёт Старт.\n\n"
         f"Выберите действие:"
     )

@@ -53,10 +53,53 @@ class Post:
     entities_json: str = "[]"
     photo_path: str = ""
     account_id: int = 0
+    # post = свой текст/фото; link = пересылка из канала (сохраняет Forwarded from)
+    delivery: str = "post"
+    link_url: str = ""
+    link_chat_id: str = ""  # int as str or @username
+    link_msg_id: int = 0
+    link_photo_url: str = ""
+    link_photo_chat_id: str = ""
+    link_photo_msg_id: int = 0
 
     @property
     def is_short(self) -> bool:
         return (self.lang or "").endswith("_short")
+
+    @property
+    def is_link_mode(self) -> bool:
+        return (self.delivery or "post") == "link"
+
+    @property
+    def has_compose(self) -> bool:
+        return bool((self.text or "").strip() or (self.photo_path or "").strip())
+
+    @property
+    def has_text_link(self) -> bool:
+        return bool(self.link_msg_id and (self.link_chat_id or "").strip())
+
+    @property
+    def has_photo_link(self) -> bool:
+        return bool(self.link_photo_msg_id and (self.link_photo_chat_id or "").strip())
+
+    def pick_forward(
+        self, *, want_photo: bool
+    ) -> tuple[str | int, int] | None:
+        """Выбрать источник пересылки: фото-ссылка или текстовая."""
+        if want_photo and self.has_photo_link:
+            return _peer_ref(self.link_photo_chat_id), int(self.link_photo_msg_id)
+        if self.has_text_link:
+            return _peer_ref(self.link_chat_id), int(self.link_msg_id)
+        if self.has_photo_link:
+            return _peer_ref(self.link_photo_chat_id), int(self.link_photo_msg_id)
+        return None
+
+
+def _peer_ref(raw: str) -> str | int:
+    s = (raw or "").strip()
+    if s.lstrip("-").isdigit():
+        return int(s)
+    return s.lstrip("@")
 
 
 @dataclass
@@ -79,6 +122,7 @@ class Chat:
     require_channels: str = ""  # @ch1, @ch2 или ссылки
     is_join_request: int = 0
     text_kind: str = "full"  # full | short
+    allow_media: int = 1  # 0 = чат без фото, шлём текст / text-link
     created_at: str = ""
 
     @property
@@ -88,6 +132,10 @@ class Chat:
     @property
     def uses_short_text(self) -> bool:
         return (self.text_kind or "full") == "short"
+
+    @property
+    def media_allowed(self) -> bool:
+        return bool(self.allow_media)
 
     @property
     def tg_id(self) -> int | str:
@@ -189,6 +237,7 @@ class SenderSettings:
     cloak_enabled: bool = False
     cloak_text: str = ""
     cloak_entities_json: str = "[]"
+    mentions_enabled: bool = False  # глобальные отметки; по умолчанию выкл
     keep_extra_ids: str = ""
     extra: dict[str, Any] = field(default_factory=dict)
 

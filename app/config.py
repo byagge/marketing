@@ -37,6 +37,14 @@ class Settings(BaseSettings):
     weekly_health_dow: str = "mon"
     weekly_health_hour: int = 10
 
+    # Параллельная настройка аккаунтов (Telethon разные сессии — ок).
+    # 8–10 обычно безопасно; FloodWait обрабатывается внутри.
+    setup_parallel: int = 8
+    setup_batch_pause_sec: float = 1.5
+    # Пауза между scheduled-сообщениями внутри одного чата.
+    schedule_pause_sec: float = 0.22
+    schedule_delete_pause_sec: float = 0.12
+
     # Retry schedule setup for chats the account cannot access yet
     setup_retry_days: int = 3
     setup_max_attempts: int = 3

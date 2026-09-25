@@ -19,6 +19,15 @@ class EditPost(StatesGroup):
     en = State()
     ru_short = State()
     en_short = State()
+    # ссылки на сообщения канала
+    link_ru = State()
+    link_en = State()
+    link_ru_short = State()
+    link_en_short = State()
+    link_ru_photo = State()
+    link_en_photo = State()
+    link_ru_short_photo = State()
+    link_en_short_photo = State()
     cloak = State()
 
 

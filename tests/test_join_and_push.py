@@ -7,6 +7,7 @@ from app.tg.join import (
     needs_bot_flow,
 )
 from app.tg.sender_push import (
+    apply_mentions_everywhere,
     disable_mentions_everywhere,
     has_premium_emoji,
     normalize_multiline,
@@ -113,6 +114,29 @@ async def test_disable_mentions_everywhere():
 
 
 @pytest.mark.asyncio
+async def test_apply_mentions_everywhere_on():
+    class FakeAPI:
+        def __init__(self):
+            self.mentions = None
+            self.patches = []
+
+        async def put_mentions(self, account_id, enabled):
+            self.mentions = enabled
+
+        async def list_chats(self, account_id):
+            return [{"chat_id": "-1001"}]
+
+        async def patch_chat(self, account_id, chat_id, **fields):
+            self.patches.append((chat_id, fields))
+
+    api = FakeAPI()
+    n = await apply_mentions_everywhere(api, "acc1", enabled=True)
+    assert api.mentions is True
+    assert n == 1
+    assert api.patches[0][1].get("mention") == "global"
+
+
+@pytest.mark.asyncio
 async def test_push_chat_text_forces_mention_off():
     class FakeAPI:
         def __init__(self):
@@ -128,3 +152,18 @@ async def test_push_chat_text_forces_mention_off():
     assert api.fields["active"] is True
     assert api.fields["mode"] == "post"
     assert api.fields["text"] == "hi\nthere"
+
+
+@pytest.mark.asyncio
+async def test_push_chat_text_mentions_on():
+    class FakeAPI:
+        def __init__(self):
+            self.fields = None
+
+        async def patch_chat(self, account_id, chat_id, **fields):
+            self.fields = fields
+            return {"ok": True}
+
+    api = FakeAPI()
+    await push_chat_text(api, "acc1", "-1001", "hi", mentions_enabled=True)
+    assert api.fields["mention"] == "global"
