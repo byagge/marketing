@@ -15,23 +15,66 @@ from app.utils.schedule import build_schedule_times, posts_count_for_interval
 
 log = logging.getLogger(__name__)
 
-# Ошибки «в этот чат нельзя медиа»
+# Ошибки «в этот чат нельзя медиа/фото» → шлём только текст (caption).
 _MEDIA_FORBIDDEN_MARKERS = (
     "chatsendmediaforbidden",
     "chat_send_media_forbidden",
-    "chatforbidsforwarding",  # иногда
+    "chatsendphotosforbidden",
+    "chat_send_photos_forbidden",
+    "sendmessagemediainvalid",
+    "chatforbidsforwarding",
     "media_invalid",
     "mediaempty",
-    "allow_payment_required",  # не то, но
 )
 
 
 def is_media_forbidden_error(exc: BaseException) -> bool:
     name = type(exc).__name__.casefold()
     msg = str(exc).casefold()
-    if "media" in name and ("forbidden" in name or "invalid" in name or "empty" in name):
+    compact = name.replace("_", "")
+    if ("media" in compact or "photo" in compact) and (
+        "forbidden" in compact or "invalid" in compact or "empty" in compact
+    ):
         return True
-    return any(m in name or m in msg for m in _MEDIA_FORBIDDEN_MARKERS)
+    return any(m in name or m in msg or m in compact for m in _MEDIA_FORBIDDEN_MARKERS)
+
+
+def _banned_rights_forbid_photos(rights: Any) -> bool:
+    """В ChatBannedRights True = право запрещено."""
+    if rights is None:
+        return False
+    return bool(
+        getattr(rights, "send_photos", False) or getattr(rights, "send_media", False)
+    )
+
+
+async def peer_allows_photos(client: TelegramClient, entity: Any) -> bool:
+    """
+    Можно ли слать фото в этот чат от текущего аккаунта.
+    При сомнении — True (далее сработает реактивный fallback).
+    """
+    try:
+        perms = await client.get_permissions(entity, "me")
+    except Exception:
+        return True
+    if perms is None:
+        return True
+    if getattr(perms, "is_admin", False) or getattr(perms, "is_creator", False):
+        return True
+    participant = getattr(perms, "participant", None)
+    personal = getattr(participant, "banned_rights", None) if participant else None
+    if _banned_rights_forbid_photos(personal):
+        return False
+    if getattr(perms, "has_default_permissions", False):
+        defaults = getattr(entity, "default_banned_rights", None)
+        if defaults is None:
+            try:
+                defaults = await client.get_permissions(entity)
+            except Exception:
+                defaults = None
+        if _banned_rights_forbid_photos(defaults):
+            return False
+    return True
 
 
 def _extract_sent_message(updates):

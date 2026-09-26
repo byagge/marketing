@@ -13,7 +13,12 @@ from app.sender_api import SenderAPI
 from app.store import Store
 from app.tg.client import telethon_client
 from app.tg.resolve import lookup_entity
-from app.tg.scheduler import schedule_chat_forwards, schedule_chat_posts
+from app.tg.scheduler import (
+    is_media_forbidden_error,
+    peer_allows_photos,
+    schedule_chat_forwards,
+    schedule_chat_posts,
+)
 from app.tg.unavailable import format_unavailable, is_chat_unavailable, is_unavailable_text
 from app.utils.chat_ids import chat_ids_match
 from app.utils.entities import entities_loads
@@ -226,8 +231,22 @@ async def schedule_one_chat(
                 log,
                 max_attempts=max_attempts,
             )
+        # заранее: если в чат нельзя фото — сразу без медиа (caption/текст)
+        want_media = chat.media_allowed
+        if want_media and (
+            (use_link and post.has_photo_link)
+            or (not use_link and bool(post.photo_path))
+        ):
+            if not await peer_allows_photos(client, entity):
+                want_media = False
+                await store.update_chat(chat.id, allow_media=0)
+                chat = await store.get_chat(chat.id) or chat
+                await log.emit(
+                    f"{account.label}: «{chat.title}»: фото запрещено правами — "
+                    f"выкладываю только текст"
+                )
         if use_link:
-            from_peer, msg_id = post.pick_forward(want_photo=chat.media_allowed)  # type: ignore[misc]
+            from_peer, msg_id = post.pick_forward(want_photo=want_media)  # type: ignore[misc]
             assert from_peer is not None
             result = await schedule_chat_forwards(
                 client=client,
@@ -243,12 +262,18 @@ async def schedule_one_chat(
             # если фото-ссылка не прошла из-за медиа — пробуем text-link
             if (
                 result["success"] < result["planned"]
-                and chat.media_allowed
+                and want_media
                 and post.has_photo_link
                 and post.has_text_link
             ):
-                err_l = (result.get("error") or "").casefold()
-                if "media" in err_l or "forbidden" in err_l or result["success"] == 0:
+                err = result.get("error") or ""
+                if (
+                    is_media_forbidden_error(RuntimeError(err))
+                    or "media" in err.casefold()
+                    or "photo" in err.casefold()
+                    or "forbidden" in err.casefold()
+                    or result["success"] == 0
+                ):
                     await store.update_chat(chat.id, allow_media=0)
                     chat = await store.get_chat(chat.id) or chat
                     from_peer2, msg_id2 = post.pick_forward(want_photo=False)  # type: ignore[misc]
@@ -270,7 +295,7 @@ async def schedule_one_chat(
                     )
         else:
             photo = post.photo_path or None
-            if not chat.media_allowed:
+            if not want_media:
                 photo = None
             result = await schedule_chat_posts(
                 client=client,
@@ -283,9 +308,9 @@ async def schedule_one_chat(
                 tz=settings.tz,
                 repeat_period=repeat_period,
                 photo_path=photo,
-                allow_media=chat.media_allowed,
+                allow_media=want_media,
             )
-            if result.get("media_blocked") and chat.media_allowed:
+            if result.get("media_blocked") and want_media:
                 await store.update_chat(chat.id, allow_media=0)
                 await log.emit(
                     f"{account.label}: «{chat.title}»: фото запрещено — дальше только текст"
