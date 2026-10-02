@@ -200,3 +200,89 @@ def try_chat_png(chat: Chat, slots: list[MinuteSlot], accounts: list[Account]) -
         return render_chat_png(chat, slots, accounts)
     except Exception:
         return None
+
+
+def render_grid_png(
+    title: str,
+    subtitle: str,
+    col_titles: list[str],
+    row_labels: list[str],
+    cells: dict[tuple[int, int], str],
+    *,
+    row_head: str = "Время / чат",
+    footer: str = "",
+    max_cols: int = 20,
+) -> bytes:
+    """Универсальная таблица: строки — время, колонки — чаты, ячейка — аккаунт/число.
+
+    Ячейка закрашена, только если там что-то есть (факт); пустая — не отмечена.
+    cells: (индекс строки, индекс колонки) → текст.
+    """
+    from PIL import Image, ImageDraw
+
+    cols = col_titles[:max_cols]
+    min_w, col_w, row_h = 92, 104, 26
+    pad, title_h = 16, 46
+    width = min(max(pad * 2 + min_w + max(len(cols), 1) * col_w, 560), 2200)
+    height = pad * 2 + title_h + row_h * (1 + len(row_labels)) + 26
+    height = min(max(height, 200), 3000)
+
+    img = Image.new("RGB", (width, height), BG)
+    draw = ImageDraw.Draw(img)
+    title_font = _font(16, True)
+    sub_font = _font(12)
+    head_font = _font(11, True)
+    cell_font = _font(12, True)
+    small = _font(12)
+
+    draw.text((pad, pad), _fit(title, 70), font=title_font, fill=HEADER)
+    draw.text((pad, pad + 22), _fit(subtitle, 110), font=sub_font, fill=MUTED)
+
+    top = pad + title_h
+
+    def box(i: int, j: int) -> tuple[int, int, int, int]:
+        x0 = pad + (0 if j == 0 else min_w + (j - 1) * col_w)
+        y0 = top + i * row_h
+        w = min_w if j == 0 else col_w
+        return x0, y0, x0 + w, y0 + row_h
+
+    heads = [row_head] + [_fit(t, 14) for t in cols]
+    for j, head in enumerate(heads):
+        x0, y0, x1, y1 = box(0, j)
+        draw.rectangle((x0, y0, x1, y1), fill=HEADER, outline=GRID)
+        tw = _text_w(head_font, head)
+        draw.text((x0 + max(2, (x1 - x0 - tw) / 2), y0 + 6), head, font=head_font, fill=HEADER_FG)
+
+    for i, label in enumerate(row_labels, start=1):
+        x0, y0, x1, y1 = box(i, 0)
+        draw.rectangle((x0, y0, x1, y1), fill=CELL, outline=GRID)
+        tw = _text_w(cell_font, label)
+        draw.text((x0 + (x1 - x0 - tw) / 2, y0 + 5), label, font=cell_font, fill=TEXT)
+        for j in range(1, len(cols) + 1):
+            cx0, cy0, cx1, cy1 = box(i, j)
+            text = cells.get((i - 1, j - 1))
+            if text:
+                draw.rectangle((cx0, cy0, cx1, cy1), fill=FILLED, outline=GRID)
+                name = _fit(text, 12)
+                tw = _text_w(cell_font, name)
+                draw.text(
+                    (cx0 + max(2, (cx1 - cx0 - tw) / 2), cy0 + 5),
+                    name,
+                    font=cell_font,
+                    fill=FILLED_TEXT,
+                )
+            else:
+                draw.rectangle((cx0, cy0, cx1, cy1), fill=CELL, outline=GRID)
+
+    note = footer or "Закрашено — отправка подтверждена по истории чата; пусто — не отправлено"
+    draw.text((pad, height - 22), _fit(note, 120), font=small, fill=MUTED)
+    buf = BytesIO()
+    img.save(buf, format="PNG", optimize=True)
+    return buf.getvalue()
+
+
+def try_grid_png(*args, **kwargs) -> bytes | None:
+    try:
+        return render_grid_png(*args, **kwargs)
+    except Exception:
+        return None

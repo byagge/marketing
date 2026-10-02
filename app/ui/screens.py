@@ -62,6 +62,15 @@ def accounts_html(accounts: list[Account]) -> str:
     return "\n".join(lines)
 
 
+def _spam_line(acc: Account) -> str:
+    label = {"clean": "чист", "limited": "ограничен", "unknown": "не определён"}.get(
+        acc.spam_status, "не проверялся"
+    )
+    mark = pe("check") if acc.spam_status == "clean" else pe("warn") if acc.spam_status else pe("block")
+    extra = f" до {escape(acc.spam_until)}" if acc.spam_until else ""
+    return f"{mark} {label}{extra}"
+
+
 def account_html(acc: Account, ru=None, en=None) -> str:
     uname = f"@{acc.username}" if acc.username else "—"
     run = runtime.is_running("setup", acc.id)
@@ -115,6 +124,7 @@ def account_html(acc: Account, ru=None, en=None) -> str:
         f"{pe('star')} Premium: {on_off(bool(acc.is_premium))}"
         f"{'' if acc.is_premium else ' · суточный cron без repeat'}\n"
         f"{pe('monitor')} Pyrogram: {on_off(bool(acc.pyrogram_session))}\n"
+        f"{pe('shield')} SpamBot: {_spam_line(acc)}\n"
         f"{pe('up')} Online ping: {on_off(bool(acc.online_ping_enabled))}"
         f"{'' if acc.telethon_session else ' (нужен Telethon)'}\n\n"
         f"{sender_mode}"

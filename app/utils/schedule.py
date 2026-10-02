@@ -27,6 +27,15 @@ def posts_count_for_interval(interval_minutes: int) -> int:
     return min(needed, MAX_SCHEDULED)
 
 
+ROLLING_HOURS = 26
+
+
+def rolling_posts_count(interval_minutes: int) -> int:
+    """Сколько слотов нужно, чтобы покрыть ~26 ч (с запасом до следующей пересборки)."""
+    step = max(1, int(interval_minutes)) + 1
+    return max(1, min(MAX_SCHEDULED, math.ceil(ROLLING_HOURS * 60 / step)))
+
+
 def build_schedule_times(
     start_minute: int,
     interval_minutes: int,
@@ -35,8 +44,15 @@ def build_schedule_times(
     now: datetime | None = None,
     tz: ZoneInfo | None = None,
     start_hour: int = 9,
+    rolling: bool = False,
 ) -> list[datetime]:
-    """Сетка как в source/every_hour.py: 09:mm, затем каждый слот +interval и +1 мин дрейфа."""
+    """Сетка как в source/every_hour.py: 09:mm, затем каждый слот +interval и +1 мин дрейфа.
+
+    rolling=True (аккаунты без Premium, где нет schedule_repeat): сетка стартует
+    с ближайшего слота «сейчас», а не с start_hour. Тогда суточная пересборка может
+    идти в любое время и не теряет слоты до своего окончания (раньше при долгом
+    прогоне утренние слоты уезжали на завтра).
+    """
     if tz is None:
         tz = ZoneInfo("Asia/Bishkek")
     if now is None:
@@ -46,10 +62,18 @@ def build_schedule_times(
     else:
         now = now.astimezone(tz)
 
-    count = posts_count if posts_count is not None else posts_count_for_interval(interval_minutes)
     minute = max(0, min(59, int(start_minute)))
     interval = max(1, int(interval_minutes))
     threshold = now + timedelta(seconds=30)
+
+    if rolling:
+        count = posts_count if posts_count is not None else rolling_posts_count(interval)
+        first = now.replace(minute=minute, second=0, microsecond=0)
+        while first <= threshold:
+            first += timedelta(hours=1)
+        return [first + timedelta(minutes=interval * i + i) for i in range(count)]
+
+    count = posts_count if posts_count is not None else posts_count_for_interval(interval_minutes)
 
     base = now.replace(hour=start_hour, minute=minute, second=0, microsecond=0)
     times: list[datetime] = []

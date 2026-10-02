@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import sys
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
@@ -54,7 +54,12 @@ async def main() -> None:
     dp.update.outer_middleware(AdminOnlyMiddleware())
     setup_routers(dp)
 
-    scheduler = AsyncIOScheduler(timezone=settings.timezone)
+    # misfire_grace_time: по умолчанию 1 с — если цикл событий занят, cron-задача
+    # (утренние отчёты, суточный schedule) молча пропускалась.
+    scheduler = AsyncIOScheduler(
+        timezone=settings.timezone,
+        job_defaults={"misfire_grace_time": 3600, "coalesce": True, "max_instances": 1},
+    )
 
     async def weekly():
         admin_id = next(iter(settings.admins), None)
@@ -71,6 +76,39 @@ async def main() -> None:
         # Premium accounts are skipped (Telegram daily repeat stays intact).
         admin_id = next(iter(settings.admins), None)
         await run_nonpremium_daily_reschedule(store, bot, admin_id)
+
+    async def facts_tick():
+        # раз в час: факты отправки + (каждые N часов) скан банов/мутов
+        from datetime import datetime
+
+        from app.jobs.facts import spawn_facts
+
+        hour = datetime.now(settings.tz).hour
+        scan = hour % max(1, settings.restrictions_scan_every_hours) == 0
+        if not scan:
+            # мут закончился → проверяем сразу, а не ждём плановый скан
+            now_iso = datetime.now(timezone.utc).isoformat(timespec="seconds")
+            scan = any(
+                r.until_at and r.until_at <= now_iso
+                for r in await store.list_restrictions(kinds=("mute", "nowrite"))
+            )
+        spawn_facts(
+            store,
+            hours=settings.facts_hours,
+            scan_restrictions=scan,
+        )
+
+    async def spam_tick():
+        from app.jobs.spam import run_spam_check
+
+        admin_id = next(iter(settings.admins), None)
+        await run_spam_check(store, bot=bot, admin_chat_id=admin_id)
+
+    async def advisor_tick():
+        from app.jobs.advisor import run_advisor
+
+        admin_id = next(iter(settings.admins), None)
+        await run_advisor(store, bot, admin_id)
 
     async def online_tick():
         summary = await run_online_ping_tick(store)
@@ -92,6 +130,38 @@ async def main() -> None:
         id="nonpremium_reschedule_daily",
         replace_existing=True,
         **nonpremium_reschedule_cron_args(),
+    )
+    scheduler.add_job(
+        facts_tick,
+        "cron",
+        id="facts_hourly",
+        replace_existing=True,
+        minute=settings.facts_minute,
+        timezone=settings.timezone,
+        misfire_grace_time=900,
+        coalesce=True,
+    )
+    scheduler.add_job(
+        spam_tick,
+        "cron",
+        id="spam_daily",
+        replace_existing=True,
+        hour=settings.spam_check_hour,
+        minute=23,
+        timezone=settings.timezone,
+        misfire_grace_time=3600,
+        coalesce=True,
+    )
+    scheduler.add_job(
+        advisor_tick,
+        "cron",
+        id="advisor_daily",
+        replace_existing=True,
+        hour=settings.advisor_hour,
+        minute=17,
+        timezone=settings.timezone,
+        misfire_grace_time=3600,
+        coalesce=True,
     )
     # Interval comes from bot UI (DB). Tick every 15 min and run when due.
     scheduler.add_job(

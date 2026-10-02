@@ -1,16 +1,22 @@
+from app.bot.handlers.acc_chats import router as acc_chats_router
 from app.bot.handlers.accounts import router as accounts_router
 from app.bot.handlers.chats import router as chats_router
+from app.bot.handlers.facts import router as facts_router
 from app.bot.handlers.membership import router as membership_router
 from app.bot.handlers.menu import router as menu_router
 from app.bot.handlers.online_settings import router as online_router
 from app.bot.handlers.ops import router as ops_router
 from app.bot.handlers.posts import router as posts_router
+from app.bot.handlers.restrictions import router as restrictions_router
 from app.bot.handlers.sender import router as sender_router
 from app.bot.handlers.session_maker import router as session_maker_router
 from app.bot.handlers.table import router as table_router
 
 __all__ = [
+    "acc_chats_router",
     "accounts_router",
+    "facts_router",
+    "restrictions_router",
     "chats_router",
     "membership_router",
     "menu_router",

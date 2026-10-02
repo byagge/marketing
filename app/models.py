@@ -21,6 +21,15 @@ class Account:
     last_error: str = ""
     created_at: str = ""
     updated_at: str = ""
+    # @SpamBot: "" не проверяли | clean | limited | unknown
+    spam_status: str = ""
+    spam_checked_at: str = ""
+    spam_until: str = ""
+    spam_detail: str = ""
+
+    @property
+    def is_spam_limited(self) -> bool:
+        return self.spam_status == "limited"
 
     @property
     def display(self) -> str:
@@ -192,6 +201,47 @@ class SetupState:
     @property
     def is_abandoned(self) -> bool:
         return self.status == "abandoned"
+
+
+@dataclass
+class Restriction:
+    """Бан / мут / запрет писать для пары аккаунт × чат."""
+
+    id: int
+    account_id: int
+    chat_pk: int
+    kind: str  # ban | mute | nowrite
+    reason: str = ""
+    reason_link: str = ""
+    error: str = ""
+    detected_at: str = ""
+    until_at: str = ""  # пусто = бессрочно / неизвестно
+    active: int = 1
+    resolved_at: str = ""
+    account_label: str = ""
+    chat_title: str = ""
+
+    @property
+    def is_ban(self) -> bool:
+        return self.kind == "ban"
+
+    @property
+    def is_mute(self) -> bool:
+        return self.kind in {"mute", "nowrite"}
+
+
+@dataclass
+class ChatPref:
+    """Настройки пары аккаунт × чат (вкл/выкл отправки, отметки)."""
+
+    account_id: int
+    chat_key: str
+    enabled: int = 1
+    mention: int = -1  # -1 как в общих настройках | 0 выкл | 1 вкл
+
+    @property
+    def is_enabled(self) -> bool:
+        return bool(self.enabled)
 
 
 @dataclass

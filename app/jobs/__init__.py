@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
+from app.notify import notifier
 from app.store import Store
 
 
@@ -64,10 +65,8 @@ class LogSink:
     async def emit(self, message: str, level: str = "info", notify: bool = True) -> None:
         await self.store.add_log(self.job_id, message, level)
         if notify and self.bot and self.chat_id:
-            try:
-                await self.bot.send_message(self.chat_id, message)
-            except Exception:
-                pass
+            # очередь: не блокирует задачу и переживает flood-лимит Telegram
+            notifier.push(self.bot, self.chat_id, message)
 
 
 def parse_keep_ids(raw: str, chat_ids: list[str]) -> set[int]:

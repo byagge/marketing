@@ -61,6 +61,23 @@ class Settings(BaseSettings):
     online_hold_seconds: float = 4.0
     online_ping_enabled: bool = True
 
+    # Факты отправки / баны и муты / SpamBot / советы по аккаунтам
+    facts_minute: int = 7  # каждый час в :07 читаем историю чатов
+    facts_hours: float = 3.0  # окно сбора (перекрывается — повторов нет)
+    restrictions_scan_every_hours: int = 3
+    spam_check_hour: int = 6
+    advisor_hour: int = 12
+    advisor_mention: str = "@arxixx"
+    # важные чаты (подстроки названий): выделяем в отчётах по фактам
+    priority_chats: str = "get-chat,lustify"
+    # аккаунт «приносит больше вреда, чем пользы»: доля недоступных чатов
+    advisor_stop_share: float = 0.6
+    advisor_warn_share: float = 0.35
+
+    @property
+    def priority_keys(self) -> list[str]:
+        return [p.strip().casefold() for p in self.priority_chats.split(",") if p.strip()]
+
     @property
     def nonpremium_hour(self) -> int:
         if self.nonpremium_reschedule_hour is not None:

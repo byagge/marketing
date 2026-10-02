@@ -4,6 +4,7 @@ from aiogram import Bot
 
 from app.config import get_settings
 from app.jobs import LogSink
+from app.notify import safe_send
 from app.store import Store
 from app.tg.client import telethon_client
 from app.tg.health import check_schedule_chats
@@ -32,7 +33,7 @@ async def run_health(store: Store, account_id: int, bot: Bot, admin_chat_id: int
     if not account or not account.telethon_session:
         text = "Нет аккаунта или Telethon session"
         if bot:
-            await bot.send_message(admin_chat_id, text)
+            await safe_send(bot, admin_chat_id, text)
         return text
     job = await store.create_job("health", account.id)
     log = LogSink(store, job.id, bot, admin_chat_id)
@@ -54,9 +55,9 @@ async def run_health(store: Store, account_id: int, bot: Bot, admin_chat_id: int
 async def run_health_all(store: Store, bot: Bot, admin_chat_id: int) -> None:
     accounts = await store.list_accounts()
     if not accounts:
-        await bot.send_message(admin_chat_id, "Нет аккаунтов для проверки schedule")
+        await safe_send(bot, admin_chat_id, "Нет аккаунтов для проверки schedule")
         return
-    await bot.send_message(admin_chat_id, f"Недельная проверка schedule | {len(accounts)} аккаунтов")
+    await safe_send(bot, admin_chat_id, f"Недельная проверка schedule | {len(accounts)} аккаунтов")
     for acc in accounts:
         if not acc.telethon_session:
             continue

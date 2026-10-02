@@ -9,7 +9,20 @@ from typing import Any
 import aiosqlite
 
 from app.config import DB_PATH, POSTS_DIR, ensure_dirs
-from app.models import Account, Chat, Job, JobLog, MinuteSlot, OnlinePingSettings, Post, SenderSettings, SetupState
+from app.models import (
+    Account,
+    Chat,
+    ChatPref,
+    Job,
+    JobLog,
+    MinuteSlot,
+    OnlinePingSettings,
+    Post,
+    Restriction,
+    SenderSettings,
+    SetupState,
+)
+from app.utils.chat_ids import canon_chat_id
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS accounts (
@@ -109,6 +122,56 @@ CREATE TABLE IF NOT EXISTS job_logs (
     created_at TEXT NOT NULL,
     level TEXT NOT NULL,
     message TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS send_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    account_id INTEGER NOT NULL,
+    chat_pk INTEGER NOT NULL,
+    sent_at TEXT NOT NULL,
+    msg_id INTEGER NOT NULL,
+    UNIQUE(account_id, chat_pk, msg_id)
+);
+CREATE INDEX IF NOT EXISTS idx_send_events_time ON send_events(sent_at);
+
+CREATE TABLE IF NOT EXISTS send_scans (
+    account_id INTEGER NOT NULL,
+    chat_pk INTEGER NOT NULL,
+    scanned_at TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'ok',
+    detail TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (account_id, chat_pk)
+);
+
+CREATE TABLE IF NOT EXISTS chat_restrictions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    account_id INTEGER NOT NULL,
+    chat_pk INTEGER NOT NULL,
+    kind TEXT NOT NULL,
+    reason TEXT NOT NULL DEFAULT '',
+    reason_link TEXT NOT NULL DEFAULT '',
+    error TEXT NOT NULL DEFAULT '',
+    detected_at TEXT NOT NULL,
+    until_at TEXT NOT NULL DEFAULT '',
+    active INTEGER NOT NULL DEFAULT 1,
+    resolved_at TEXT NOT NULL DEFAULT '',
+    UNIQUE(account_id, chat_pk)
+);
+
+CREATE TABLE IF NOT EXISTS account_chat_prefs (
+    account_id INTEGER NOT NULL,
+    chat_key TEXT NOT NULL,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    mention INTEGER NOT NULL DEFAULT -1,
+    PRIMARY KEY (account_id, chat_key)
+);
+
+CREATE TABLE IF NOT EXISTS account_chat_posts (
+    account_id INTEGER NOT NULL,
+    chat_key TEXT NOT NULL,
+    text TEXT NOT NULL DEFAULT '',
+    entities_json TEXT NOT NULL DEFAULT '[]',
+    photo_path TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (account_id, chat_key)
 );
 """
 
@@ -243,6 +306,16 @@ async def _migrate_accounts_premium(db: aiosqlite.Connection) -> None:
         )
 
 
+async def _migrate_accounts_spam(db: aiosqlite.Connection) -> None:
+    cur = await db.execute("PRAGMA table_info(accounts)")
+    cols = {row[1] for row in await cur.fetchall()}
+    if not cols:
+        return
+    for name in ("spam_status", "spam_checked_at", "spam_until", "spam_detail"):
+        if name not in cols:
+            await db.execute(f"ALTER TABLE accounts ADD COLUMN {name} TEXT NOT NULL DEFAULT ''")
+
+
 async def _migrate_chats_invite(db: aiosqlite.Connection) -> None:
     cur = await db.execute("PRAGMA table_info(chats)")
     cols = [row[1] for row in await cur.fetchall()]
@@ -286,6 +359,29 @@ def _account(row: aiosqlite.Row) -> Account:
         last_error=row["last_error"] or "",
         created_at=row["created_at"] or "",
         updated_at=row["updated_at"] or "",
+        spam_status=(row["spam_status"] if "spam_status" in keys else "") or "",
+        spam_checked_at=(row["spam_checked_at"] if "spam_checked_at" in keys else "") or "",
+        spam_until=(row["spam_until"] if "spam_until" in keys else "") or "",
+        spam_detail=(row["spam_detail"] if "spam_detail" in keys else "") or "",
+    )
+
+
+def _restriction(row: aiosqlite.Row) -> Restriction:
+    keys = row.keys()
+    return Restriction(
+        id=row["id"],
+        account_id=row["account_id"],
+        chat_pk=row["chat_pk"],
+        kind=row["kind"],
+        reason=row["reason"] or "",
+        reason_link=row["reason_link"] or "",
+        error=row["error"] or "",
+        detected_at=row["detected_at"] or "",
+        until_at=row["until_at"] or "",
+        active=int(row["active"]),
+        resolved_at=row["resolved_at"] or "",
+        account_label=(row["account_label"] if "account_label" in keys else "") or "",
+        chat_title=(row["chat_title"] if "chat_title" in keys else "") or "",
     )
 
 
@@ -352,6 +448,7 @@ class Store:
             await _migrate_posts_table(db)
             await _migrate_posts_columns(db)
             await _migrate_accounts_premium(db)
+            await _migrate_accounts_spam(db)
             await _migrate_chats_invite(db)
             for key, value in DEFAULT_SETTINGS.items():
                 await db.execute(
@@ -520,6 +617,14 @@ class Store:
             await db.execute("DELETE FROM setup_states WHERE account_id=?", (account_id,))
             await db.execute("DELETE FROM minute_slots WHERE account_id=?", (account_id,))
             await db.execute("DELETE FROM posts WHERE account_id=?", (account_id,))
+            for table in (
+                "send_events",
+                "send_scans",
+                "chat_restrictions",
+                "account_chat_prefs",
+                "account_chat_posts",
+            ):
+                await db.execute(f"DELETE FROM {table} WHERE account_id=?", (account_id,))
             await db.execute("DELETE FROM accounts WHERE id=?", (account_id,))
             await db.commit()
 
@@ -784,6 +889,9 @@ class Store:
             await db.execute("PRAGMA foreign_keys = ON")
             await db.execute("DELETE FROM setup_states WHERE chat_pk=?", (chat_pk,))
             await db.execute("DELETE FROM minute_slots WHERE chat_pk=?", (chat_pk,))
+            await db.execute("DELETE FROM send_events WHERE chat_pk=?", (chat_pk,))
+            await db.execute("DELETE FROM send_scans WHERE chat_pk=?", (chat_pk,))
+            await db.execute("DELETE FROM chat_restrictions WHERE chat_pk=?", (chat_pk,))
             await db.execute("DELETE FROM chats WHERE id=?", (chat_pk,))
             await db.commit()
 
@@ -828,8 +936,13 @@ class Store:
     ) -> SetupState:
         now = _now()
         existing = await self.get_setup_state(account_id, chat_pk)
-        fail_count = (existing.fail_count if existing else 0) + 1
-        status = "abandoned" if fail_count >= max_attempts else "pending"
+        if existing is not None and existing.is_abandoned:
+            # уже «стоп до начала недели»: счётчик не растёт (раньше доходил до 130/3)
+            fail_count = existing.fail_count
+            status = "abandoned"
+        else:
+            fail_count = (existing.fail_count if existing else 0) + 1
+            status = "abandoned" if fail_count >= max_attempts else "pending"
         async with self._connect() as db:
             await db.execute(
                 "INSERT INTO setup_states(account_id, chat_pk, status, fail_count, "
@@ -1121,3 +1234,310 @@ class Store:
             )
             for r in rows
         ]
+
+    # ---- setup state helpers -------------------------------------------------
+
+    async def reset_setup_state(self, account_id: int, chat_pk: int) -> None:
+        """Пара снова может пробоваться (например, после вступления в чат)."""
+        async with self._connect() as db:
+            await db.execute(
+                "UPDATE setup_states SET status='pending', fail_count=0, last_error='' "
+                "WHERE account_id=? AND chat_pk=? AND status<>'ok'",
+                (account_id, chat_pk),
+            )
+            await db.commit()
+
+    # ---- bans / mutes --------------------------------------------------------
+
+    async def upsert_restriction(
+        self,
+        account_id: int,
+        chat_pk: int,
+        kind: str,
+        *,
+        reason: str = "",
+        reason_link: str = "",
+        error: str = "",
+        until_at: str = "",
+    ) -> Restriction:
+        now = _now()
+        existing = await self.get_restriction(account_id, chat_pk, active_only=False)
+        keep_since = (
+            existing.detected_at
+            if existing and existing.active and existing.kind == kind
+            else now
+        )
+        reason = reason or (existing.reason if existing and existing.active and existing.kind == kind else "")
+        reason_link = reason_link or (
+            existing.reason_link if existing and existing.active and existing.kind == kind else ""
+        )
+        async with self._connect() as db:
+            await db.execute(
+                "INSERT INTO chat_restrictions(account_id, chat_pk, kind, reason, "
+                "reason_link, error, detected_at, until_at, active, resolved_at) "
+                "VALUES(?,?,?,?,?,?,?,?,1,'') "
+                "ON CONFLICT(account_id, chat_pk) DO UPDATE SET "
+                "kind=excluded.kind, reason=excluded.reason, reason_link=excluded.reason_link, "
+                "error=excluded.error, detected_at=excluded.detected_at, "
+                "until_at=excluded.until_at, active=1, resolved_at=''",
+                (
+                    account_id,
+                    chat_pk,
+                    kind,
+                    reason[:1500],
+                    reason_link,
+                    (error or "")[:500],
+                    keep_since,
+                    until_at,
+                ),
+            )
+            await db.commit()
+        got = await self.get_restriction(account_id, chat_pk, active_only=False)
+        assert got is not None
+        return got
+
+    async def resolve_restriction(self, account_id: int, chat_pk: int) -> bool:
+        async with self._connect() as db:
+            cur = await db.execute(
+                "UPDATE chat_restrictions SET active=0, resolved_at=? "
+                "WHERE account_id=? AND chat_pk=? AND active=1",
+                (_now(), account_id, chat_pk),
+            )
+            await db.commit()
+            return bool(cur.rowcount)
+
+    async def get_restriction(
+        self, account_id: int, chat_pk: int, *, active_only: bool = True
+    ) -> Restriction | None:
+        sql = (
+            "SELECT r.*, COALESCE(a.label,'') AS account_label, "
+            "COALESCE(c.title,'') AS chat_title FROM chat_restrictions r "
+            "LEFT JOIN accounts a ON a.id=r.account_id "
+            "LEFT JOIN chats c ON c.id=r.chat_pk "
+            "WHERE r.account_id=? AND r.chat_pk=?"
+        )
+        if active_only:
+            sql += " AND r.active=1"
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(sql, (account_id, chat_pk))
+            row = await cur.fetchone()
+        return _restriction(row) if row else None
+
+    async def list_restrictions(
+        self,
+        *,
+        kinds: tuple[str, ...] | None = None,
+        account_id: int | None = None,
+        chat_pk: int | None = None,
+        active_only: bool = True,
+    ) -> list[Restriction]:
+        sql = (
+            "SELECT r.*, COALESCE(a.label,'') AS account_label, "
+            "COALESCE(c.title,'') AS chat_title FROM chat_restrictions r "
+            "LEFT JOIN accounts a ON a.id=r.account_id "
+            "LEFT JOIN chats c ON c.id=r.chat_pk WHERE 1=1"
+        )
+        args: list[Any] = []
+        if active_only:
+            sql += " AND r.active=1"
+        if kinds:
+            sql += " AND r.kind IN (" + ",".join("?" for _ in kinds) + ")"
+            args.extend(kinds)
+        if account_id is not None:
+            sql += " AND r.account_id=?"
+            args.append(account_id)
+        if chat_pk is not None:
+            sql += " AND r.chat_pk=?"
+            args.append(chat_pk)
+        sql += " ORDER BY a.label COLLATE NOCASE, c.title COLLATE NOCASE"
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(sql, args)
+            return [_restriction(r) for r in await cur.fetchall()]
+
+    async def banned_pairs(self) -> set[tuple[int, int]]:
+        rows = await self.list_restrictions(kinds=("ban",))
+        return {(r.account_id, r.chat_pk) for r in rows}
+
+    # ---- per account × chat prefs -------------------------------------------
+
+    async def get_pref(self, account_id: int, chat_ref: str | int) -> ChatPref:
+        key = canon_chat_id(chat_ref)
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                "SELECT * FROM account_chat_prefs WHERE account_id=? AND chat_key=?",
+                (account_id, key),
+            )
+            row = await cur.fetchone()
+        if not row:
+            return ChatPref(account_id=account_id, chat_key=key)
+        return ChatPref(
+            account_id=account_id,
+            chat_key=key,
+            enabled=int(row["enabled"]),
+            mention=int(row["mention"]),
+        )
+
+    async def set_pref(
+        self,
+        account_id: int,
+        chat_ref: str | int,
+        *,
+        enabled: bool | None = None,
+        mention: int | None = None,
+    ) -> ChatPref:
+        cur_pref = await self.get_pref(account_id, chat_ref)
+        new_enabled = cur_pref.enabled if enabled is None else int(bool(enabled))
+        new_mention = cur_pref.mention if mention is None else int(mention)
+        async with self._connect() as db:
+            await db.execute(
+                "INSERT INTO account_chat_prefs(account_id, chat_key, enabled, mention) "
+                "VALUES(?,?,?,?) ON CONFLICT(account_id, chat_key) DO UPDATE SET "
+                "enabled=excluded.enabled, mention=excluded.mention",
+                (account_id, cur_pref.chat_key, new_enabled, new_mention),
+            )
+            await db.commit()
+        return ChatPref(account_id, cur_pref.chat_key, new_enabled, new_mention)
+
+    async def list_prefs(self, account_id: int | None = None) -> list[ChatPref]:
+        sql = "SELECT * FROM account_chat_prefs"
+        args: list[Any] = []
+        if account_id is not None:
+            sql += " WHERE account_id=?"
+            args.append(account_id)
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(sql, args)
+            rows = await cur.fetchall()
+        return [
+            ChatPref(r["account_id"], r["chat_key"], int(r["enabled"]), int(r["mention"]))
+            for r in rows
+        ]
+
+    async def disabled_pairs(self) -> set[tuple[int, str]]:
+        """(account_id, canon chat key) — отправка выключена вручную."""
+        return {(p.account_id, p.chat_key) for p in await self.list_prefs() if not p.enabled}
+
+    # ---- per account × chat custom text -------------------------------------
+
+    async def get_chat_post(self, account_id: int, chat_ref: str | int) -> Post | None:
+        key = canon_chat_id(chat_ref)
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                "SELECT * FROM account_chat_posts WHERE account_id=? AND chat_key=?",
+                (account_id, key),
+            )
+            row = await cur.fetchone()
+        if not row:
+            return None
+        if not (row["text"] or "").strip() and not (row["photo_path"] or "").strip():
+            return None
+        return Post(
+            lang="custom",
+            text=row["text"] or "",
+            entities_json=row["entities_json"] or "[]",
+            photo_path=row["photo_path"] or "",
+            account_id=account_id,
+        )
+
+    async def save_chat_post(
+        self,
+        account_id: int,
+        chat_ref: str | int,
+        text: str,
+        entities: list[dict] | None,
+        photo_path: str = "",
+    ) -> None:
+        key = canon_chat_id(chat_ref)
+        async with self._connect() as db:
+            await db.execute(
+                "INSERT INTO account_chat_posts(account_id, chat_key, text, entities_json, photo_path) "
+                "VALUES(?,?,?,?,?) ON CONFLICT(account_id, chat_key) DO UPDATE SET "
+                "text=excluded.text, entities_json=excluded.entities_json, "
+                "photo_path=excluded.photo_path",
+                (account_id, key, text or "", json.dumps(entities or [], ensure_ascii=False), photo_path or ""),
+            )
+            await db.commit()
+
+    async def delete_chat_post(self, account_id: int, chat_ref: str | int) -> None:
+        async with self._connect() as db:
+            await db.execute(
+                "DELETE FROM account_chat_posts WHERE account_id=? AND chat_key=?",
+                (account_id, canon_chat_id(chat_ref)),
+            )
+            await db.commit()
+
+    async def chat_post_keys(self, account_id: int) -> set[str]:
+        async with self._connect() as db:
+            cur = await db.execute(
+                "SELECT chat_key FROM account_chat_posts WHERE account_id=? "
+                "AND (text<>'' OR photo_path<>'')",
+                (account_id,),
+            )
+            return {r[0] for r in await cur.fetchall()}
+
+    # ---- send facts ----------------------------------------------------------
+
+    async def add_send_events(self, rows: list[tuple[int, int, str, int]]) -> int:
+        """rows: (account_id, chat_pk, sent_at_utc_iso, msg_id)."""
+        if not rows:
+            return 0
+        async with self._connect() as db:
+            before = (await (await db.execute("SELECT COUNT(*) FROM send_events")).fetchone())[0]
+            await db.executemany(
+                "INSERT OR IGNORE INTO send_events(account_id, chat_pk, sent_at, msg_id) "
+                "VALUES(?,?,?,?)",
+                rows,
+            )
+            await db.commit()
+            after = (await (await db.execute("SELECT COUNT(*) FROM send_events")).fetchone())[0]
+        return int(after - before)
+
+    async def send_events_between(
+        self, start_utc: str, end_utc: str
+    ) -> list[tuple[int, int, str]]:
+        """[(account_id, chat_pk, sent_at)] для start <= sent_at < end."""
+        async with self._connect() as db:
+            cur = await db.execute(
+                "SELECT account_id, chat_pk, sent_at FROM send_events "
+                "WHERE sent_at>=? AND sent_at<? ORDER BY sent_at",
+                (start_utc, end_utc),
+            )
+            return [(r[0], r[1], r[2]) for r in await cur.fetchall()]
+
+    async def mark_scan(self, account_id: int, chat_pk: int, status: str, detail: str = "") -> None:
+        async with self._connect() as db:
+            await db.execute(
+                "INSERT INTO send_scans(account_id, chat_pk, scanned_at, status, detail) "
+                "VALUES(?,?,?,?,?) ON CONFLICT(account_id, chat_pk) DO UPDATE SET "
+                "scanned_at=excluded.scanned_at, status=excluded.status, detail=excluded.detail",
+                (account_id, chat_pk, _now(), status, detail[:300]),
+            )
+            await db.commit()
+
+    async def list_scans(self) -> list[tuple[int, int, str, str, str]]:
+        async with self._connect() as db:
+            cur = await db.execute(
+                "SELECT account_id, chat_pk, scanned_at, status, detail FROM send_scans"
+            )
+            return [tuple(r) for r in await cur.fetchall()]  # type: ignore[misc]
+
+    async def last_send_at(self) -> str:
+        async with self._connect() as db:
+            cur = await db.execute("SELECT MAX(sent_at) FROM send_events")
+            row = await cur.fetchone()
+        return (row[0] if row and row[0] else "") or ""
+
+    async def prune_send_events(self, keep_days: int = 90) -> int:
+        from datetime import timedelta
+
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=keep_days)).isoformat(
+            timespec="seconds"
+        )
+        async with self._connect() as db:
+            cur = await db.execute("DELETE FROM send_events WHERE sent_at<?", (cutoff,))
+            await db.commit()
+            return int(cur.rowcount or 0)

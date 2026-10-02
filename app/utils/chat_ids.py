@@ -24,3 +24,16 @@ def chat_ids_match(left: str | int | None, right: str | int | None) -> bool:
 
 def any_chat_match(cid: str | int | None, chats) -> bool:
     return any(chat_ids_match(cid, getattr(c, "chat_id", c)) for c in chats)
+
+
+def canon_chat_id(cid: str | int | None) -> str:
+    """Единый ключ чата: без знака и префикса -100 (как у Telegram entity.id)."""
+    raw = str(cid or "").strip()
+    if not raw:
+        return ""
+    if raw.lstrip("-").isdigit():
+        digits = str(abs(int(raw)))
+        if raw.startswith("-100") and len(raw) > 4:
+            digits = raw[4:]
+        return digits
+    return raw.lstrip("@").casefold()

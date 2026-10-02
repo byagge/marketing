@@ -28,6 +28,22 @@ _MEDIA_FORBIDDEN_MARKERS = (
 )
 
 
+# Счётчик FloodWait за время работы процесса: помогает понять, почему суточная
+# пересборка идёт часами (в отчётах показываем разницу до/после).
+FLOOD = {"waits": 0, "seconds": 0.0}
+
+
+async def flood_sleep(e: FloodWaitError) -> None:
+    secs = float(getattr(e, "seconds", 0) or 0) + 1
+    FLOOD["waits"] += 1
+    FLOOD["seconds"] += secs
+    await asyncio.sleep(secs)
+
+
+def flood_snapshot() -> tuple[int, float]:
+    return int(FLOOD["waits"]), float(FLOOD["seconds"])
+
+
 def is_media_forbidden_error(exc: BaseException) -> bool:
     name = type(exc).__name__.casefold()
     msg = str(exc).casefold()
@@ -93,7 +109,7 @@ async def fetch_scheduled(client: TelegramClient, target_entity) -> list:
             )
             return list(getattr(result, "messages", None) or [])
         except FloodWaitError as e:
-            await asyncio.sleep(e.seconds + 1)
+            await flood_sleep(e)
 
 
 async def delete_scheduled(
@@ -119,7 +135,7 @@ async def delete_scheduled(
                 deleted += len(batch)
                 break
             except FloodWaitError as e:
-                await asyncio.sleep(e.seconds + 1)
+                await flood_sleep(e)
         await asyncio.sleep(max(0.0, float(pause)))
     return deleted
 
@@ -174,7 +190,7 @@ async def send_scheduled_post(
                     result = await client(functions.messages.SendMessageRequest(**kwargs))
                 return _extract_sent_message(result)
             except FloodWaitError as e:
-                await asyncio.sleep(e.seconds + 1)
+                await flood_sleep(e)
 
     if want_photo:
         try:
@@ -216,7 +232,7 @@ async def send_scheduled_forward(
             result = await client(functions.messages.ForwardMessagesRequest(**kwargs))
             return _extract_sent_message(result)
         except FloodWaitError as e:
-            await asyncio.sleep(e.seconds + 1)
+            await flood_sleep(e)
 
 
 async def schedule_chat_posts(
@@ -234,6 +250,7 @@ async def schedule_chat_posts(
     allow_media: bool = True,
     clear_existing: bool = True,
     pause: float = 0.7,
+    rolling: bool = False,
 ) -> dict[str, Any]:
     from app.config import get_settings
 
@@ -254,13 +271,14 @@ async def schedule_chat_posts(
     if clear_existing:
         cleared = await delete_scheduled(client, entity, pause=del_pause)
 
-    count = posts_count_for_interval(interval_minutes)
+    count = None if rolling else posts_count_for_interval(interval_minutes)
     times = build_schedule_times(
         start_minute=start_minute,
         interval_minutes=interval_minutes,
         posts_count=count,
         tz=tz,
         start_hour=start_hour,
+        rolling=rolling,
     )
 
     success = 0
@@ -341,6 +359,7 @@ async def schedule_chat_forwards(
     repeat_period: int | None,
     clear_existing: bool = True,
     pause: float = 0.7,
+    rolling: bool = False,
 ) -> dict[str, Any]:
     """Запланировать пересылки одного сообщения (с меткой Forwarded from)."""
     from app.config import get_settings
@@ -362,13 +381,14 @@ async def schedule_chat_forwards(
     if clear_existing:
         cleared = await delete_scheduled(client, entity, pause=del_pause)
 
-    count = posts_count_for_interval(interval_minutes)
+    count = None if rolling else posts_count_for_interval(interval_minutes)
     times = build_schedule_times(
         start_minute=start_minute,
         interval_minutes=interval_minutes,
         posts_count=count,
         tz=tz,
         start_hour=start_hour,
+        rolling=rolling,
     )
 
     success = 0

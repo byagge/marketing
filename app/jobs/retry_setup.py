@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from collections import defaultdict
 
 from aiogram import Bot
@@ -9,10 +10,21 @@ from app.config import get_settings
 from app.jobs.health import run_health_all
 from app.jobs.parallel import map_batches, setup_parallel_defaults
 from app.jobs.setup import run_setup_chats_only
+from app.notify import safe_send
+from app.utils.chat_ids import canon_chat_id
 from app.store import Store
+from app.tg.scheduler import flood_snapshot
 from app.tg.client import telethon_client
 
 log = logging.getLogger("marketing.retry")
+
+
+def _took(t0: float, fw0: tuple[int, float]) -> str:
+    """«заняло 12 мин, FloodWait 5× / 340 с» — видно, что тормозит прогон."""
+    mins = (time.monotonic() - t0) / 60
+    n1, s1 = flood_snapshot()
+    n, secs = n1 - fw0[0], s1 - fw0[1]
+    return f"заняло {mins:.0f} мин, FloodWait {n}× / {secs:.0f} с"
 
 
 async def run_setup_retries(store: Store, bot: Bot | None, admin_chat_id: int | None) -> str:
@@ -22,6 +34,16 @@ async def run_setup_retries(store: Store, bot: Bot | None, admin_chat_id: int | 
         retry_days=settings.setup_retry_days,
         max_attempts=settings.setup_max_attempts,
     )
+    # баны и муты не повторяем (их снимает скан ограничений), выключенные вручную — тоже
+    blocked = {(r.account_id, r.chat_pk) for r in await store.list_restrictions()}
+    disabled = await store.disabled_pairs()
+    chat_keys = {c.id: canon_chat_id(c.chat_id) for c in await store.list_chats()}
+    due = [
+        st
+        for st in due
+        if (st.account_id, st.chat_pk) not in blocked
+        and (st.account_id, chat_keys.get(st.chat_pk, "")) not in disabled
+    ]
     if not due:
         return "Повтор настройки: нет чатов к проверке"
 
@@ -33,7 +55,7 @@ async def run_setup_retries(store: Store, bot: Bot | None, admin_chat_id: int | 
 
     if bot and admin_chat_id:
         try:
-            await bot.send_message(
+            await safe_send(bot, 
                 admin_chat_id,
                 f"Повтор настройки schedule | {len(due)} чатов / "
                 f"{len(by_account)} аккаунтов "
@@ -46,6 +68,8 @@ async def run_setup_retries(store: Store, bot: Bot | None, admin_chat_id: int | 
     batch_size, batch_pause = setup_parallel_defaults()
     items = list(by_account.items())
     ok_n = skip_n = abandoned_n = 0
+    t0 = time.monotonic()
+    fw0 = flood_snapshot()
 
     async def _one(item: tuple[int, list[int]]):
         account_id, chat_pks = item
@@ -75,11 +99,11 @@ async def run_setup_retries(store: Store, bot: Bot | None, admin_chat_id: int | 
 
     summary = (
         f"Повтор настройки завершён: ок={ok_n}, пропуск={skip_n}, "
-        f"стоп до недели={abandoned_n}"
+        f"стоп до недели={abandoned_n} | {_took(t0, fw0)}"
     )
     if bot and admin_chat_id:
         try:
-            await bot.send_message(admin_chat_id, summary)
+            await safe_send(bot, admin_chat_id, summary)
         except Exception:
             pass
     return summary
@@ -105,7 +129,7 @@ async def run_weekly_recheck(store: Store, bot: Bot, admin_chat_id: int) -> None
     for state in pending:
         by_account[state.account_id].append(state.chat_pk)
 
-    await bot.send_message(
+    await safe_send(bot, 
         admin_chat_id,
         f"Недельный пересмотр schedule | сброшено состояний: {reset_n} | "
         f"к проверке: {len(pending)} чатов",
@@ -141,7 +165,7 @@ async def run_weekly_recheck(store: Store, bot: Bot, admin_chat_id: int) -> None
         skip_n += len(buckets.get("skipped", [])) + len(buckets.get("config_error", []))
         abandoned_n += len(buckets.get("abandoned", []))
 
-    await bot.send_message(
+    await safe_send(bot, 
         admin_chat_id,
         f"Недельный пересмотр: ок={ok_n}, пропуск={skip_n}, "
         f"снова стоп={abandoned_n} (макс {settings.setup_max_attempts} попыток)",
@@ -170,7 +194,7 @@ async def run_nonpremium_daily_reschedule(
     chat_pks = [c.id for c in schedule_chats]
     if bot and admin_chat_id:
         try:
-            await bot.send_message(
+            await safe_send(bot, 
                 admin_chat_id,
                 f"Суточный schedule (non-Premium) | проверка {len(accounts)} аккаунтов, "
                 f"{len(chat_pks)} чатов | час={settings.nonpremium_hour}:00",
@@ -180,6 +204,8 @@ async def run_nonpremium_daily_reschedule(
 
     renewed = skipped_premium = 0
     ok_n = skip_n = abandoned_n = 0
+    t0 = time.monotonic()
+    fw0 = flood_snapshot()
     enabled_pks = set(chat_pks)
     batch_size, batch_pause = setup_parallel_defaults()
 
@@ -230,11 +256,12 @@ async def run_nonpremium_daily_reschedule(
     summary = (
         f"Суточный schedule (non-Premium): обновлено аккаунтов={renewed}, "
         f"пропуск Premium={skipped_premium}, "
-        f"чаты ок={ok_n}, пропуск={skip_n}, abandoned={abandoned_n}"
+        f"чаты ок={ok_n}, пропуск={skip_n}, abandoned={abandoned_n} | "
+        f"{_took(t0, fw0)}"
     )
     if bot and admin_chat_id:
         try:
-            await bot.send_message(admin_chat_id, summary)
+            await safe_send(bot, admin_chat_id, summary)
         except Exception:
             pass
     return summary

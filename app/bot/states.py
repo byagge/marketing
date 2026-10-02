@@ -70,3 +70,7 @@ class MakeSession(StatesGroup):
     phone = State()
     code = State()
     password = State()
+
+
+class EditChatText(StatesGroup):
+    text = State()

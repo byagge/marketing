@@ -7,6 +7,7 @@ from datetime import datetime, timedelta, timezone
 from aiogram import Bot
 
 from app.jobs import runtime
+from app.notify import safe_send
 from app.store import Store
 from app.tg.client import telethon_client
 from app.tg.online import bump_online
@@ -92,7 +93,7 @@ async def run_online_ping(
         summary += "\n" + "\n".join(errors[:8])
     if notify and bot and admin_chat_id and (fail or ok):
         try:
-            await bot.send_message(admin_chat_id, summary)
+            await safe_send(bot, admin_chat_id, summary)
         except Exception:
             pass
     return summary

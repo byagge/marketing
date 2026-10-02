@@ -9,7 +9,7 @@ from telethon import TelegramClient
 from app.config import get_settings
 from app.jobs import LogSink, runtime
 from app.models import Account, Chat, Post
-from app.sender_api import SenderAPI
+from app.sender_api import SenderAPI, SenderAPIError
 from app.store import Store
 from app.tg.client import telethon_client
 from app.tg.resolve import lookup_entity
@@ -19,8 +19,10 @@ from app.tg.scheduler import (
     schedule_chat_forwards,
     schedule_chat_posts,
 )
+from app.tg.restrictions import classify_text, record_restriction
 from app.tg.unavailable import format_unavailable, is_chat_unavailable, is_unavailable_text
-from app.utils.chat_ids import chat_ids_match
+from app.utils.chat_ids import canon_chat_id, chat_ids_match
+from app.utils.timefmt import fmt_until
 from app.utils.entities import entities_loads
 from app.utils.minutes import period_for_interval, suggest_minute
 from app.utils.schedule import resolve_repeat_period
@@ -118,6 +120,47 @@ def pick_sender_live_chats(live_chats: list[dict], schedule_chats: list[Chat]) -
     return picked
 
 
+async def _blocked_chat_keys(store: Store, account_id: int) -> set[str]:
+    """Каталожные чаты, где у аккаунта активный бан/мут (ключ canon chat id)."""
+    keys: set[str] = set()
+    restrictions = await store.list_restrictions(account_id=account_id)
+    for restr in restrictions:
+        chat = await store.get_chat(restr.chat_pk)
+        if chat:
+            keys.add(canon_chat_id(chat.chat_id))
+    return keys
+
+
+async def apply_chat_prefs(
+    api: SenderAPI,
+    sender_id: str,
+    live_chats: list[dict],
+    prefs: dict,
+    blocked_keys: set[str] | None = None,
+) -> int:
+    """Ручное выкл/вкл чатов и отметки по чатам — поверх общих настроек."""
+    blocked_keys = blocked_keys or set()
+    changed = 0
+    for live in live_chats:
+        cid = str(live.get("chat_id") or "")
+        if not cid:
+            continue
+        key = canon_chat_id(cid)
+        pref = prefs.get(key)
+        try:
+            if (pref is not None and not pref.is_enabled) or key in blocked_keys:
+                await api.patch_chat(sender_id, cid, active=False)
+                changed += 1
+            elif pref is not None and pref.mention >= 0:
+                await api.patch_chat(
+                    sender_id, cid, mention=True if pref.mention else False
+                )
+                changed += 1
+        except SenderAPIError:
+            continue
+    return changed
+
+
 async def _mute_schedule_on_sender(
     api: SenderAPI,
     sender_id: str,
@@ -132,6 +175,13 @@ async def _mute_schedule_on_sender(
             await api.patch_chat(sender_id, cid, active=False, mention=False)
 
 
+_KIND_LABEL = {
+    "ban": "БАН — записан в базу банов, больше не пробую",
+    "mute": "мут — записан в базу мутов",
+    "nowrite": "запрет писать — записан в базу мутов",
+}
+
+
 async def _fail_unavailable(
     store: Store,
     account: Account,
@@ -140,17 +190,51 @@ async def _fail_unavailable(
     log: LogSink,
     *,
     max_attempts: int,
+    client: TelegramClient | None = None,
+    entity: Any = None,
 ) -> str:
+    # бан / мут → отдельная база (по ним больше не пытаемся вступать и писать)
+    hint = classify_text(error)
+    prev_restr = await store.get_restriction(account.id, chat.id)
+    kind: str | None = None
+    if hint:
+        try:
+            kind = await record_restriction(
+                store, client, account, chat, entity, hint=hint, error=error
+            )
+        except Exception:  # noqa: BLE001
+            kind = hint
+    prev_state = await store.get_setup_state(account.id, chat.id)
+    was_abandoned = bool(prev_state and prev_state.is_abandoned)
     state = await store.record_setup_fail(
         account.id, chat.id, error, max_attempts=max_attempts
     )
     prefix = f"{account.label}: "
+    # повторные одинаковые ошибки не шлём в Telegram (раньше — 21 сообщение в час)
+    new_restr = kind is not None and (prev_restr is None or prev_restr.kind != kind)
+    notify = (not was_abandoned) or new_restr
+
+    if kind:
+        restr = await store.get_restriction(account.id, chat.id)
+        extra = ""
+        if restr and restr.is_mute:
+            extra = f" до {fmt_until(restr.until_at)}"
+            if restr.reason:
+                extra += f" | причина: {restr.reason[:200]}"
+        await log.emit(
+            f"{prefix}Пропуск «{chat.title}»: {_KIND_LABEL.get(kind, kind)}{extra}",
+            "error",
+            notify=notify,
+        )
+        return "abandoned" if kind == "ban" or state.is_abandoned else "skipped"
+
     if state.is_abandoned:
         await log.emit(
             f"{prefix}Пропуск «{chat.title}»: недоступен ({error}). "
             f"Попытка {state.fail_count}/{max_attempts} — больше не пробую "
             f"до начала недели",
             "error",
+            notify=notify,
         )
         return "abandoned"
     await log.emit(
@@ -160,6 +244,17 @@ async def _fail_unavailable(
         "error",
     )
     return "skipped"
+
+
+async def pair_blocked(store: Store, account: Account, chat: Chat) -> str | None:
+    """Почему эту пару не настраиваем: disabled | banned | muted | None."""
+    pref = await store.get_pref(account.id, chat.chat_id)
+    if not pref.is_enabled:
+        return "disabled"
+    restr = await store.get_restriction(account.id, chat.id)
+    if restr is not None:
+        return "banned" if restr.is_ban else "muted"
+    return None
 
 
 async def schedule_one_chat(
@@ -181,6 +276,14 @@ async def schedule_one_chat(
     settings = get_settings()
     max_attempts = settings.setup_max_attempts
 
+    blocked = await pair_blocked(store, account, chat)
+    if blocked:
+        # выключено вручную / бан / мут — тихо пропускаем, в базе всё видно
+        await log.emit(
+            f"{account.label}: «{chat.title}» пропущен ({blocked})", notify=False
+        )
+        return blocked
+
     if skip_abandoned:
         state = await store.get_setup_state(account.id, chat.id)
         if state and state.is_abandoned:
@@ -188,10 +291,14 @@ async def schedule_one_chat(
                 f"{account.label}: Пропуск «{chat.title}»: уже {state.fail_count} "
                 f"неудачных попыток (ждём начало недели)",
                 "error",
+                notify=False,
             )
             return "abandoned"
 
     post = pick_post_for_chat(posts, chat)
+    custom = await store.get_chat_post(account.id, chat.chat_id)
+    if custom is not None:
+        post = custom  # свой текст для этого чата у этого аккаунта
     use_link = post.is_link_mode and (post.has_text_link or post.has_photo_link)
     if not use_link and not post.text.strip():
         await log.emit(
@@ -230,6 +337,7 @@ async def schedule_one_chat(
                 "чат не найден в аккаунте",
                 log,
                 max_attempts=max_attempts,
+                client=client,
             )
         # заранее: если в чат нельзя фото — сразу без медиа (caption/текст)
         want_media = chat.media_allowed
@@ -258,6 +366,7 @@ async def schedule_one_chat(
                 start_hour=settings.start_hour,
                 tz=settings.tz,
                 repeat_period=repeat_period,
+                rolling=repeat_period is None,
             )
             # если фото-ссылка не прошла из-за медиа — пробуем text-link
             if (
@@ -292,6 +401,7 @@ async def schedule_one_chat(
                         start_hour=settings.start_hour,
                         tz=settings.tz,
                         repeat_period=repeat_period,
+                        rolling=repeat_period is None,
                     )
         else:
             photo = post.photo_path or None
@@ -309,6 +419,7 @@ async def schedule_one_chat(
                 repeat_period=repeat_period,
                 photo_path=photo,
                 allow_media=want_media,
+                rolling=repeat_period is None,
             )
             if result.get("media_blocked") and want_media:
                 await store.update_chat(chat.id, allow_media=0)
@@ -324,6 +435,8 @@ async def schedule_one_chat(
                 format_unavailable(e),
                 log,
                 max_attempts=max_attempts,
+                client=client,
+                entity=locals().get("entity"),
             )
         await log.emit(
             f"{account.label}: Ошибка schedule «{chat.title}»: "
@@ -346,6 +459,8 @@ async def schedule_one_chat(
                 err,
                 log,
                 max_attempts=max_attempts,
+                client=client,
+                entity=locals().get("entity"),
             )
         await log.emit(
             f"{account.label}: Частично «{chat.title}»: "
@@ -511,6 +626,8 @@ async def _configure_sender(
 
     targets = pick_sender_live_chats(live_chats, schedule_chats)
     live_ids = {str(c.get("chat_id") or "") for c in live_chats}
+    prefs = {p.chat_key: p for p in await store.list_prefs(account.id)}
+    blocked_keys = await _blocked_chat_keys(store, account.id)
     for chat in sender_chats:
         if not any(chat_ids_match(chat.chat_id, cid) for cid in live_ids):
             await log.emit(
@@ -524,6 +641,20 @@ async def _configure_sender(
         if runtime.cancelled("setup", account.id):
             raise SetupError("Остановлено")
         cid = str(live.get("chat_id"))
+        key = canon_chat_id(cid)
+        pref = prefs.get(key)
+        if (pref is not None and not pref.is_enabled) or key in blocked_keys:
+            # выключено вручную / бан / мут: в Autoposter чат не включаем
+            try:
+                await api.patch_chat(sender_id, cid, active=False)
+            except SenderAPIError:
+                pass
+            await log.emit(
+                f"Sender: «{live.get('title') or cid}» выключен "
+                f"({'вручную' if pref is not None and not pref.is_enabled else 'бан/мут'})",
+                notify=False,
+            )
+            continue
         catalog = match_catalog_chat(cid, sender_chats)
         if catalog:
             post = pick_post_for_chat(posts, catalog)
@@ -535,18 +666,25 @@ async def _configure_sender(
             tag = None
             title = live.get("title") or cid
             kind_note = "полн."
+        custom = await store.get_chat_post(account.id, cid)
+        if custom is not None:
+            post = custom
+            kind_note = "свой"
         text, ents = render_post(
             post.text,
             entities_loads(post.entities_json),
             tag,
         )
+        chat_mentions = (
+            mentions_on if pref is None or pref.mention < 0 else bool(pref.mention)
+        )
         await push_chat_text(
-            api, sender_id, cid, text, ents, mentions_enabled=mentions_on
+            api, sender_id, cid, text, ents, mentions_enabled=chat_mentions
         )
         sender_count += 1
         await log.emit(
             f"Sender: включил «{title}» ({kind_note}, "
-            f"mention={'on' if mentions_on else 'off'})",
+            f"mention={'on' if chat_mentions else 'off'})",
             notify=False,
         )
 
@@ -559,6 +697,7 @@ async def _configure_sender(
         await apply_mentions_everywhere(
             api, sender_id, enabled=mentions_on, live_chats=live_chats
         )
+        await apply_chat_prefs(api, sender_id, live_chats, prefs, blocked_keys)
         # и снова клоакинг — spam/start не должен его сбрасывать, но проверяем
         cloak_res = await push_cloak(
             api, sender_id, enabled=cloak_on, text=cloak_text

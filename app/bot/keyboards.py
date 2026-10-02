@@ -89,6 +89,7 @@ def main_menu() -> InlineKeyboardMarkup:
         inline_keyboard=[
             [ib("Настройка", "setup", icon="robot"), ib("Чаты", "chats", icon="users")],
             [ib("Таблица", "table", icon="clock"), ib("Sender", "sender", icon="link")],
+            [ib("Факты отправки", "fact", icon="chart"), ib("Баны / муты", "restr", icon="shield")],
             [ib("Аккаунты", "accounts", icon="user"), ib("Online", "online", icon="star")],
             [ib("Session", "mk_session", icon="inbox")],
             [ib("Отчёты", "reports", icon="chart"), ib("Проверка", "health", icon="search")],
@@ -138,7 +139,11 @@ def account_kb(acc: Account, running: bool = False) -> InlineKeyboardMarkup:
                 ib("Пост", "posts", acc.id, icon="mega"),
                 ib("Leave", "leave_go", acc.id, icon="block"),
             ],
-            [ib("Проверка чатов", "acc_chats", acc.id, icon="users")],
+            [ib("Чаты аккаунта (вкл/выкл, текст)", "acc_cl", acc.id, icon="mega")],
+            [
+                ib("Ограничения / SpamBot", "restr_a", acc.id, icon="shield"),
+                ib("Проверка чатов", "acc_chats", acc.id, icon="users"),
+            ],
             [ib("Вступить во все чаты", "acc_join_all", acc.id, icon="up")],
             [ib("Вступить по папке", "acc_folder", acc.id, icon="folder")],
             [ib("Проверить schedule", "health_go", acc.id, icon="search")],
@@ -324,6 +329,7 @@ def table_chats_kb(
         rows.append([ib("Остановить перенастройку", "tbl_reall_stop", icon="down")])
     else:
         rows.append([ib("Перенастроить все", "tbl_reall", icon="robot")])
+    rows.append([ib("Факт: последний час / сутки", "fact", icon="chart")])
     rows.append([ib("Только таблицу", "tbl_rebal", icon="stack")])
     rows.append([ib("Скачать Excel", "tbl_dl", icon="inbox")])
     rows.append([ib("Загрузить Excel", "tbl_ul", icon="folder")])
@@ -395,6 +401,7 @@ def setup_kb(accounts: list[Account], running_ids: set[int]) -> InlineKeyboardMa
             rows.append([ib(acc.label, "setup_ask", acc.id, icon="up")])
     rows.append([ib("Перенастроить все", "tbl_reall", icon="robot")])
     rows.append([ib("Вступить все аккаунты", "join_all_acc", icon="users")])
+    rows.append([ib("Вступить в недостающие (все акк.)", "join_miss_all", icon="up")])
     rows.append(home_row())
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
