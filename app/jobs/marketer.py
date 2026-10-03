@@ -43,11 +43,10 @@ async def run_marketer_tick(store: Store, bot: Bot | None = None) -> str:
         result = box.get("result")
         if result is None:
             return "marketer: failed (no result)"
-        crit = sum(1 for f in result.findings if f.severity == "critical")
         return (
-            f"marketer: accounts={result.accounts_scanned} "
-            f"findings={len(result.findings)} crit={crit} "
-            f"leads={result.leads_new} fixed={sum(1 for x in result.fixed if x.ok)}"
+            f"operator: pairs={result.pairs} working={result.working} "
+            f"actions={len(result.actions)} (ok={sum(1 for a in result.actions if a.ok)}) "
+            f"new_escalations={len(result.new_escalations)}"
         )
 
 
@@ -86,8 +85,8 @@ async def run_marketer_morning(store: Store, bot: Bot | None = None) -> str:
         if result is None:
             return "marketer_morning: failed"
         return (
-            f"marketer_morning: accounts={result.accounts_scanned} "
-            f"findings={len(result.findings)} leads={result.leads_new}"
+            f"operator_morning: pairs={result.pairs} working={result.working} "
+            f"actions={len(result.actions)}"
         )
 
 

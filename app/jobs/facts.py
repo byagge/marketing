@@ -89,6 +89,7 @@ async def collect_account(
     since: datetime,
     *,
     scan_restrictions: bool,
+    scan_dms: bool = False,
 ) -> dict[str, Any]:
     stats: dict[str, Any] = {
         "new": 0,
@@ -98,6 +99,8 @@ async def collect_account(
         "mute": 0,
         "resolved": 0,
         "resolved_chats": [],
+        "dm_new": 0,
+        "dm_pending": 0,
     }
     async with telethon_client(account.telethon_session) as client:
         entities = await dialog_entities(client, chats)
@@ -115,6 +118,12 @@ async def collect_account(
             stats["mute"] += res["mute"] + res["nowrite"]
             stats["resolved"] += res["resolved"]
             stats["resolved_chats"] = list(res.get("resolved_chats") or [])
+        if scan_dms:
+            from app.jobs.dms import collect_dms
+
+            dm = await collect_dms(store, client, account)
+            stats["dm_new"] = dm.new_people
+            stats["dm_pending"] = dm.pending
     return stats
 
 
@@ -154,8 +163,13 @@ async def run_facts_collection(
     bot: Bot | None = None,
     admin_chat_id: int | None = None,
     account_ids: list[int] | None = None,
+    scan_dms: bool = True,
+    quiet: bool = False,
 ) -> str:
-    """Собрать факты отправки за последние `hours` часов по всем аккаунтам."""
+    """Собрать факты отправки за последние `hours` часов по всем аккаунтам.
+
+    quiet=True — плановый сбор: итог в чат не шлём (только при ошибках аккаунтов).
+    """
     started = time.monotonic()
     accounts = [a for a in await store.list_accounts() if a.telethon_session]
     if account_ids is not None:
@@ -170,16 +184,43 @@ async def run_facts_collection(
 
     async def _one(acc: Account) -> dict[str, Any]:
         acc_chats = [c for c in chats if (acc.id, c.id) not in banned]
-        return await collect_account(
-            store, acc, acc_chats, since, scan_restrictions=scan_restrictions
+        try:
+            res = await collect_account(
+                store,
+                acc,
+                acc_chats,
+                since,
+                scan_restrictions=scan_restrictions,
+                scan_dms=scan_dms,
+            )
+        except Exception as e:  # noqa: BLE001
+            await store.set_setting(
+                f"facts_status:{acc.id}",
+                f"err|{to_iso(datetime.now(timezone.utc))}|{type(e).__name__}: {e}"[:300],
+            )
+            raise
+        await store.set_setting(
+            f"facts_status:{acc.id}", f"ok|{to_iso(datetime.now(timezone.utc))}|"
         )
+        return res
 
     results = await map_batches(accounts, _one, batch_size=batch_size, batch_pause=batch_pause)
-    total = {"new": 0, "chats": 0, "not_member": 0, "ban": 0, "mute": 0, "resolved": 0}
+    total = {
+        "new": 0,
+        "chats": 0,
+        "not_member": 0,
+        "ban": 0,
+        "mute": 0,
+        "resolved": 0,
+        "dm_new": 0,
+        "dm_pending": 0,
+    }
     failed = 0
+    failed_names: list[str] = []
     for acc, res in zip(accounts, results):
         if isinstance(res, BaseException):
             failed += 1
+            failed_names.append(f"{acc.label} ({type(res).__name__})")
             log.warning("facts failed for %s: %s", acc.label, res)
             continue
         for k, v in res.items():
@@ -200,8 +241,14 @@ async def run_facts_collection(
     )
     if scan_restrictions:
         summary += f" | баны {total['ban']}, муты {total['mute']}, снято {total['resolved']}"
+    if scan_dms:
+        summary += f" | новых людей в ЛС {total['dm_new']}"
+        if total["dm_pending"]:
+            summary += f" (в очереди индексации {total['dm_pending']} диалогов)"
     summary += f" | {took:.0f} с"
-    if bot and admin_chat_id:
+    if failed_names:
+        summary += "\nНе удалось прочитать: " + ", ".join(failed_names[:10])
+    if bot and admin_chat_id and (not quiet or failed_names):
         await safe_send(bot, admin_chat_id, summary)
     log.info(summary)
     return summary

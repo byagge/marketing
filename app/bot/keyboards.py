@@ -365,8 +365,11 @@ def reports_kb(
         rows.append(day_btns)
     rows.extend(
         [
-            [ib("Плотность / советы", "rep_density", p=day_offset, icon="pin")],
-            [ib("Лиды", "rep_leads", p=day_offset, icon="users")],
+            [ib("Реальная частота по чатам", "rep_density", p=day_offset, icon="pin")],
+            [
+                ib("Люди в ЛС", "rep_leads", p=day_offset, icon="users"),
+                ib("По аккаунтам", "rep_acc", p=day_offset, icon="user"),
+            ],
             [ib("Проблемы", "rep_issues", icon="warn")],
             [ib("Журнал задач", "rep_jobs", icon="folder")],
             [toggle, fix],

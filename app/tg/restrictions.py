@@ -191,7 +191,11 @@ async def record_restriction(
         kind, until, detail = probe.kind, probe.until, probe.detail
     elif hint == "ban" and probe is not None and probe.kind == "ok":
         # участник без ограничений, но писать нельзя → это лимит самого аккаунта
-        # (@SpamBot), а не бан в чате: в базу банов не пишем
+        # (@SpamBot), а не бан в чате: в базу банов не пишем, но просим срочно
+        # перепроверить аккаунт в @SpamBot
+        await store.set_setting(
+            f"spam_recheck:{account.id}", to_iso(datetime.now(timezone.utc))
+        )
         return None
     elif hint == "ban":
         kind = "ban"

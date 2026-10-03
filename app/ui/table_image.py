@@ -212,6 +212,7 @@ def render_grid_png(
     row_head: str = "Время / чат",
     footer: str = "",
     max_cols: int = 20,
+    grey_rows: set[int] | None = None,
 ) -> bytes:
     """Универсальная таблица: строки — время, колонки — чаты, ячейка — аккаунт/число.
 
@@ -253,14 +254,24 @@ def render_grid_png(
         tw = _text_w(head_font, head)
         draw.text((x0 + max(2, (x1 - x0 - tw) / 2), y0 + 6), head, font=head_font, fill=HEADER_FG)
 
+    grey = grey_rows or set()
     for i, label in enumerate(row_labels, start=1):
         x0, y0, x1, y1 = box(i, 0)
-        draw.rectangle((x0, y0, x1, y1), fill=CELL, outline=GRID)
+        is_grey = (i - 1) in grey
+        draw.rectangle((x0, y0, x1, y1), fill=(228, 228, 228) if is_grey else CELL, outline=GRID)
         tw = _text_w(cell_font, label)
-        draw.text((x0 + (x1 - x0 - tw) / 2, y0 + 5), label, font=cell_font, fill=TEXT)
+        draw.text(
+            (x0 + (x1 - x0 - tw) / 2, y0 + 5),
+            label,
+            font=cell_font,
+            fill=MUTED if is_grey else TEXT,
+        )
         for j in range(1, len(cols) + 1):
             cx0, cy0, cx1, cy1 = box(i, j)
             text = cells.get((i - 1, j - 1))
+            if is_grey and not text:
+                draw.rectangle((cx0, cy0, cx1, cy1), fill=(228, 228, 228), outline=GRID)
+                continue
             if text:
                 draw.rectangle((cx0, cy0, cx1, cy1), fill=FILLED, outline=GRID)
                 name = _fit(text, 12)

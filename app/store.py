@@ -253,6 +253,28 @@ CREATE TABLE IF NOT EXISTS daily_reports (
     payload_json TEXT NOT NULL DEFAULT '{}'
 );
 
+CREATE TABLE IF NOT EXISTS dm_people (
+    account_id INTEGER NOT NULL,
+    user_id INTEGER NOT NULL,
+    username TEXT NOT NULL DEFAULT '',
+    name TEXT NOT NULL DEFAULT '',
+    started_by TEXT NOT NULL DEFAULT 'unknown',
+    first_at TEXT NOT NULL DEFAULT '',
+    last_in_at TEXT NOT NULL DEFAULT '',
+    last_msg_id INTEGER NOT NULL DEFAULT 0,
+    last_msg_at TEXT NOT NULL DEFAULT '',
+    in_count INTEGER NOT NULL DEFAULT 0,
+    unread INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (account_id, user_id)
+);
+
+CREATE TABLE IF NOT EXISTS dm_activity (
+    account_id INTEGER NOT NULL,
+    user_id INTEGER NOT NULL,
+    day TEXT NOT NULL,
+    PRIMARY KEY (account_id, user_id, day)
+);
+
 CREATE INDEX IF NOT EXISTS idx_incidents_status ON incidents(status, severity);
 CREATE INDEX IF NOT EXISTS idx_health_snap_acc ON health_snapshots(account_id, chat_pk, checked_at);
 CREATE INDEX IF NOT EXISTS idx_leads_acc ON leads(account_id, last_seen_at);
@@ -2239,3 +2261,163 @@ class Store:
             )
             return [r[0] for r in await cur.fetchall()]
 
+    # ---- люди, которые пишут аккаунтам (ЛС) ---------------------------------
+
+    async def dm_known(self, account_id: int) -> dict[int, tuple[int, str]]:
+        """user_id → (last_msg_id, last_msg_at) уже обработанных диалогов."""
+        async with self._connect() as db:
+            cur = await db.execute(
+                "SELECT user_id, last_msg_id, last_msg_at FROM dm_people WHERE account_id=?",
+                (account_id,),
+            )
+            return {int(r[0]): (int(r[1]), r[2] or "") for r in await cur.fetchall()}
+
+    async def upsert_dm_person(
+        self,
+        account_id: int,
+        user_id: int,
+        *,
+        username: str = "",
+        name: str = "",
+        started_by: str | None = None,
+        first_at: str | None = None,
+        last_in_at: str | None = None,
+        last_msg_id: int = 0,
+        last_msg_at: str = "",
+        add_in: int = 0,
+        unread: int = 0,
+    ) -> None:
+        async with self._connect() as db:
+            await db.execute(
+                "INSERT INTO dm_people(account_id, user_id, username, name, started_by, "
+                "first_at, last_in_at, last_msg_id, last_msg_at, in_count, unread) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?) "
+                "ON CONFLICT(account_id, user_id) DO UPDATE SET "
+                "username=CASE WHEN excluded.username<>'' THEN excluded.username ELSE username END, "
+                "name=CASE WHEN excluded.name<>'' THEN excluded.name ELSE name END, "
+                "started_by=CASE WHEN dm_people.started_by='unknown' "
+                "  THEN excluded.started_by ELSE dm_people.started_by END, "
+                "first_at=CASE WHEN dm_people.first_at='' THEN excluded.first_at "
+                "  ELSE dm_people.first_at END, "
+                "last_in_at=CASE WHEN excluded.last_in_at>dm_people.last_in_at "
+                "  THEN excluded.last_in_at ELSE dm_people.last_in_at END, "
+                "last_msg_id=MAX(dm_people.last_msg_id, excluded.last_msg_id), "
+                "last_msg_at=CASE WHEN excluded.last_msg_at>dm_people.last_msg_at "
+                "  THEN excluded.last_msg_at ELSE dm_people.last_msg_at END, "
+                "in_count=dm_people.in_count+? , unread=excluded.unread",
+                (
+                    account_id,
+                    user_id,
+                    username,
+                    name,
+                    started_by or "unknown",
+                    first_at or "",
+                    last_in_at or "",
+                    last_msg_id,
+                    last_msg_at,
+                    add_in,
+                    unread,
+                    add_in,
+                ),
+            )
+            await db.commit()
+
+    async def add_dm_activity(self, account_id: int, user_id: int, days: set[str]) -> None:
+        if not days:
+            return
+        async with self._connect() as db:
+            await db.executemany(
+                "INSERT OR IGNORE INTO dm_activity(account_id, user_id, day) VALUES(?,?,?)",
+                [(account_id, user_id, d) for d in days],
+            )
+            await db.commit()
+
+    async def dm_summary(
+        self, since_24h: str, since_7d: str
+    ) -> dict[int, dict[str, int]]:
+        """По каждому аккаунту: сколько людей написали (всего / первыми / за 24ч / 7д)."""
+        out: dict[int, dict[str, int]] = {}
+        async with self._connect() as db:
+            cur = await db.execute(
+                "SELECT account_id, "
+                "SUM(CASE WHEN in_count>0 THEN 1 ELSE 0 END), "
+                "SUM(CASE WHEN started_by='them' THEN 1 ELSE 0 END), "
+                "SUM(CASE WHEN started_by='them' AND first_at>=? THEN 1 ELSE 0 END), "
+                "SUM(CASE WHEN started_by='them' AND first_at>=? THEN 1 ELSE 0 END), "
+                "SUM(CASE WHEN last_in_at>=? THEN 1 ELSE 0 END), "
+                "SUM(CASE WHEN unread>0 THEN 1 ELSE 0 END), "
+                "COUNT(*) "
+                "FROM dm_people GROUP BY account_id",
+                (since_24h, since_7d, since_24h),
+            )
+            for r in await cur.fetchall():
+                out[int(r[0])] = {
+                    "wrote": int(r[1] or 0),
+                    "first_total": int(r[2] or 0),
+                    "first_24h": int(r[3] or 0),
+                    "first_7d": int(r[4] or 0),
+                    "active_24h": int(r[5] or 0),
+                    "waiting": int(r[6] or 0),
+                    "dialogs": int(r[7] or 0),
+                }
+        return out
+
+    async def dm_active_on_day(self, day: str) -> dict[int, int]:
+        """account_id → сколько разных людей писали в этот локальный день."""
+        async with self._connect() as db:
+            cur = await db.execute(
+                "SELECT account_id, COUNT(*) FROM dm_activity WHERE day=? GROUP BY account_id",
+                (day,),
+            )
+            return {int(r[0]): int(r[1]) for r in await cur.fetchall()}
+
+    async def dm_new_on_day(self, day_start_utc: str, day_end_utc: str) -> dict[int, int]:
+        """account_id → сколько людей написали впервые в этот день."""
+        async with self._connect() as db:
+            cur = await db.execute(
+                "SELECT account_id, COUNT(*) FROM dm_people "
+                "WHERE started_by='them' AND first_at>=? AND first_at<? GROUP BY account_id",
+                (day_start_utc, day_end_utc),
+            )
+            return {int(r[0]): int(r[1]) for r in await cur.fetchall()}
+
+    async def resolve_incidents_by_source(self, source: str) -> int:
+        async with self._connect() as db:
+            cur = await db.execute(
+                "UPDATE incidents SET status='resolved', resolved_at=? "
+                "WHERE source=? AND status IN ('open','fixing')",
+                (_now(), source),
+            )
+            await db.commit()
+            return int(cur.rowcount or 0)
+
+    async def resolve_incidents_not_in(
+        self, source: str, keep: set[tuple[str, int | None, int | None]]
+    ) -> int:
+        """Закрыть открытые инциденты источника, которых нет в актуальном списке."""
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                "SELECT id, kind, account_id, chat_pk FROM incidents "
+                "WHERE source=? AND status IN ('open','fixing')",
+                (source,),
+            )
+            rows = await cur.fetchall()
+            stale = [
+                r["id"]
+                for r in rows
+                if (r["kind"], r["account_id"], r["chat_pk"]) not in keep
+            ]
+            for pk in stale:
+                await db.execute(
+                    "UPDATE incidents SET status='resolved', resolved_at=? WHERE id=?",
+                    (_now(), pk),
+                )
+            await db.commit()
+            return len(stale)
+
+    async def first_send_at(self) -> str:
+        async with self._connect() as db:
+            cur = await db.execute("SELECT MIN(sent_at) FROM send_events")
+            row = await cur.fetchone()
+        return (row[0] if row and row[0] else "") or ""

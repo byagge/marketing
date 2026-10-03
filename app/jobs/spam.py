@@ -92,3 +92,52 @@ async def run_spam_check(
     if bot and admin_chat_id:
         await safe_send(bot, admin_chat_id, summary)
     return summary
+
+
+async def run_spam_due(
+    store: Store,
+    bot: Bot | None = None,
+    admin_chat_id: int | None = None,
+    *,
+    limit: int = 6,
+) -> str:
+    """Постоянная проверка @SpamBot: тик раз в ~30 мин берёт тех, кому пора.
+
+    Пора, если аккаунт ни разу не проверялся, проверка старше spam_recheck_hours,
+    или есть флаг «подозрение» (ошибка «banned from sending» без бана в чате).
+    О смене статуса (появился лимит / лимит снят) сообщаем сразу.
+    """
+    from datetime import timedelta
+
+    from app.config import get_settings
+    from app.utils.timefmt import parse_utc
+
+    s = get_settings()
+    now = datetime.now(timezone.utc)
+    due: list[tuple[int, Account]] = []
+    for acc in await store.list_accounts():
+        if not acc.telethon_session:
+            continue
+        flag = parse_utc(await store.get_setting(f"spam_recheck:{acc.id}", ""))
+        checked = parse_utc(acc.spam_checked_at)
+        flagged = flag is not None and (checked is None or flag > checked)
+        stale = checked is None or (now - checked) >= timedelta(hours=s.spam_recheck_hours)
+        if flagged or stale:
+            due.append((0 if flagged else 1 if checked is None else 2, acc))
+    due.sort(key=lambda x: (x[0], x[1].spam_checked_at or ""))
+    changes: list[str] = []
+    checked_n = 0
+    for _prio, acc in due[:limit]:
+        before = acc.spam_status
+        status = await check_account_spam(store, acc)
+        checked_n += 1
+        if status == "limited" and before != "limited":
+            fresh = await store.get_account(acc.id)
+            until = f" до {fresh.spam_until}" if fresh and fresh.spam_until else ""
+            changes.append(f"⛔ {acc.label}: @SpamBot — появилось ограничение{until}")
+        elif before == "limited" and status == "clean":
+            changes.append(f"✅ {acc.label}: ограничение @SpamBot снято")
+        await asyncio.sleep(1.5)
+    if changes and bot and admin_chat_id:
+        await safe_send(bot, admin_chat_id, "\n".join(changes))
+    return f"SpamBot: проверено {checked_n}, изменений {len(changes)}, в очереди ещё {max(0, len(due) - limit)}"

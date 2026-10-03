@@ -62,13 +62,21 @@ class Settings(BaseSettings):
     online_ping_enabled: bool = True
 
     # AI-маркетолог: тихий сбор + утренний брифинг
-    marketer_interval_min: int = 20
+    marketer_interval_min: int = 30
     marketer_enabled: bool = True
     marketer_morning_hour: int = 7
     marketer_morning_minute: int = 40
     # Цель: пост в группу каждые 5–10 минут (наши аккаунты суммарно).
     density_target_min: float = 5.0
     density_target_max: float = 10.0
+
+    # ИИ-оператор: цикл анализа по фактам (без Telegram-запросов, кроме починки)
+    operator_interval_min: int = 30
+    # Необязательно: краткий вывод от Claude по уже посчитанным фактам (без ключа — выключено)
+    anthropic_api_key: str = ""
+    operator_llm_model: str = "claude-sonnet-5-5"
+    # SpamBot: проверять каждые N часов (и сразу при подозрении на лимит)
+    spam_recheck_hours: float = 3.0
 
     # Факты отправки / баны и муты / SpamBot / советы по аккаунтам
     facts_minute: int = 7  # каждый час в :07 читаем историю чатов

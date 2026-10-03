@@ -222,81 +222,97 @@ async def cb_rep_issues(query: CallbackQuery) -> None:
     )
 
 
-@router.callback_query(MenuCB.filter(F.a == "rep_density"))
-async def cb_rep_density(query: CallbackQuery, callback_data: MenuCB) -> None:
-    from html import escape
-
+async def _rep_kb(day_offset: int):
     from app.config import get_settings
     from app.reporting.dashboard import day_offsets
-    from app.ui.emoji import pe
-    from app.ui.screens import prompt_html
 
-    settings = get_settings()
-    days = day_offsets(settings.timezone, 7)
-    off = int(callback_data.p or 0)
-    day = days[min(off, len(days) - 1)][1]
-    rows = await ctx.store.density_for_day(day)
-    lines = [f"Плотность за <code>{escape(day)}</code>\n"]
-    if not rows:
-        lines.append("Пока нет данных — подожди тихий сбор (каждые ~20 мин).")
-    for d in rows:
-        gap = float(d.get("avg_gap_min") or 0)
-        st = d.get("status") or ""
-        mark = {
-            "ok": "✓",
-            "sparse": "⚠ нужно больше акк.",
-            "dense": "🔥 слишком часто",
-            "empty": "✗ пусто",
-        }.get(st, st)
-        title = escape(str(d.get("chat_title") or d.get("chat_pk")))
-        lines.append(
-            f"{pe('pin')} <b>{title}</b>\n"
-            f"   {gap:.1f} мин между постами · {d.get('accounts_live', 0)} акк. · {mark}\n"
-            f"   <i>{escape((d.get('advice') or '')[:200])}</i>"
-        )
     dash_on = (await ctx.store.get_setting("marketer_enabled", "1")) == "1"
     auto = (await ctx.store.get_setting("marketer_auto_fix", "1")) == "1"
+    days = day_offsets(get_settings().timezone, 7)
+    return reports_kb(marketer_on=dash_on, auto_fix=auto, day_offset=day_offset, days=days)
+
+
+def _day_for(off: int) -> str:
+    from app.config import get_settings
+    from app.reporting.dashboard import day_offsets
+
+    days = day_offsets(get_settings().timezone, 7)
+    return days[min(off, len(days) - 1)][1]
+
+
+@router.callback_query(MenuCB.filter(F.a == "rep_density"))
+async def cb_rep_density(query: CallbackQuery, callback_data: MenuCB) -> None:
+    from app.reporting.dashboard import format_density_html
+    from app.reporting.factual import build_fact_report
+    from app.ui.screens import prompt_html
+
+    off = int(callback_data.p or 0)
+    await query.answer()
+    report = await build_fact_report(ctx.store, _day_for(off))
     await safe_edit(
         query,
-        prompt_html("Плотность / советы", "\n".join(lines)[:3500], "pin"),
-        reports_kb(marketer_on=dash_on, auto_fix=auto, day_offset=off, days=days),
+        prompt_html("Реальная частота", format_density_html(report)[:3500], "pin"),
+        await _rep_kb(off),
     )
+
+
+@router.callback_query(MenuCB.filter(F.a == "rep_acc"))
+async def cb_rep_acc(query: CallbackQuery, callback_data: MenuCB) -> None:
+    from app.reporting.dashboard import format_accounts_html
+    from app.reporting.factual import build_fact_report
+
+    off = int(callback_data.p or 0) % 100
+    page = int(callback_data.i or 0)
+    await query.answer()
+    report = await build_fact_report(ctx.store, _day_for(off))
+    text, total = format_accounts_html(report, page)
+    kb = await _rep_kb(off)
+    rows = list(kb.inline_keyboard)
+    nav = []
+    if page > 0:
+        nav.append(ib("Назад", "rep_acc", page - 1, off, icon="down"))
+    if page + 1 < total:
+        nav.append(ib("Вперёд", "rep_acc", page + 1, off, icon="up"))
+    if nav:
+        rows.insert(0, nav)
+    await safe_edit(query, text[:3900], InlineKeyboardMarkup(inline_keyboard=rows))
 
 
 @router.callback_query(MenuCB.filter(F.a == "rep_leads"))
 async def cb_rep_leads(query: CallbackQuery, callback_data: MenuCB) -> None:
     from html import escape
 
-    from app.config import get_settings
-    from app.reporting.dashboard import day_offsets
+    from app.reporting.factual import build_fact_report
     from app.ui.emoji import pe
     from app.ui.screens import prompt_html
 
-    settings = get_settings()
-    days = day_offsets(settings.timezone, 7)
     off = int(callback_data.p or 0)
-    day = days[min(off, len(days) - 1)][1]
-    rows = await ctx.store.lead_stats_for_day(day)
-    total_new = sum(r.new_leads for r in rows)
-    total_msg = sum(r.messages for r in rows)
+    await query.answer()
+    r = await build_fact_report(ctx.store, _day_for(off))
+    new_day = sum(a.dm_first_day for a in r.accounts)
+    active = sum(a.dm_active_day for a in r.accounts)
     lines = [
-        f"Лиды за <code>{escape(day)}</code>\n",
-        f"{pe('users')} Новых людей: <b>{total_new}</b>",
-        f"{pe('mega')} Сообщений в ЛС: <b>{total_msg}</b>\n",
+        f"Люди, которые писали аккаунтам в личку · <code>{escape(r.day)}</code>\n",
+        f"{pe('users')} Написали первыми за день: <b>{new_day}</b>",
+        f"{pe('mega')} Писали в этот день (всего разных людей): <b>{active}</b>",
+        f"{pe('clock')} Ждут ответа сейчас: <b>{sum(a.dm_waiting for a in r.accounts)}</b>",
+        f"{pe('chart')} За 7 дней первыми: <b>{sum(a.dm_first_7d for a in r.accounts)}</b> · "
+        f"за 24ч: <b>{sum(a.dm_first_24h for a in r.accounts)}</b>\n",
     ]
-    if not rows:
-        lines.append("Пока пусто — сбор идёт в фоне.")
-    for r in rows:
+    if r.dm_pending_total:
         lines.append(
-            f"· <b>{escape(r.account_label or str(r.account_id))}</b> — "
-            f"+{r.new_leads} · {r.messages} сообщ."
+            f"<i>Идёт индексация старой переписки: осталось {r.dm_pending_total} диалогов — "
+            f"«всего» вырастет.</i>\n"
         )
-    dash_on = (await ctx.store.get_setting("marketer_enabled", "1")) == "1"
-    auto = (await ctx.store.get_setting("marketer_auto_fix", "1")) == "1"
+    for a in sorted(r.accounts, key=lambda x: (-x.dm_wrote, x.label))[:20]:
+        lines.append(
+            f"· <b>{escape(a.label)}</b> — новых {a.dm_first_day}, писали {a.dm_active_day}, "
+            f"всего писали {a.dm_wrote} (первыми {a.dm_first_total}), ждут {a.dm_waiting}"
+        )
     await safe_edit(
         query,
-        prompt_html("Лиды", "\n".join(lines)[:3500], "users"),
-        reports_kb(marketer_on=dash_on, auto_fix=auto, day_offset=off, days=days),
+        prompt_html("Люди в ЛС", "\n".join(lines)[:3500], "users"),
+        await _rep_kb(off),
     )
 
 

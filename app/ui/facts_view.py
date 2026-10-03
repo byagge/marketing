@@ -90,6 +90,23 @@ async def window_view(
         f"{base.strftime('%d.%m %H:%M')} – {end_local.strftime('%H:%M')} "
         f"({get_settings().timezone}) · отправок: {len(events)}"
     )
+    # серым — минуты, по которым данных ещё нет (сбор раз в час / сбор был позже)
+    scans = await store.list_scans()
+    collected_until = max((parse_utc(sc[2]) for sc in scans if parse_utc(sc[2])), default=None)
+    first_event = parse_utc(await store.first_send_at())
+    grey: set[int] = set()
+    for i in range(minutes):
+        t = (base + timedelta(minutes=i)).astimezone(timezone.utc)
+        if collected_until is None or t > collected_until:
+            grey.add(i)
+        elif first_event is not None and t < first_event:
+            grey.add(i)
+    footer = (
+        "Закрашено — отправка подтверждена историей чата; пусто — не отправлено; "
+        "серое — данные ещё не собраны"
+        if grey
+        else ""
+    )
     png = try_grid_png(
         title,
         subtitle,
@@ -97,7 +114,11 @@ async def window_view(
         row_labels,
         cells,
         row_head="Время",
+        footer=footer,
+        grey_rows=grey,
     )
+    if grey:
+        subtitle += f" · данные собраны до {fmt_local(collected_until, '%H:%M') if collected_until else '—'}"
 
     per_chat: dict[int, list[datetime]] = {}
     for _a, chat_pk, sent_at in events:

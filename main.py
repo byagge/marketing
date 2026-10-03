@@ -105,13 +105,16 @@ async def main() -> None:
             scan_restrictions=scan,
             bot=bot,
             admin_chat_id=admin_id,
+            quiet=True,
         )
 
     async def spam_tick():
-        from app.jobs.spam import run_spam_check
+        # постоянная проверка @SpamBot: по 6 аккаунтов за тик, у кого пора / подозрение
+        from app.jobs.spam import run_spam_due
 
         admin_id = next(iter(settings.admins), None)
-        await run_spam_check(store, bot=bot, admin_chat_id=admin_id)
+        summary = await run_spam_due(store, bot, admin_id)
+        log.info("%s", summary)
 
     async def advisor_tick():
         from app.jobs.advisor import run_advisor
@@ -170,14 +173,12 @@ async def main() -> None:
     )
     scheduler.add_job(
         spam_tick,
-        "cron",
-        id="spam_daily",
+        "interval",
+        id="spam_due",
         replace_existing=True,
-        hour=settings.spam_check_hour,
-        minute=23,
-        timezone=settings.timezone,
-        misfire_grace_time=3600,
+        minutes=30,
         coalesce=True,
+        max_instances=1,
     )
     scheduler.add_job(
         advisor_tick,
