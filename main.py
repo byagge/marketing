@@ -19,6 +19,12 @@ from app.bot.middlewares import AdminOnlyMiddleware
 from app.config import ensure_dirs, get_settings
 from app.context import ctx
 from app.jobs.health import weekly_cron_args
+from app.jobs.marketer import (
+    marketer_cron_args,
+    marketer_morning_cron_args,
+    run_marketer_morning,
+    run_marketer_tick,
+)
 from app.jobs.online import run_online_ping_tick
 from app.jobs.retry_setup import (
     nonpremium_reschedule_cron_args,
@@ -92,10 +98,13 @@ async def main() -> None:
                 r.until_at and r.until_at <= now_iso
                 for r in await store.list_restrictions(kinds=("mute", "nowrite"))
             )
+        admin_id = next(iter(settings.admins), None)
         spawn_facts(
             store,
             hours=settings.facts_hours,
             scan_restrictions=scan,
+            bot=bot,
+            admin_chat_id=admin_id,
         )
 
     async def spam_tick():
@@ -109,6 +118,24 @@ async def main() -> None:
 
         admin_id = next(iter(settings.admins), None)
         await run_advisor(store, bot, admin_id)
+
+    async def marketer_tick():
+        if not settings.marketer_enabled:
+            return
+        enabled = (await store.get_setting("marketer_enabled", "1")) == "1"
+        if not enabled:
+            return
+        summary = await run_marketer_tick(store, bot)
+        log.info("%s", summary)
+
+    async def marketer_morning():
+        if not settings.marketer_enabled:
+            return
+        enabled = (await store.get_setting("marketer_enabled", "1")) == "1"
+        if not enabled:
+            return
+        summary = await run_marketer_morning(store, bot)
+        log.info("%s", summary)
 
     async def online_tick():
         summary = await run_online_ping_tick(store)
@@ -179,13 +206,44 @@ async def main() -> None:
         replace_existing=True,
         run_date=run_at,
     )
+    # AI-маркетолог: тихий сбор 24/7 + утренний брифинг.
+    mk_args = marketer_cron_args()
+    scheduler.add_job(
+        marketer_tick,
+        "interval",
+        id="marketer_tick",
+        replace_existing=True,
+        minutes=mk_args["minutes"],
+        max_instances=1,
+        coalesce=True,
+        misfire_grace_time=120,
+    )
+    mk_startup = datetime.now(scheduler.timezone) + timedelta(minutes=2)
+    scheduler.add_job(
+        marketer_tick,
+        "date",
+        id="marketer_startup",
+        replace_existing=True,
+        run_date=mk_startup,
+    )
+    morning_args = marketer_morning_cron_args()
+    scheduler.add_job(
+        marketer_morning,
+        "cron",
+        id="marketer_morning",
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+        misfire_grace_time=300,
+        **morning_args,
+    )
     scheduler.start()
 
     online_cfg = await store.online_ping_settings()
     log.info(
         "Marketing bot starting (weekly=%s %s:00, setup_retry=daily %s:00, "
         "nonpremium_reschedule=daily %s:00, online_ping=%s every %sh±%ss, "
-        "retry_days=%s, max_attempts=%s)",
+        "marketer=every %smin + morning %02d:%02d, retry_days=%s, max_attempts=%s)",
         settings.weekly_health_dow,
         settings.weekly_health_hour,
         settings.setup_retry_hour,
@@ -193,6 +251,9 @@ async def main() -> None:
         "on" if online_cfg.enabled else "off",
         online_cfg.hours,
         online_cfg.jitter_sec,
+        settings.marketer_interval_min,
+        settings.marketer_morning_hour,
+        settings.marketer_morning_minute,
         settings.setup_retry_days,
         settings.setup_max_attempts,
     )

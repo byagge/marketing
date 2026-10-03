@@ -300,3 +300,84 @@ class OnlinePingSettings:
     hold_seconds: float = 4.0
     next_at: str = ""
     last_at: str = ""
+
+@dataclass
+class Incident:
+    """Operational problem the marketer surfaces for the admin."""
+
+    id: int
+    kind: str
+    severity: str  # critical | high | medium | low | info
+    title: str
+    detail: str = ""
+    status: str = "open"  # open | fixing | resolved | ignored
+    account_id: int | None = None
+    chat_pk: int | None = None
+    source: str = "marketer"
+    first_seen_at: str = ""
+    last_seen_at: str = ""
+    resolved_at: str = ""
+    meta_json: str = "{}"
+    account_label: str = ""
+    chat_title: str = ""
+
+    @property
+    def is_open(self) -> bool:
+        return self.status in {"open", "fixing"}
+
+
+@dataclass
+class HealthSnapshot:
+    id: int
+    account_id: int
+    chat_pk: int
+    checked_at: str
+    status: str
+    count: int = 0
+    expected: int = 0
+    error: str = ""
+    sent_est: float = 0.0
+    account_label: str = ""
+    chat_title: str = ""
+
+
+@dataclass
+class SendStatDay:
+    day: str
+    account_id: int
+    channel: str  # schedule | sender
+    messages: float
+    chat_pk: int | None = None
+    account_label: str = ""
+    chat_title: str = ""
+
+
+@dataclass
+class Lead:
+    id: int
+    account_id: int
+    user_id: int
+    username: str = ""
+    first_seen_at: str = ""
+    last_seen_at: str = ""
+    msg_count: int = 0
+    account_label: str = ""
+
+
+@dataclass
+class LeadStatDay:
+    day: str
+    account_id: int
+    new_leads: int = 0
+    messages: int = 0
+    account_label: str = ""
+
+
+@dataclass
+class DailyReport:
+    day: str
+    created_at: str
+    updated_at: str
+    payload_json: str = "{}"
+
+

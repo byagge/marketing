@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import logging
+
 from html import escape
 
 from aiogram import F, Router
@@ -7,6 +9,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, InlineKeyboardMarkup, Message
 
 from app.bot.keyboards import (
+    reports_kb,
     BTN_CANCEL,
     MenuCB,
     confirm_kb,
@@ -22,7 +25,9 @@ from app.jobs import runtime
 from app.jobs.health import run_health, run_health_all
 from app.jobs.leave import preview_leave, run_leave
 from app.jobs.setup import run_setup
+from app.reporting.dashboard import build_dashboard, format_dashboard_html
 from app.ui.screens import (
+    incidents_html,
     health_html,
     prompt_html,
     reports_html,
@@ -141,10 +146,174 @@ async def cb_health_go(query: CallbackQuery, callback_data: MenuCB) -> None:
 
 @router.callback_query(MenuCB.filter(F.a == "reports"))
 async def cb_reports(query: CallbackQuery) -> None:
-    jobs = await ctx.store.recent_jobs(15)
-    from app.bot.keyboards import main_menu
+    await query.answer()
+    await _show_report(query, day_offset=0)
 
-    await safe_edit(query, reports_html(jobs), main_menu())
+
+@router.callback_query(MenuCB.filter(F.a == "rep_day"))
+async def cb_rep_day(query: CallbackQuery, callback_data: MenuCB) -> None:
+    await query.answer()
+    await _show_report(query, day_offset=int(callback_data.p or 0))
+
+
+async def _show_report(query: CallbackQuery, *, day_offset: int = 0) -> None:
+    from app.config import get_settings
+    from app.reporting.dashboard import day_offsets
+    from app.ui.screens import prompt_html
+
+    settings = get_settings()
+    days = day_offsets(settings.timezone, 7)
+    day = days[min(day_offset, len(days) - 1)][1] if days else None
+    try:
+        dash = await build_dashboard(ctx.store, day=day)
+        text = format_dashboard_html(dash)
+        kb = reports_kb(
+            marketer_on=dash.marketer_enabled,
+            auto_fix=dash.auto_fix,
+            day_offset=day_offset,
+            days=days,
+        )
+        await safe_edit(query, text, kb)
+    except Exception as e:
+        import logging
+
+        logging.getLogger("marketing.reports").exception("reports failed")
+        await safe_edit(
+            query,
+            prompt_html(
+                "Отчётность",
+                f"Не удалось открыть отчёт: <code>{type(e).__name__}</code>. "
+                f"Попробуй ещё раз.",
+                "warn",
+            ),
+            reports_kb(days=days, day_offset=day_offset),
+        )
+
+
+@router.callback_query(MenuCB.filter(F.a == "rep_jobs"))
+async def cb_rep_jobs(query: CallbackQuery) -> None:
+    jobs = await ctx.store.recent_jobs(15)
+    dash_on = (await ctx.store.get_setting("marketer_enabled", "1")) == "1"
+    auto = (await ctx.store.get_setting("marketer_auto_fix", "1")) == "1"
+    from app.config import get_settings
+    from app.reporting.dashboard import day_offsets
+
+    days = day_offsets(get_settings().timezone, 7)
+    await safe_edit(
+        query,
+        reports_html(jobs),
+        reports_kb(marketer_on=dash_on, auto_fix=auto, days=days),
+    )
+
+
+@router.callback_query(MenuCB.filter(F.a == "rep_issues"))
+async def cb_rep_issues(query: CallbackQuery) -> None:
+    incidents = await ctx.store.list_incidents(statuses=["open", "fixing"], limit=40)
+    dash_on = (await ctx.store.get_setting("marketer_enabled", "1")) == "1"
+    auto = (await ctx.store.get_setting("marketer_auto_fix", "1")) == "1"
+    from app.config import get_settings
+    from app.reporting.dashboard import day_offsets
+
+    days = day_offsets(get_settings().timezone, 7)
+    await safe_edit(
+        query,
+        incidents_html(incidents),
+        reports_kb(marketer_on=dash_on, auto_fix=auto, days=days),
+    )
+
+
+@router.callback_query(MenuCB.filter(F.a == "rep_density"))
+async def cb_rep_density(query: CallbackQuery, callback_data: MenuCB) -> None:
+    from html import escape
+
+    from app.config import get_settings
+    from app.reporting.dashboard import day_offsets
+    from app.ui.emoji import pe
+    from app.ui.screens import prompt_html
+
+    settings = get_settings()
+    days = day_offsets(settings.timezone, 7)
+    off = int(callback_data.p or 0)
+    day = days[min(off, len(days) - 1)][1]
+    rows = await ctx.store.density_for_day(day)
+    lines = [f"Плотность за <code>{escape(day)}</code>\n"]
+    if not rows:
+        lines.append("Пока нет данных — подожди тихий сбор (каждые ~20 мин).")
+    for d in rows:
+        gap = float(d.get("avg_gap_min") or 0)
+        st = d.get("status") or ""
+        mark = {
+            "ok": "✓",
+            "sparse": "⚠ нужно больше акк.",
+            "dense": "🔥 слишком часто",
+            "empty": "✗ пусто",
+        }.get(st, st)
+        title = escape(str(d.get("chat_title") or d.get("chat_pk")))
+        lines.append(
+            f"{pe('pin')} <b>{title}</b>\n"
+            f"   {gap:.1f} мин между постами · {d.get('accounts_live', 0)} акк. · {mark}\n"
+            f"   <i>{escape((d.get('advice') or '')[:200])}</i>"
+        )
+    dash_on = (await ctx.store.get_setting("marketer_enabled", "1")) == "1"
+    auto = (await ctx.store.get_setting("marketer_auto_fix", "1")) == "1"
+    await safe_edit(
+        query,
+        prompt_html("Плотность / советы", "\n".join(lines)[:3500], "pin"),
+        reports_kb(marketer_on=dash_on, auto_fix=auto, day_offset=off, days=days),
+    )
+
+
+@router.callback_query(MenuCB.filter(F.a == "rep_leads"))
+async def cb_rep_leads(query: CallbackQuery, callback_data: MenuCB) -> None:
+    from html import escape
+
+    from app.config import get_settings
+    from app.reporting.dashboard import day_offsets
+    from app.ui.emoji import pe
+    from app.ui.screens import prompt_html
+
+    settings = get_settings()
+    days = day_offsets(settings.timezone, 7)
+    off = int(callback_data.p or 0)
+    day = days[min(off, len(days) - 1)][1]
+    rows = await ctx.store.lead_stats_for_day(day)
+    total_new = sum(r.new_leads for r in rows)
+    total_msg = sum(r.messages for r in rows)
+    lines = [
+        f"Лиды за <code>{escape(day)}</code>\n",
+        f"{pe('users')} Новых людей: <b>{total_new}</b>",
+        f"{pe('mega')} Сообщений в ЛС: <b>{total_msg}</b>\n",
+    ]
+    if not rows:
+        lines.append("Пока пусто — сбор идёт в фоне.")
+    for r in rows:
+        lines.append(
+            f"· <b>{escape(r.account_label or str(r.account_id))}</b> — "
+            f"+{r.new_leads} · {r.messages} сообщ."
+        )
+    dash_on = (await ctx.store.get_setting("marketer_enabled", "1")) == "1"
+    auto = (await ctx.store.get_setting("marketer_auto_fix", "1")) == "1"
+    await safe_edit(
+        query,
+        prompt_html("Лиды", "\n".join(lines)[:3500], "users"),
+        reports_kb(marketer_on=dash_on, auto_fix=auto, day_offset=off, days=days),
+    )
+
+
+@router.callback_query(MenuCB.filter(F.a == "mk_toggle"))
+async def cb_mk_toggle(query: CallbackQuery) -> None:
+    cur = (await ctx.store.get_setting("marketer_enabled", "1")) == "1"
+    await ctx.store.set_setting("marketer_enabled", "0" if cur else "1")
+    await query.answer("Мониторинг выкл" if cur else "Мониторинг 24/7 вкл")
+    await _show_report(query, day_offset=0)
+
+
+@router.callback_query(MenuCB.filter(F.a == "mk_autofix"))
+async def cb_mk_autofix(query: CallbackQuery) -> None:
+    cur = (await ctx.store.get_setting("marketer_auto_fix", "1")) == "1"
+    await ctx.store.set_setting("marketer_auto_fix", "0" if cur else "1")
+    await query.answer("Автофикс выкл" if cur else "Автофикс вкл")
+    await _show_report(query, day_offset=0)
 
 
 @router.callback_query(MenuCB.filter(F.a == "leave_go"))

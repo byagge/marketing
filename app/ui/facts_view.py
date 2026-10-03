@@ -22,7 +22,7 @@ from app.utils.facts import (
 )
 from app.utils.timefmt import fmt_local, parse_utc
 
-MAX_COLS = 20
+MAX_COLS = 40
 
 
 def is_priority(chat: Chat) -> bool:

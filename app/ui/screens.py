@@ -393,6 +393,26 @@ def reports_html(jobs) -> str:
     return "\n".join(lines)[:3900]
 
 
+def incidents_html(incidents) -> str:
+    if not incidents:
+        return (
+            f"{pe('check')} <b>Проблемы</b>\n\n"
+            f"Открытых нет — маркетолог всё под контролем."
+        )
+    lines = [f"{pe('warn')} <b>Открытые проблемы</b> ({len(incidents)})\n"]
+    for inc in incidents[:20]:
+        sev = {"critical": "🔴", "high": "🟠", "medium": "🟡", "low": "🔵"}.get(
+            inc.severity, "⚪"
+        )
+        who = escape(inc.account_label or "—")
+        chat = f" / {escape(inc.chat_title)}" if inc.chat_title else ""
+        lines.append(
+            f"{sev} <b>{escape(inc.title)}</b> — {who}{chat}\n"
+            f"   <code>{escape(inc.kind)}</code> · {escape((inc.detail or '')[:100])}"
+        )
+    return "\n".join(lines)[:3900]
+
+
 def leave_html() -> str:
     return (
         f"{pe('block')} <b>Выйти из чатов</b>\n\n"

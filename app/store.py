@@ -21,6 +21,12 @@ from app.models import (
     Restriction,
     SenderSettings,
     SetupState,
+    DailyReport,
+    HealthSnapshot,
+    Incident,
+    Lead,
+    LeadStatDay,
+    SendStatDay,
 )
 from app.utils.chat_ids import canon_chat_id
 
@@ -173,6 +179,83 @@ CREATE TABLE IF NOT EXISTS account_chat_posts (
     photo_path TEXT NOT NULL DEFAULT '',
     PRIMARY KEY (account_id, chat_key)
 );
+
+CREATE TABLE IF NOT EXISTS incidents (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    account_id INTEGER REFERENCES accounts(id) ON DELETE SET NULL,
+    chat_pk INTEGER REFERENCES chats(id) ON DELETE SET NULL,
+    kind TEXT NOT NULL,
+    severity TEXT NOT NULL DEFAULT 'medium',
+    title TEXT NOT NULL,
+    detail TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'open',
+    source TEXT NOT NULL DEFAULT 'marketer',
+    first_seen_at TEXT NOT NULL,
+    last_seen_at TEXT NOT NULL,
+    resolved_at TEXT NOT NULL DEFAULT '',
+    meta_json TEXT NOT NULL DEFAULT '{}'
+);
+
+CREATE TABLE IF NOT EXISTS health_snapshots (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    chat_pk INTEGER NOT NULL REFERENCES chats(id) ON DELETE CASCADE,
+    checked_at TEXT NOT NULL,
+    status TEXT NOT NULL,
+    count INTEGER NOT NULL DEFAULT 0,
+    expected INTEGER NOT NULL DEFAULT 0,
+    error TEXT NOT NULL DEFAULT '',
+    sent_est REAL NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS send_stats_daily (
+    day TEXT NOT NULL,
+    account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    channel TEXT NOT NULL,
+    chat_pk INTEGER,
+    messages REAL NOT NULL DEFAULT 0,
+    PRIMARY KEY (day, account_id, channel, chat_pk)
+);
+
+CREATE TABLE IF NOT EXISTS leads (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    user_id INTEGER NOT NULL,
+    username TEXT NOT NULL DEFAULT '',
+    first_seen_at TEXT NOT NULL,
+    last_seen_at TEXT NOT NULL,
+    msg_count INTEGER NOT NULL DEFAULT 0,
+    UNIQUE(account_id, user_id)
+);
+
+CREATE TABLE IF NOT EXISTS lead_stats_daily (
+    day TEXT NOT NULL,
+    account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    new_leads INTEGER NOT NULL DEFAULT 0,
+    messages INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (day, account_id)
+);
+
+CREATE TABLE IF NOT EXISTS density_daily (
+    day TEXT NOT NULL,
+    chat_pk INTEGER NOT NULL REFERENCES chats(id) ON DELETE CASCADE,
+    accounts_live INTEGER NOT NULL DEFAULT 0,
+    avg_gap_min REAL NOT NULL DEFAULT 0,
+    status TEXT NOT NULL DEFAULT 'empty',
+    advice TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (day, chat_pk)
+);
+
+CREATE TABLE IF NOT EXISTS daily_reports (
+    day TEXT PRIMARY KEY,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    payload_json TEXT NOT NULL DEFAULT '{}'
+);
+
+CREATE INDEX IF NOT EXISTS idx_incidents_status ON incidents(status, severity);
+CREATE INDEX IF NOT EXISTS idx_health_snap_acc ON health_snapshots(account_id, chat_pk, checked_at);
+CREATE INDEX IF NOT EXISTS idx_leads_acc ON leads(account_id, last_seen_at);
 """
 
 DEFAULT_SETTINGS = {
@@ -194,6 +277,10 @@ DEFAULT_SETTINGS = {
     "online_hold_seconds": "4",
     "online_ping_last_at": "",
     "online_ping_next_at": "",
+    "marketer_enabled": "1",
+    "marketer_last_run_at": "",
+    "marketer_last_digest_at": "",
+    "marketer_auto_fix": "1",
 }
 
 
@@ -430,6 +517,45 @@ def _setup_state(row: aiosqlite.Row) -> SetupState:
         fail_count=int(row["fail_count"] or 0),
         last_attempt_at=row["last_attempt_at"] or "",
         last_error=row["last_error"] or "",
+        account_label=(row["account_label"] if "account_label" in keys else "") or "",
+        chat_title=(row["chat_title"] if "chat_title" in keys else "") or "",
+    )
+
+
+
+def _incident(row: aiosqlite.Row) -> Incident:
+    keys = row.keys()
+    return Incident(
+        id=row["id"],
+        kind=row["kind"],
+        severity=row["severity"] or "medium",
+        title=row["title"] or "",
+        detail=row["detail"] or "",
+        status=row["status"] or "open",
+        account_id=row["account_id"],
+        chat_pk=row["chat_pk"],
+        source=row["source"] or "marketer",
+        first_seen_at=row["first_seen_at"] or "",
+        last_seen_at=row["last_seen_at"] or "",
+        resolved_at=row["resolved_at"] or "",
+        meta_json=row["meta_json"] or "{}",
+        account_label=(row["account_label"] if "account_label" in keys else "") or "",
+        chat_title=(row["chat_title"] if "chat_title" in keys else "") or "",
+    )
+
+
+def _health_snapshot(row: aiosqlite.Row) -> HealthSnapshot:
+    keys = row.keys()
+    return HealthSnapshot(
+        id=row["id"],
+        account_id=row["account_id"],
+        chat_pk=row["chat_pk"],
+        checked_at=row["checked_at"] or "",
+        status=row["status"] or "",
+        count=int(row["count"] or 0),
+        expected=int(row["expected"] or 0),
+        error=row["error"] or "",
+        sent_est=float(row["sent_est"] or 0),
         account_label=(row["account_label"] if "account_label" in keys else "") or "",
         chat_title=(row["chat_title"] if "chat_title" in keys else "") or "",
     )
@@ -1040,6 +1166,59 @@ class Store:
             await db.commit()
             return int(cur.rowcount or 0)
 
+
+    async def active_slots(self) -> list[MinuteSlot]:
+        """Только слоты, где schedule реально назначен (setup_states.status=ok)."""
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                "SELECT s.*, a.label AS account_label, c.title AS chat_title "
+                "FROM minute_slots s "
+                "JOIN accounts a ON a.id=s.account_id "
+                "JOIN chats c ON c.id=s.chat_pk "
+                "JOIN setup_states st ON st.account_id=s.account_id AND st.chat_pk=s.chat_pk "
+                "WHERE st.status='ok' "
+                "ORDER BY c.title COLLATE NOCASE, s.start_minute"
+            )
+            rows = await cur.fetchall()
+        return [
+            MinuteSlot(
+                id=r["id"],
+                chat_pk=r["chat_pk"],
+                account_id=r["account_id"],
+                start_minute=int(r["start_minute"]),
+                account_label=r["account_label"] or "",
+                chat_title=r["chat_title"] or "",
+            )
+            for r in rows
+        ]
+
+    async def active_slots_for_chat(self, chat_pk: int) -> list[MinuteSlot]:
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                "SELECT s.*, a.label AS account_label, c.title AS chat_title "
+                "FROM minute_slots s "
+                "JOIN accounts a ON a.id=s.account_id "
+                "JOIN chats c ON c.id=s.chat_pk "
+                "JOIN setup_states st ON st.account_id=s.account_id AND st.chat_pk=s.chat_pk "
+                "WHERE s.chat_pk=? AND st.status='ok' "
+                "ORDER BY s.start_minute",
+                (chat_pk,),
+            )
+            rows = await cur.fetchall()
+        return [
+            MinuteSlot(
+                id=r["id"],
+                chat_pk=r["chat_pk"],
+                account_id=r["account_id"],
+                start_minute=int(r["start_minute"]),
+                account_label=r["account_label"] or "",
+                chat_title=r["chat_title"] or "",
+            )
+            for r in rows
+        ]
+
     async def slots_for_chat(self, chat_pk: int) -> list[MinuteSlot]:
         async with self._connect() as db:
             db.row_factory = aiosqlite.Row
@@ -1541,3 +1720,522 @@ class Store:
             cur = await db.execute("DELETE FROM send_events WHERE sent_at<?", (cutoff,))
             await db.commit()
             return int(cur.rowcount or 0)
+
+    async def upsert_incident(
+        self,
+        *,
+        kind: str,
+        severity: str,
+        title: str,
+        detail: str = "",
+        account_id: int | None = None,
+        chat_pk: int | None = None,
+        source: str = "marketer",
+        meta_json: str = "{}",
+    ) -> Incident:
+        """Dedup open incidents by (kind, account_id, chat_pk); bump last_seen."""
+        now = _now()
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                "SELECT id FROM incidents WHERE kind=? AND status IN ('open','fixing') "
+                "AND IFNULL(account_id,-1)=IFNULL(?, -1) "
+                "AND IFNULL(chat_pk,-1)=IFNULL(?, -1) "
+                "ORDER BY id DESC LIMIT 1",
+                (kind, account_id, chat_pk),
+            )
+            row = await cur.fetchone()
+            if row:
+                await db.execute(
+                    "UPDATE incidents SET severity=?, title=?, detail=?, last_seen_at=?, "
+                    "meta_json=?, source=? WHERE id=?",
+                    (
+                        severity,
+                        title,
+                        (detail or "")[:2000],
+                        now,
+                        meta_json or "{}",
+                        source,
+                        row["id"],
+                    ),
+                )
+                await db.commit()
+                pk = int(row["id"])
+            else:
+                cur = await db.execute(
+                    "INSERT INTO incidents(account_id, chat_pk, kind, severity, title, "
+                    "detail, status, source, first_seen_at, last_seen_at, meta_json) "
+                    "VALUES(?,?,?,?,?,?, 'open', ?,?,?,?)",
+                    (
+                        account_id,
+                        chat_pk,
+                        kind,
+                        severity,
+                        title,
+                        (detail or "")[:2000],
+                        source,
+                        now,
+                        now,
+                        meta_json or "{}",
+                    ),
+                )
+                await db.commit()
+                pk = int(cur.lastrowid)
+        inc = await self.get_incident(pk)
+        assert inc is not None
+        return inc
+
+    async def get_incident(self, incident_id: int) -> Incident | None:
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                "SELECT i.*, COALESCE(a.label,'') AS account_label, "
+                "COALESCE(c.title,'') AS chat_title "
+                "FROM incidents i "
+                "LEFT JOIN accounts a ON a.id=i.account_id "
+                "LEFT JOIN chats c ON c.id=i.chat_pk "
+                "WHERE i.id=?",
+                (incident_id,),
+            )
+            row = await cur.fetchone()
+        return _incident(row) if row else None
+
+    async def list_incidents(
+        self,
+        *,
+        statuses: list[str] | None = None,
+        limit: int = 50,
+    ) -> list[Incident]:
+        statuses = statuses or ["open", "fixing"]
+        placeholders = ",".join("?" for _ in statuses)
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                f"SELECT i.*, COALESCE(a.label,'') AS account_label, "
+                f"COALESCE(c.title,'') AS chat_title "
+                f"FROM incidents i "
+                f"LEFT JOIN accounts a ON a.id=i.account_id "
+                f"LEFT JOIN chats c ON c.id=i.chat_pk "
+                f"WHERE i.status IN ({placeholders}) "
+                f"ORDER BY CASE i.severity "
+                f"  WHEN 'critical' THEN 0 WHEN 'high' THEN 1 "
+                f"  WHEN 'medium' THEN 2 WHEN 'low' THEN 3 ELSE 4 END, "
+                f"i.last_seen_at DESC LIMIT ?",
+                (*statuses, limit),
+            )
+            return [_incident(r) for r in await cur.fetchall()]
+
+    async def set_incident_status(self, incident_id: int, status: str) -> None:
+        resolved = _now() if status == "resolved" else ""
+        async with self._connect() as db:
+            await db.execute(
+                "UPDATE incidents SET status=?, resolved_at=? WHERE id=?",
+                (status, resolved, incident_id),
+            )
+            await db.commit()
+
+    async def resolve_incidents_matching(
+        self,
+        *,
+        kind: str,
+        account_id: int | None = None,
+        chat_pk: int | None = None,
+    ) -> int:
+        async with self._connect() as db:
+            cur = await db.execute(
+                "UPDATE incidents SET status='resolved', resolved_at=? "
+                "WHERE kind=? AND status IN ('open','fixing') "
+                "AND IFNULL(account_id,-1)=IFNULL(?, -1) "
+                "AND IFNULL(chat_pk,-1)=IFNULL(?, -1)",
+                (_now(), kind, account_id, chat_pk),
+            )
+            await db.commit()
+            return int(cur.rowcount or 0)
+
+    async def add_health_snapshot(
+        self,
+        *,
+        account_id: int,
+        chat_pk: int,
+        status: str,
+        count: int,
+        expected: int,
+        error: str = "",
+        sent_est: float = 0.0,
+        checked_at: str | None = None,
+    ) -> HealthSnapshot:
+        ts = checked_at or _now()
+        async with self._connect() as db:
+            cur = await db.execute(
+                "INSERT INTO health_snapshots(account_id, chat_pk, checked_at, status, "
+                "count, expected, error, sent_est) VALUES(?,?,?,?,?,?,?,?)",
+                (
+                    account_id,
+                    chat_pk,
+                    ts,
+                    status,
+                    int(count),
+                    int(expected),
+                    (error or "")[:500],
+                    float(sent_est),
+                ),
+            )
+            await db.commit()
+            pk = int(cur.lastrowid)
+        snap = await self.get_health_snapshot(pk)
+        assert snap is not None
+        return snap
+
+    async def get_health_snapshot(self, snap_id: int) -> HealthSnapshot | None:
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                "SELECT h.*, COALESCE(a.label,'') AS account_label, "
+                "COALESCE(c.title,'') AS chat_title "
+                "FROM health_snapshots h "
+                "LEFT JOIN accounts a ON a.id=h.account_id "
+                "LEFT JOIN chats c ON c.id=h.chat_pk "
+                "WHERE h.id=?",
+                (snap_id,),
+            )
+            row = await cur.fetchone()
+        return _health_snapshot(row) if row else None
+
+    async def latest_health_snapshot(
+        self, account_id: int, chat_pk: int
+    ) -> HealthSnapshot | None:
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                "SELECT h.*, COALESCE(a.label,'') AS account_label, "
+                "COALESCE(c.title,'') AS chat_title "
+                "FROM health_snapshots h "
+                "LEFT JOIN accounts a ON a.id=h.account_id "
+                "LEFT JOIN chats c ON c.id=h.chat_pk "
+                "WHERE h.account_id=? AND h.chat_pk=? "
+                "ORDER BY h.id DESC LIMIT 1",
+                (account_id, chat_pk),
+            )
+            row = await cur.fetchone()
+        return _health_snapshot(row) if row else None
+
+    async def add_send_stat(
+        self,
+        *,
+        day: str,
+        account_id: int,
+        channel: str,
+        messages: float,
+        chat_pk: int | None = None,
+    ) -> None:
+        # SQLite UNIQUE treats NULLs as distinct тАФ use 0 for account-level rollups.
+        pk = 0 if chat_pk is None else int(chat_pk)
+        async with self._connect() as db:
+            await db.execute(
+                "INSERT INTO send_stats_daily(day, account_id, channel, chat_pk, messages) "
+                "VALUES(?,?,?,?,?) "
+                "ON CONFLICT(day, account_id, channel, chat_pk) DO UPDATE SET "
+                "messages = send_stats_daily.messages + excluded.messages",
+                (day, account_id, channel, pk, float(messages)),
+            )
+            await db.commit()
+
+    async def set_send_stat(
+        self,
+        *,
+        day: str,
+        account_id: int,
+        channel: str,
+        messages: float,
+        chat_pk: int | None = None,
+    ) -> None:
+        """╨Р╨▒╤Б╨╛╨╗╤О╤В╨╜╨╛╨╡ ╨╖╨╜╨░╤З╨╡╨╜╨╕╨╡ ╨╖╨░ ╨┤╨╡╨╜╤М (╨┤╨╗╤П sender-╨╛╤Ж╨╡╨╜╨║╨╕, ╨▒╨╡╨╖ ╨╜╨░╨║╤А╤Г╤В╨║╨╕)."""
+        pk = 0 if chat_pk is None else int(chat_pk)
+        async with self._connect() as db:
+            await db.execute(
+                "INSERT INTO send_stats_daily(day, account_id, channel, chat_pk, messages) "
+                "VALUES(?,?,?,?,?) "
+                "ON CONFLICT(day, account_id, channel, chat_pk) DO UPDATE SET "
+                "messages = excluded.messages",
+                (day, account_id, channel, pk, float(messages)),
+            )
+            await db.commit()
+
+    async def send_stats_for_day(self, day: str) -> list[SendStatDay]:
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                "SELECT s.*, COALESCE(a.label,'') AS account_label, "
+                "COALESCE(c.title,'') AS chat_title "
+                "FROM send_stats_daily s "
+                "LEFT JOIN accounts a ON a.id=s.account_id "
+                "LEFT JOIN chats c ON c.id=s.chat_pk "
+                "WHERE s.day=? ORDER BY s.channel, a.label, c.title",
+                (day,),
+            )
+            rows = await cur.fetchall()
+        return [
+            SendStatDay(
+                day=r["day"],
+                account_id=r["account_id"],
+                channel=r["channel"],
+                messages=float(r["messages"] or 0),
+                chat_pk=r["chat_pk"],
+                account_label=r["account_label"] or "",
+                chat_title=r["chat_title"] or "",
+            )
+            for r in rows
+        ]
+
+    async def send_stats_since(self, day_from: str) -> list[SendStatDay]:
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                "SELECT s.*, COALESCE(a.label,'') AS account_label, "
+                "COALESCE(c.title,'') AS chat_title "
+                "FROM send_stats_daily s "
+                "LEFT JOIN accounts a ON a.id=s.account_id "
+                "LEFT JOIN chats c ON c.id=s.chat_pk "
+                "WHERE s.day >= ? ORDER BY s.day DESC, s.channel, a.label",
+                (day_from,),
+            )
+            rows = await cur.fetchall()
+        return [
+            SendStatDay(
+                day=r["day"],
+                account_id=r["account_id"],
+                channel=r["channel"],
+                messages=float(r["messages"] or 0),
+                chat_pk=r["chat_pk"],
+                account_label=r["account_label"] or "",
+                chat_title=r["chat_title"] or "",
+            )
+            for r in rows
+        ]
+
+    # тФАтФА leads тФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФАтФА
+
+    async def upsert_lead(
+        self,
+        *,
+        account_id: int,
+        user_id: int,
+        username: str = "",
+        seen_at: str | None = None,
+        add_messages: int = 1,
+    ) -> bool:
+        """Return True if this is a newly created lead row."""
+        ts = seen_at or _now()
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                "SELECT id FROM leads WHERE account_id=? AND user_id=?",
+                (account_id, user_id),
+            )
+            row = await cur.fetchone()
+            if row:
+                await db.execute(
+                    "UPDATE leads SET username=CASE WHEN ?<>'' THEN ? ELSE username END, "
+                    "last_seen_at=? WHERE id=?",
+                    (username, username, ts, row["id"]),
+                )
+                await db.commit()
+                return False
+            await db.execute(
+                "INSERT INTO leads(account_id, user_id, username, first_seen_at, "
+                "last_seen_at, msg_count) VALUES(?,?,?,?,?,?)",
+                (
+                    account_id,
+                    user_id,
+                    username or "",
+                    ts,
+                    ts,
+                    max(1, int(add_messages) if add_messages else 1),
+                ),
+            )
+            await db.commit()
+            return True
+
+    async def get_lead(self, account_id: int, user_id: int) -> Lead | None:
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                "SELECT l.*, COALESCE(a.label,'') AS account_label "
+                "FROM leads l LEFT JOIN accounts a ON a.id=l.account_id "
+                "WHERE l.account_id=? AND l.user_id=?",
+                (account_id, user_id),
+            )
+            row = await cur.fetchone()
+        if not row:
+            return None
+        return Lead(
+            id=row["id"],
+            account_id=row["account_id"],
+            user_id=row["user_id"],
+            username=row["username"] or "",
+            first_seen_at=row["first_seen_at"] or "",
+            last_seen_at=row["last_seen_at"] or "",
+            msg_count=int(row["msg_count"] or 0),
+            account_label=row["account_label"] or "",
+        )
+
+    async def count_leads(self, account_id: int | None = None) -> int:
+        async with self._connect() as db:
+            if account_id is None:
+                cur = await db.execute("SELECT COUNT(*) FROM leads")
+            else:
+                cur = await db.execute(
+                    "SELECT COUNT(*) FROM leads WHERE account_id=?", (account_id,)
+                )
+            row = await cur.fetchone()
+        return int(row[0] if row else 0)
+
+    async def set_lead_stat(
+        self,
+        *,
+        day: str,
+        account_id: int,
+        new_leads: int = 0,
+        messages: int = 0,
+    ) -> None:
+        """╨Р╨▒╤Б╨╛╨╗╤О╤В╨╜╤Л╨╡ ╨╖╨╜╨░╤З╨╡╨╜╨╕╤П ╨╖╨░ ╨┤╨╡╨╜╤М (╨┐╨╡╤А╨╡╨╖╨░╨┐╨╕╤Б╤М ╨┐╨╛╤Б╨╗╨╡ ╤Б╨║╨░╨╜╨░)."""
+        async with self._connect() as db:
+            await db.execute(
+                "INSERT INTO lead_stats_daily(day, account_id, new_leads, messages) "
+                "VALUES(?,?,?,?) "
+                "ON CONFLICT(day, account_id) DO UPDATE SET "
+                "new_leads=excluded.new_leads, messages=excluded.messages",
+                (day, account_id, int(new_leads), int(messages)),
+            )
+            await db.commit()
+
+    async def count_leads_since(self, account_id: int, since_iso_prefix: str) -> int:
+        """╨Ы╨╕╨┤╤Л ╤Б first_seen_at ╨╜╨░╤З╨╕╨╜╨░╤П ╤Б since (╨╜╨░╨┐╤А╨╕╨╝╨╡╤А '2026-09-30')."""
+        async with self._connect() as db:
+            cur = await db.execute(
+                "SELECT COUNT(*) FROM leads WHERE account_id=? AND first_seen_at >= ?",
+                (account_id, since_iso_prefix),
+            )
+            row = await cur.fetchone()
+        return int(row[0] if row else 0)
+
+    async def add_lead_stat(
+        self,
+        *,
+        day: str,
+        account_id: int,
+        new_leads: int = 0,
+        messages: int = 0,
+    ) -> None:
+        async with self._connect() as db:
+            await db.execute(
+                "INSERT INTO lead_stats_daily(day, account_id, new_leads, messages) "
+                "VALUES(?,?,?,?) "
+                "ON CONFLICT(day, account_id) DO UPDATE SET "
+                "new_leads = lead_stats_daily.new_leads + excluded.new_leads, "
+                "messages = lead_stats_daily.messages + excluded.messages",
+                (day, account_id, int(new_leads), int(messages)),
+            )
+            await db.commit()
+
+    async def lead_stats_for_day(self, day: str) -> list[LeadStatDay]:
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                "SELECT s.*, COALESCE(a.label,'') AS account_label "
+                "FROM lead_stats_daily s "
+                "LEFT JOIN accounts a ON a.id=s.account_id "
+                "WHERE s.day=? ORDER BY s.new_leads DESC, a.label",
+                (day,),
+            )
+            rows = await cur.fetchall()
+        return [
+            LeadStatDay(
+                day=r["day"],
+                account_id=r["account_id"],
+                new_leads=int(r["new_leads"] or 0),
+                messages=int(r["messages"] or 0),
+                account_label=r["account_label"] or "",
+            )
+            for r in rows
+        ]
+
+    async def save_density_day(
+        self,
+        day: str,
+        rows: list[dict],
+    ) -> None:
+        async with self._connect() as db:
+            for r in rows:
+                await db.execute(
+                    "INSERT INTO density_daily(day, chat_pk, accounts_live, avg_gap_min, "
+                    "status, advice) VALUES(?,?,?,?,?,?) "
+                    "ON CONFLICT(day, chat_pk) DO UPDATE SET "
+                    "accounts_live=excluded.accounts_live, avg_gap_min=excluded.avg_gap_min, "
+                    "status=excluded.status, advice=excluded.advice",
+                    (
+                        day,
+                        int(r["chat_pk"]),
+                        int(r["accounts_live"]),
+                        float(r["avg_gap_min"]),
+                        r["status"],
+                        (r.get("advice") or "")[:1000],
+                    ),
+                )
+            await db.commit()
+
+    async def density_for_day(self, day: str) -> list[dict]:
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                "SELECT d.*, COALESCE(c.title,'') AS chat_title "
+                "FROM density_daily d "
+                "LEFT JOIN chats c ON c.id=d.chat_pk "
+                "WHERE d.day=? ORDER BY d.avg_gap_min DESC",
+                (day,),
+            )
+            rows = await cur.fetchall()
+        return [dict(r) for r in rows]
+
+    async def save_daily_report(self, day: str, payload: dict | str) -> DailyReport:
+        import json
+
+        raw = payload if isinstance(payload, str) else json.dumps(payload, ensure_ascii=False)
+        now = _now()
+        async with self._connect() as db:
+            await db.execute(
+                "INSERT INTO daily_reports(day, created_at, updated_at, payload_json) "
+                "VALUES(?,?,?,?) "
+                "ON CONFLICT(day) DO UPDATE SET updated_at=excluded.updated_at, "
+                "payload_json=excluded.payload_json",
+                (day, now, now, raw),
+            )
+            await db.commit()
+        rep = await self.get_daily_report(day)
+        assert rep is not None
+        return rep
+
+    async def get_daily_report(self, day: str) -> DailyReport | None:
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                "SELECT * FROM daily_reports WHERE day=?", (day,)
+            )
+            row = await cur.fetchone()
+        if not row:
+            return None
+        return DailyReport(
+            day=row["day"],
+            created_at=row["created_at"] or "",
+            updated_at=row["updated_at"] or "",
+            payload_json=row["payload_json"] or "{}",
+        )
+
+    async def list_report_days(self, limit: int = 30) -> list[str]:
+        async with self._connect() as db:
+            cur = await db.execute(
+                "SELECT day FROM daily_reports ORDER BY day DESC LIMIT ?",
+                (limit,),
+            )
+            return [r[0] for r in await cur.fetchall()]
+

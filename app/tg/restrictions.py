@@ -227,9 +227,19 @@ async def scan_account(
     account: Account,
     chats: list[Chat],
     entities: dict[int, Any],
-) -> dict[str, int]:
-    """Проверить все чаты каталога: найти баны/муты и снять закончившиеся."""
-    stats = {"ban": 0, "mute": 0, "nowrite": 0, "resolved": 0, "ok": 0}
+) -> dict[str, Any]:
+    """Проверить все чаты каталога: найти баны/муты и снять закончившиеся.
+
+    Возвращает resolved_chats — pk schedule-чатов, которые снова можно настраивать.
+    """
+    stats: dict[str, Any] = {
+        "ban": 0,
+        "mute": 0,
+        "nowrite": 0,
+        "resolved": 0,
+        "ok": 0,
+        "resolved_chats": [],
+    }
     for chat in chats:
         entity = entities.get(chat.id)
         if entity is None:
@@ -249,4 +259,6 @@ async def scan_account(
                 stats["resolved"] += 1
                 # ограничение снято — пару можно снова настраивать
                 await store.reset_setup_state(account.id, chat.id)
+                if chat.is_schedule:
+                    stats["resolved_chats"].append(chat.id)
     return stats

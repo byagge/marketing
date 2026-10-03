@@ -89,8 +89,16 @@ async def collect_account(
     since: datetime,
     *,
     scan_restrictions: bool,
-) -> dict[str, int]:
-    stats = {"new": 0, "chats": 0, "not_member": 0, "ban": 0, "mute": 0, "resolved": 0}
+) -> dict[str, Any]:
+    stats: dict[str, Any] = {
+        "new": 0,
+        "chats": 0,
+        "not_member": 0,
+        "ban": 0,
+        "mute": 0,
+        "resolved": 0,
+        "resolved_chats": [],
+    }
     async with telethon_client(account.telethon_session) as client:
         entities = await dialog_entities(client, chats)
         for chat in chats:
@@ -106,7 +114,36 @@ async def collect_account(
             stats["ban"] += res["ban"]
             stats["mute"] += res["mute"] + res["nowrite"]
             stats["resolved"] += res["resolved"]
+            stats["resolved_chats"] = list(res.get("resolved_chats") or [])
     return stats
+
+
+async def _setup_after_mute_resolve(
+    store: Store,
+    account: Account,
+    chat_pks: list[int],
+    bot: Bot | None,
+    admin_chat_id: int | None,
+) -> None:
+    """Мут/nowrite сняли → сразу пересобираем schedule, не ждём weekly/retry."""
+    if not chat_pks:
+        return
+    from app.jobs.setup import run_setup_chats_only
+
+    try:
+        await run_setup_chats_only(
+            store,
+            account.id,
+            chat_pks,
+            bot,
+            admin_chat_id,
+            job_kind="setup_after_unmute",
+            skip_abandoned=False,
+        )
+    except Exception:  # noqa: BLE001
+        log.exception(
+            "setup_after_unmute failed for %s chats=%s", account.label, chat_pks
+        )
 
 
 async def run_facts_collection(
@@ -131,7 +168,7 @@ async def run_facts_collection(
     since = datetime.now(timezone.utc) - timedelta(hours=hours)
     batch_size, batch_pause = setup_parallel_defaults()
 
-    async def _one(acc: Account) -> dict[str, int]:
+    async def _one(acc: Account) -> dict[str, Any]:
         acc_chats = [c for c in chats if (acc.id, c.id) not in banned]
         return await collect_account(
             store, acc, acc_chats, since, scan_restrictions=scan_restrictions
@@ -146,7 +183,14 @@ async def run_facts_collection(
             log.warning("facts failed for %s: %s", acc.label, res)
             continue
         for k, v in res.items():
+            if k == "resolved_chats":
+                continue
             total[k] += v
+        resolved_chats = list(res.get("resolved_chats") or [])
+        if resolved_chats:
+            await _setup_after_mute_resolve(
+                store, acc, resolved_chats, bot, admin_chat_id
+            )
     await store.prune_send_events(90)
     took = time.monotonic() - started
     summary = (

@@ -61,6 +61,15 @@ class Settings(BaseSettings):
     online_hold_seconds: float = 4.0
     online_ping_enabled: bool = True
 
+    # AI-маркетолог: тихий сбор + утренний брифинг
+    marketer_interval_min: int = 20
+    marketer_enabled: bool = True
+    marketer_morning_hour: int = 7
+    marketer_morning_minute: int = 40
+    # Цель: пост в группу каждые 5–10 минут (наши аккаунты суммарно).
+    density_target_min: float = 5.0
+    density_target_max: float = 10.0
+
     # Факты отправки / баны и муты / SpamBot / советы по аккаунтам
     facts_minute: int = 7  # каждый час в :07 читаем историю чатов
     facts_hours: float = 3.0  # окно сбора (перекрывается — повторов нет)

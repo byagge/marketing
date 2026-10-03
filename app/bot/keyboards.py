@@ -337,6 +337,46 @@ def table_chats_kb(
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
+def reports_kb(
+    *,
+    marketer_on: bool = True,
+    auto_fix: bool = True,
+    day_offset: int = 0,
+    days: list[tuple[int, str]] | None = None,
+) -> InlineKeyboardMarkup:
+    toggle = (
+        ib("Мониторинг: выкл", "mk_toggle", icon="block")
+        if marketer_on
+        else ib("Мониторинг: вкл", "mk_toggle", icon="check")
+    )
+    fix = (
+        ib("Автофикс: выкл", "mk_autofix", icon="block")
+        if auto_fix
+        else ib("Автофикс: вкл", "mk_autofix", icon="hammer")
+    )
+    rows: list[list[InlineKeyboardButton]] = [
+        [ib("Сегодня", "reports", icon="chart"), ib("Вчера", "rep_day", p=1, icon="clock")],
+    ]
+    # Быстрый выбор последних дней
+    day_btns: list[InlineKeyboardButton] = []
+    for off, _iso in (days or [])[2:5]:
+        day_btns.append(ib(f"-{off}д", "rep_day", p=off, icon="bookmark"))
+    if day_btns:
+        rows.append(day_btns)
+    rows.extend(
+        [
+            [ib("Плотность / советы", "rep_density", p=day_offset, icon="pin")],
+            [ib("Лиды", "rep_leads", p=day_offset, icon="users")],
+            [ib("Проблемы", "rep_issues", icon="warn")],
+            [ib("Журнал задач", "rep_jobs", icon="folder")],
+            [toggle, fix],
+            [ib("Обновить", "rep_day", p=day_offset, icon="up")],
+            home_row(),
+        ]
+    )
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
 def table_kb(chat: Chat, slots: list[MinuteSlot], accounts: list[Account]) -> InlineKeyboardMarkup:
     rows: list[list[InlineKeyboardButton]] = []
     used = {s.account_id for s in slots}
