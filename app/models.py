@@ -229,6 +229,11 @@ class Restriction:
     def is_mute(self) -> bool:
         return self.kind in {"mute", "nowrite"}
 
+    @property
+    def is_spamblock(self) -> bool:
+        """Пара закрыта из-за ограничения самого аккаунта (@SpamBot), а не бана в чате."""
+        return self.kind == "spamblock"
+
 
 @dataclass
 class ChatPref:

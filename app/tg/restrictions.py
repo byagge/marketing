@@ -190,17 +190,30 @@ async def record_restriction(
     if probe is not None and probe.kind in {"ban", "mute", "nowrite"}:
         kind, until, detail = probe.kind, probe.until, probe.detail
     elif hint == "ban" and probe is not None and probe.kind == "ok":
-        # участник без ограничений, но писать нельзя → это лимит самого аккаунта
-        # (@SpamBot), а не бан в чате: в базу банов не пишем, но просим срочно
-        # перепроверить аккаунт в @SpamBot
+        # В чате аккаунт без ограничений, а писать нельзя → лимит самого аккаунта
+        # (@SpamBot): пара закрывается как spamblock, но не навсегда — до конца лимита
+        # (если SpamBot назвал дату) или на сутки, затем пробуем снова.
+        kind = "spamblock"
+        from app.tg.spambot import parse_spam_until
+
+        until = None
+        if account.spam_status == "limited":
+            until = parse_spam_until(account.spam_until)
+        if until is None or until <= datetime.now(timezone.utc):
+            until = datetime.now(timezone.utc) + timedelta(hours=24)
+        detail = "ограничение аккаунта (@SpamBot): в этот чат писать нельзя"
         await store.set_setting(
             f"spam_recheck:{account.id}", to_iso(datetime.now(timezone.utc))
         )
-        return None
     elif hint == "ban":
         kind = "ban"
     elif hint == "mute":
         kind = "mute"
+        if probe is not None and probe.kind == "ok":
+            # участник без ограничений, но писать нельзя (тема закрыта и т.п.):
+            # срок неизвестен — перепроверим через несколько часов, а не каждый скан
+            until = datetime.now(timezone.utc) + timedelta(hours=6)
+            detail = "писать нельзя, срок неизвестен (перепроверим)"
     if kind is None:
         return None
 
@@ -244,9 +257,21 @@ async def scan_account(
         "ok": 0,
         "resolved_chats": [],
     }
+    now_iso = to_iso(datetime.now(timezone.utc))
     for chat in chats:
         entity = entities.get(chat.id)
         if entity is None:
+            continue
+        existing = await store.get_restriction(account.id, chat.id)
+        if existing is not None and existing.is_spamblock:
+            # лимит аккаунта (SpamBot) участник-статусом не определить: ждём срок,
+            # дальше пара пробуется заново (при ошибке снова закроется)
+            if existing.until_at and existing.until_at <= now_iso:
+                await store.resolve_restriction(account.id, chat.id)
+                await store.reset_setup_state(account.id, chat.id)
+                stats["resolved"] += 1
+                if chat.is_schedule:
+                    stats["resolved_chats"].append(chat.id)
             continue
         try:
             probe = await probe_restriction(client, entity)
@@ -259,6 +284,13 @@ async def scan_account(
             stats[probe.kind] += 1
         elif probe.kind == "ok":
             stats["ok"] += 1
+            if (
+                existing is not None
+                and existing.is_mute
+                and existing.until_at > now_iso
+                and existing.reason.startswith("писать нельзя, срок неизвестен")
+            ):
+                continue  # писать нельзя по ошибке отправки, ждём назначенную перепроверку
             if await store.resolve_restriction(account.id, chat.id):
                 stats["resolved"] += 1
                 # ограничение снято — пару можно снова настраивать

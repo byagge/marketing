@@ -4,8 +4,6 @@ from __future__ import annotations
 
 from html import escape
 
-from app.config import get_settings
-from app.operator import llm
 from app.operator.engine import CycleResult, recent_actions
 from app.reporting.factual import FactReport, build_fact_report
 from app.store import Store
@@ -21,29 +19,12 @@ def chat_line(c) -> str:
     return f"{escape(c.title)}: <b>{c.sends_day}</b> за сутки, {gap}{mx}{plan}{bans}"
 
 
-def facts_text(report: FactReport, result: CycleResult | None) -> str:
-    lines = [f"Дата {report.day}. Отправок за сутки {report.total_day} (вчера {report.total_prev_day})."]
-    if report.data_note:
-        lines.append(f"Ограничения данных: {report.data_note}.")
-    for c in report.chats[:8]:
-        gap = "нет отправок" if c.avg_gap is None else f"средняя пауза {c.avg_gap:.0f} мин"
-        lines.append(
-            f"{c.title}{' (приоритет)' if c.priority else ''}: {c.sends_day} за сутки, {gap}, "
-            f"макс. пауза {c.max_gap}, в плане {c.working_planned} акк., писали {c.senders_day}, бан {c.banned}."
-        )
-    if result is not None:
-        lines.append("Причины по парам: " + ", ".join(f"{k}={v}" for k, v in sorted(result.by_cause.items())))
-        for e in result.escalations[:6]:
-            lines.append(f"Нужен человек: {e.title} → {e.todo}")
-    return "\n".join(lines)
-
-
 async def build_brief(
     store: Store, result: CycleResult, *, morning: bool = False, only_new: list | None = None
 ) -> str:
     report = await build_fact_report(store)
     tz_day = report.day
-    head = "Утренний отчёт" if morning else "Оператор"
+    head = "Маркетолог · утренний отчёт" if morning else "Маркетолог"
     lines = [f"{pe('robot')} <b>{head}</b> · <code>{escape(tz_day)}</code>"]
 
     q = f"{report.accounts_fresh}/{report.accounts_total} акк. с свежими данными"
@@ -85,8 +66,4 @@ async def build_brief(
     elif not esc and not only_new:
         lines.append(f"\n{pe('check')} От вас ничего не требуется.")
 
-    if get_settings().anthropic_api_key.strip():
-        summary = await llm.summarize(facts_text(report, result))
-        if summary:
-            lines.append(f"\n{pe('mega')} {escape(summary)}")
     return "\n".join(lines)[:3900]

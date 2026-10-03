@@ -33,14 +33,14 @@ def _kb(rows: list[list]) -> InlineKeyboardMarkup:
 
 async def restr_home_html() -> str:
     bans = await ctx.store.list_restrictions(kinds=("ban",))
-    mutes = await ctx.store.list_restrictions(kinds=("mute", "nowrite"))
+    mutes = await ctx.store.list_restrictions(kinds=("mute", "nowrite", "spamblock"))
     accounts = [a for a in await ctx.store.list_accounts() if a.telethon_session]
     limited = sum(1 for a in accounts if a.is_spam_limited)
     unchecked = sum(1 for a in accounts if not a.spam_status)
     return (
         f"{pe('shield')} <b>Баны, муты, SpamBot</b>\n\n"
         f"{pe('block')} Баны: <b>{len(bans)}</b> — в эти чаты больше не вступаем и не пишем\n"
-        f"{pe('clock')} Муты / запрет писать: <b>{len(mutes)}</b> — "
+        f"{pe('clock')} Муты / SpamBlock / запрет писать: <b>{len(mutes)}</b> — "
         f"срок и причина сохраняются, после окончания пара снова включается\n"
         f"{pe('warn')} С ограничением @SpamBot: <b>{limited}</b> "
         f"(не проверено: {unchecked})\n\n"
@@ -108,7 +108,7 @@ async def cb_bans(query: CallbackQuery, callback_data: MenuCB) -> None:
 
 @router.callback_query(MenuCB.filter(F.a == "restr_mutes"))
 async def cb_mutes(query: CallbackQuery, callback_data: MenuCB) -> None:
-    mutes = await ctx.store.list_restrictions(kinds=("mute", "nowrite"))
+    mutes = await ctx.store.list_restrictions(kinds=("mute", "nowrite", "spamblock"))
     # скоро заканчивающиеся — выше
     mutes.sort(key=lambda r: (r.until_at or "9999", r.account_label.casefold()))
     chunk, page, total = _page(mutes, callback_data.p, MUTES_PER_PAGE)
@@ -116,7 +116,9 @@ async def cb_mutes(query: CallbackQuery, callback_data: MenuCB) -> None:
     if not mutes:
         lines.append("<i>Мутов нет.</i>")
     for r in chunk:
-        kind = "мут" if r.kind == "mute" else "чат закрыт для записи"
+        kind = {"mute": "мут", "spamblock": "SpamBlock аккаунта"}.get(
+            r.kind, "чат закрыт для записи"
+        )
         reason = escape((r.reason or "причина не найдена")[:220])
         link = f' <a href="{escape(r.reason_link)}">сообщение</a>' if r.reason_link else ""
         lines.append(

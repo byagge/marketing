@@ -179,6 +179,7 @@ _KIND_LABEL = {
     "ban": "БАН — записан в базу банов, больше не пробую",
     "mute": "мут — записан в базу мутов",
     "nowrite": "запрет писать — записан в базу мутов",
+    "spamblock": "SpamBlock аккаунта — в этот чат писать нельзя, попробую позже",
 }
 
 
@@ -217,7 +218,7 @@ async def _fail_unavailable(
     if kind:
         restr = await store.get_restriction(account.id, chat.id)
         extra = ""
-        if restr and restr.is_mute:
+        if restr and (restr.is_mute or restr.is_spamblock):
             extra = f" до {fmt_until(restr.until_at)}"
             if restr.reason:
                 extra += f" | причина: {restr.reason[:200]}"
@@ -253,7 +254,9 @@ async def pair_blocked(store: Store, account: Account, chat: Chat) -> str | None
         return "disabled"
     restr = await store.get_restriction(account.id, chat.id)
     if restr is not None:
-        return "banned" if restr.is_ban else "muted"
+        if restr.is_ban:
+            return "banned"
+        return "spamblock" if restr.is_spamblock else "muted"
     return None
 
 

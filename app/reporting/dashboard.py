@@ -110,7 +110,7 @@ def format_dashboard_html(dash: Dashboard) -> str:
 
     status = "вкл" if dash.marketer_enabled else "выкл"
     last = fmt_local(dash.marketer_last_run) if dash.marketer_last_run else "—"
-    lines.append(f"\n{pe('robot')} Оператор: <b>{status}</b> · последний цикл {last}")
+    lines.append(f"\n{pe('robot')} Маркетолог: <b>{status}</b> · последний цикл {last}")
     return _safe_html_trim("\n".join(lines), 3800)
 
 

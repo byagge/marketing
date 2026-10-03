@@ -159,14 +159,14 @@ async def test_restriction_hint_without_probe_and_account_level_limit(store: Sto
     # бан по тексту ошибки, проверить нечем → в базу банов
     assert await record_restriction(store, None, accs[0], chat, None, hint="ban", error="x") == "ban"
     await store.resolve_restriction(accs[0].id, chat.id)
-    # участник без ограничений + «banned from sending» = лимит аккаунта, не бан чата
-    assert (
-        await record_restriction(
-            store, None, accs[1], chat, None, hint="ban", probe=Probe("ok")
-        )
-        is None
+    # участник без ограничений + «banned from sending» = лимит аккаунта (SpamBlock),
+    # не бан чата: пара закрывается до конца лимита / на сутки
+    kind = await record_restriction(
+        store, None, accs[1], chat, None, hint="ban", probe=Probe("ok")
     )
-    assert await store.get_restriction(accs[1].id, chat.id) is None
+    r = await store.get_restriction(accs[1].id, chat.id)
+    assert kind == "spamblock" and r and r.is_spamblock and r.until_at
+    assert (accs[1].id, chat.id) not in await store.banned_pairs()
     # мут с известным сроком
     until = datetime.now(timezone.utc) + timedelta(days=1)
     kind = await record_restriction(

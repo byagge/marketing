@@ -14,6 +14,7 @@ WARMING = "warming"  # настроено недавно, рано судить
 DISABLED = "disabled"
 BANNED = "banned"
 MUTED = "muted"
+SPAMBLOCKED = "spamblocked"  # пара закрыта лимитом аккаунта (@SpamBot)
 NO_DATA = "no_data"
 NOT_MEMBER = "not_member"
 NOT_MEMBER_NO_LINK = "not_member_no_link"
@@ -27,7 +28,7 @@ SENDER = "sender"  # sender-чат: по плану не оцениваем
 JOIN = "join"
 SETUP = "setup"
 RESETUP = "resetup"
-COLLECT = "collect"
+COLLECT = "collect"  # перепроверить ограничения/данные аккаунта (срок мута вышел и т.п.)
 
 STALE_SCAN_MIN = 150  # данные старше — считаем «нет данных», а не «не отправляет»
 
@@ -41,8 +42,10 @@ class PairFacts:
     chat_kind: str = "schedule"
     interval: int = 60
     pref_enabled: bool = True
-    restriction: str | None = None  # ban | mute | nowrite
+    restriction: str | None = None  # ban | mute | nowrite | spamblock
     restriction_until: str = ""
+    restriction_expired: bool = False  # срок вышел — пора проверить и продолжать
+    is_private: bool = False  # закрытый чат (без публичного @username)
     has_slot: bool = False
     setup_status: str | None = None  # ok | pending | abandoned
     setup_error: str = ""
@@ -67,7 +70,7 @@ class Diagnosis:
 
     @property
     def is_problem(self) -> bool:
-        return self.cause not in {WORKING, WARMING, DISABLED, SENDER, NO_DATA}
+        return self.cause not in {WORKING, WARMING, DISABLED, SENDER, NO_DATA, BANNED, MUTED, SPAMBLOCKED}
 
 
 def warmup_minutes(interval: int) -> float:
@@ -93,12 +96,21 @@ def diagnose_pair(f: PairFacts) -> Diagnosis:
         return Diagnosis(
             BANNED,
             "high",
-            text="аккаунт забанен в чате",
+            text="аккаунт забанен в чате — больше не пытаемся (вступать, писать, искать)",
             todo="снять бан у админов чата или убрать аккаунт из чата",
         )
-    if f.restriction in {"mute", "nowrite"}:
+    if f.restriction in {"mute", "nowrite", "spamblock"}:
+        cause = SPAMBLOCKED if f.restriction == "spamblock" else MUTED
         until = f" до {f.restriction_until}" if f.restriction_until else ""
-        return Diagnosis(MUTED, "medium", text=f"мут / нельзя писать{until}")
+        what = "лимит аккаунта (SpamBlock): в этот чат писать нельзя" if cause == SPAMBLOCKED else "мут / нельзя писать"
+        if f.restriction_expired:
+            return Diagnosis(
+                cause,
+                "low",
+                action=COLLECT,
+                text=f"{what} — срок вышел, перепроверяю и продолжаю",
+            )
+        return Diagnosis(cause, "medium", text=f"{what}{until}")
 
     stale = f.scan_age_min is None or f.scan_age_min > STALE_SCAN_MIN or f.scan_status == "error"
     if stale:
@@ -126,14 +138,6 @@ def diagnose_pair(f: PairFacts) -> Diagnosis:
         )
 
     # аккаунт в чате
-    if f.account_spam == "limited" and f.sends_3h == 0:
-        return Diagnosis(
-            ACCOUNT_SPAM,
-            "high",
-            human=True,
-            text="@SpamBot: у аккаунта ограничение — писать в группы нельзя",
-            todo="подождать окончания ограничения или заменить аккаунт",
-        )
     if not f.has_slot or f.setup_status != "ok":
         err = f" ({f.setup_error[:80]})" if f.setup_error else ""
         return Diagnosis(

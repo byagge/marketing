@@ -47,6 +47,9 @@ async def check_account_spam(store: Store, account: Account) -> str:
         spam_until=res.until,
         spam_detail=res.detail,
     )
+    if res.status == "clean":
+        # лимит снят → закрытые из-за него чаты снова доступны (оператор их настроит)
+        await store.resolve_restrictions_kind(account.id, "spamblock")
     return res.status
 
 

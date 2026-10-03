@@ -72,9 +72,6 @@ class Settings(BaseSettings):
 
     # ИИ-оператор: цикл анализа по фактам (без Telegram-запросов, кроме починки)
     operator_interval_min: int = 30
-    # Необязательно: краткий вывод от Claude по уже посчитанным фактам (без ключа — выключено)
-    anthropic_api_key: str = ""
-    operator_llm_model: str = "claude-sonnet-5-5"
     # SpamBot: проверять каждые N часов (и сразу при подозрении на лимит)
     spam_recheck_hours: float = 3.0
 

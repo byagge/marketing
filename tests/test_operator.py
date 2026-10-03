@@ -57,10 +57,22 @@ def test_diagnose_decision_tree():
     assert diagnose_pair(pf(setup_age_min=30)).cause == WARMING
     d = diagnose_pair(pf())
     assert d.cause == SILENT and d.action == RESETUP
-    d = diagnose_pair(pf(account_spam="limited"))
-    assert d.cause == ACCOUNT_SPAM and d.human
-    # аккаунт с лимитом, но реально пишет → не проблема
+    # аккаунт с лимитом SpamBot: не отказываемся, а пробуем (настроить/пересоздать)
+    d = diagnose_pair(pf(account_spam="limited", has_slot=False, setup_status=None))
+    assert d.cause == NOT_SCHEDULED and d.action == SETUP
     assert diagnose_pair(pf(account_spam="limited", sends_3h=1)).cause == WORKING
+    # закрыто лимитом — ждём; срок вышел → перепроверяем и продолжаем
+    d = diagnose_pair(pf(restriction="spamblock", restriction_until="2026-10-05 10:00"))
+    assert d.cause == "spamblocked" and d.action is None
+    d = diagnose_pair(pf(restriction="spamblock", restriction_expired=True))
+    assert d.action == "collect"
+    d = diagnose_pair(pf(restriction="mute", restriction_until="2026-10-05 10:00"))
+    assert d.cause == MUTED and d.action is None  # до срока ничего не делаем
+    d = diagnose_pair(pf(restriction="mute", restriction_expired=True))
+    assert d.cause == MUTED and d.action == "collect"
+    # бан: никаких действий вообще, даже если не в чате
+    d = diagnose_pair(pf(restriction="ban", scan_status="not_member"))
+    assert d.cause == BANNED and d.action is None
     # выключено вручную и sender-чаты не оцениваем
     assert diagnose_pair(pf(pref_enabled=False)).cause == "disabled"
     assert diagnose_pair(pf(chat_kind="sender")).cause == "sender"
@@ -271,3 +283,166 @@ async def test_spam_due_picks_stale_and_flagged(store: Store, monkeypatch):
     assert checked == ["acc1", "acc2"]  # подозрение первым, затем непроверенный; acc0 свежий — пропущен
     assert sent and "acc1" in sent[0] and "ограничение" in sent[0]
     assert "проверено 2" in out
+
+
+def test_parse_spam_until():
+    from app.tg.spambot import parse_spam_until
+
+    d = parse_spam_until("Your account is now limited until 11 Oct 2026, 10:32 UTC.")
+    assert d == datetime(2026, 10, 11, 10, 32, tzinfo=timezone.utc)
+    d = parse_spam_until("ограничения будут сняты до 5 ноя 2026")
+    assert d and d.month == 11 and d.day == 5
+    assert parse_spam_until("нет даты") is None
+
+
+def test_needs_count_only_accounts_that_can_write():
+    from app.operator.diagnose import Diagnosis
+    from app.operator.needs import accounts_to_buy, compute_needs
+
+    diag = []
+    for i in range(9):  # 9 из 12 реально могут писать в Get-CHAT
+        f = pf(account_id=i, account_label=f"a{i}", sends_3h=1)
+        diag.append((f, diagnose_pair(f)))
+    for i, kw in enumerate(({"restriction": "ban"}, {"restriction": "spamblock"}, {"pref_enabled": False}), start=20):
+        f = pf(account_id=i, account_label=f"b{i}", **kw)
+        diag.append((f, diagnose_pair(f)))  # бан / SpamBlock / выкл — не считаются
+    f = pf(account_id=30, account_label="c", restriction="mute", restriction_expired=True)
+    diag.append((f, diagnose_pair(f)))  # мут закончился — считается
+    needs = compute_needs(diag, ["get-chat"])
+    n = needs[0]
+    assert n.needed == 12 and n.eligible == 10 and n.deficit == 2 and n.priority
+    assert accounts_to_buy(needs) == 2
+
+
+async def test_cycle_asks_for_new_accounts_and_probes_private_first(store: Store, monkeypatch):
+    now = datetime.now(timezone.utc)
+    iso = now.isoformat(timespec="seconds")
+    pub = await store.add_chat("Public", "-1001000000010", kind="schedule", username="pubchat")
+    priv = await store.add_chat("Private", "-1001000000011", kind="schedule")
+    a = await store.add_account("lim")
+    await store.update_account(a.id, telethon_session="/x/s.session", spam_status="limited")
+    await store.set_setting(f"facts_status:{a.id}", f"ok|{iso}|")
+    for c in (pub, priv):
+        await store.mark_scan(a.id, c.id, "ok")
+    seen: list[list[int]] = []
+
+    async def fake_setup(st, acc_id, pks):
+        seen.append(list(pks))
+        return True, "ok"
+
+    monkeypatch.setitem(engine.EXECUTORS, SETUP, fake_setup)
+    res = await engine.run_cycle(store, None, None, act=True)
+    assert seen and seen[0][0] == priv.id  # закрытый чат пробуем первым
+    need = [e for e in res.escalations if e.key == "need_accounts"]
+    assert need and "новых аккаунтов" in need[0].title and "Public" in need[0].title
+    assert need[0].severity in {"medium", "high"}
+
+
+async def test_spamblock_resolves_when_spambot_clean(store: Store):
+    from app.jobs import spam
+
+    accs, chat, _ = await _seed(store)
+    await store.upsert_restriction(
+        accs[0].id, chat.id, "spamblock", until_at=(datetime.now(timezone.utc) + timedelta(days=3)).isoformat()
+    )
+    await store.record_setup_fail(accs[0].id, chat.id, "x", max_attempts=1)  # abandoned
+
+    async def fake(st, acc):
+        return None
+
+    # имитация успешной проверки: SpamBot «чист»
+    from app.tg import spambot
+
+    async def fake_check(client, **kw):
+        return spambot.SpamResult("clean")
+
+    class Ctx:
+        async def __aenter__(self):
+            return object()
+
+        async def __aexit__(self, *a):
+            return False
+
+    import app.jobs.spam as sp
+
+    orig_c, orig_t = sp.check_spambot, sp.telethon_client
+    sp.check_spambot, sp.telethon_client = fake_check, lambda path: Ctx()
+    try:
+        status = await spam.check_account_spam(store, accs[0])
+    finally:
+        sp.check_spambot, sp.telethon_client = orig_c, orig_t
+    assert status == "clean"
+    assert await store.get_restriction(accs[0].id, chat.id) is None
+    st = await store.get_setup_state(accs[0].id, chat.id)
+    assert st.status == "pending" and st.fail_count == 0  # пару снова можно настраивать
+
+
+async def test_scan_keeps_spamblock_until_expiry_and_resolves_after(store: Store):
+    from app.tg import restrictions as R
+
+    accs, chat, _ = await _seed(store)
+    past = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat(timespec="seconds")
+    future = (datetime.now(timezone.utc) + timedelta(hours=5)).isoformat(timespec="seconds")
+    await store.upsert_restriction(accs[0].id, chat.id, "spamblock", until_at=future)
+
+    async def boom(*a, **k):
+        raise AssertionError("участник-статус не должен снимать spamblock")
+
+    orig = R.probe_restriction
+    R.probe_restriction = boom
+    try:
+        res = await R.scan_account(store, object(), accs[0], [chat], {chat.id: object()})
+        assert (await store.get_restriction(accs[0].id, chat.id)) is not None and res["resolved"] == 0
+        await store.upsert_restriction(accs[0].id, chat.id, "spamblock", until_at=past)
+        res = await R.scan_account(store, object(), accs[0], [chat], {chat.id: object()})
+    finally:
+        R.probe_restriction = orig
+    assert res["resolved"] == 1 and res["resolved_chats"] == [chat.id]
+    assert await store.get_restriction(accs[0].id, chat.id) is None
+
+
+async def test_mute_expired_triggers_recheck_action(store: Store, monkeypatch):
+    accs, chat, _ = await _seed(store)
+    now = datetime.now(timezone.utc)
+    await store.upsert_restriction(
+        accs[0].id, chat.id, "mute", until_at=(now - timedelta(minutes=3)).isoformat(timespec="seconds")
+    )
+    await store.upsert_restriction(accs[1].id, chat.id, "ban")
+    calls: list[tuple[str, int]] = []
+
+    async def fake(name):
+        async def run(st, acc_id, pks):
+            calls.append((name, acc_id))
+            if chat.id in pks:
+                touched.append((name, acc_id))
+            return True, "ok"
+        return run
+
+    touched: list[tuple[str, int]] = []
+    for n in (JOIN, SETUP, RESETUP, "collect"):
+        monkeypatch.setitem(engine.EXECUTORS, n, await fake(n))
+    await engine.run_cycle(store, None, None, act=True)
+    assert ("collect", accs[0].id) in calls           # мут закончился → перепроверить и продолжить
+    assert all(acc != accs[1].id for _n, acc in touched)  # бан: с этой парой ничего не делаем
+
+
+async def test_limited_account_silent_pair_becomes_spamblock_not_escalation(store: Store, monkeypatch):
+    accs, chat, _ = await _seed(store)
+    now = datetime.now(timezone.utc)
+    iso = now.isoformat(timespec="seconds")
+    a = accs[0]
+    await store.update_account(a.id, spam_status="limited")
+    await store.set_setting(f"facts_status:{a.id}", f"ok|{iso}|")
+    await store.mark_scan(a.id, chat.id, "ok")
+    await store.set_slot(chat.id, a.id, 5)
+    await store.record_setup_ok(a.id, chat.id)
+    import aiosqlite
+
+    async with aiosqlite.connect(store.path) as db:
+        await db.execute("UPDATE setup_states SET last_attempt_at=?", ((now - timedelta(hours=9)).isoformat(),))
+        await db.commit()
+    await store.set_setting(f"op:{RESETUP}:{a.id}:{chat.id}", f"{iso}|{now.date().isoformat()}|2")
+    res = await engine.run_cycle(store, None, None, act=False)
+    r = await store.get_restriction(a.id, chat.id)
+    assert r is not None and r.is_spamblock and r.until_at
+    assert not any("даже после пересоздания" in e.title for e in res.escalations)

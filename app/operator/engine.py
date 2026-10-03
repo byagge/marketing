@@ -23,6 +23,7 @@ from app.config import get_settings
 from app.jobs import runtime
 from app.operator.diagnose import (
     ACCOUNT_SPAM,
+    SPAMBLOCKED,
     COLLECT,
     JOIN,
     NOT_MEMBER,
@@ -36,6 +37,7 @@ from app.operator.diagnose import (
     PairFacts,
     diagnose_pair,
 )
+from app.operator.needs import ChatNeed, accounts_to_buy, compute_needs
 from app.store import Store
 from app.utils.chat_ids import canon_chat_id
 from app.utils.timefmt import parse_utc, to_iso
@@ -50,6 +52,7 @@ POLICY: dict[str, tuple[float, int]] = {
 }
 MAX_ACCOUNTS_PER_CYCLE = 8
 MAX_PAIRS_PER_ACCOUNT = 6
+SPAMBLOCK_PROBES = 3  # проб новых чатов за цикл у аккаунта с лимитом SpamBot
 RECENT_KEY = "op:recent"
 SESSION_ERR_MARKERS = ("не авториз", "unauthorized", "authkey", "session", "revoked", "deactivated")
 
@@ -80,6 +83,7 @@ class CycleResult:
     escalations: list[Escalation] = field(default_factory=list)
     diagnoses: list[tuple[PairFacts, Diagnosis]] = field(default_factory=list)
     skipped_reason: str = ""
+    needs: list[ChatNeed] = field(default_factory=list)
 
     @property
     def working(self) -> int:
@@ -124,6 +128,7 @@ async def gather_pairs(store: Store, now: datetime | None = None) -> list[PairFa
             session_err[acc.id] = err
 
     join_ok = {c.id: _has_join_method(c) for c in chats}
+    now_iso = to_iso(now)
     out: list[PairFacts] = []
     for acc in accounts:
         for chat in chats:
@@ -150,6 +155,8 @@ async def gather_pairs(store: Store, now: datetime | None = None) -> list[PairFa
                     pref_enabled=(acc.id, canon_chat_id(chat.chat_id)) not in disabled,
                     restriction=r.kind if r else None,
                     restriction_until=(r.until_at[:16].replace("T", " ") if r and r.until_at else ""),
+                    restriction_expired=bool(r and r.until_at and r.until_at <= now_iso),
+                    is_private=not (chat.username or "").strip(),
                     has_slot=key in slots,
                     setup_status=st.status if st else None,
                     setup_error=st.last_error if st else "",
@@ -326,6 +333,60 @@ def _escalations(
     return out
 
 
+def parse_spam_until_safe(f: PairFacts) -> datetime:
+    """Когда пробовать снова: не раньше чем через сутки."""
+    return datetime.now(timezone.utc) + timedelta(hours=24)
+
+
+def _spam_escalations(diagnoses: list[tuple[PairFacts, Diagnosis]]) -> list[Escalation]:
+    """Аккаунт с лимитом SpamBot, который не пишет ни в один чат."""
+    per: dict[int, dict[str, Any]] = {}
+    for f, d in diagnoses:
+        if f.chat_kind != "schedule":
+            continue
+        row = per.setdefault(
+            f.account_id,
+            {"label": f.account_label, "limited": f.account_spam == "limited", "work": 0, "blocked": 0},
+        )
+        if d.cause == "working":
+            row["work"] += 1
+        elif d.cause == SPAMBLOCKED:
+            row["blocked"] += 1
+    out = []
+    for acc_id, row in per.items():
+        if row["limited"] and row["work"] == 0 and row["blocked"] >= 2:
+            out.append(
+                Escalation(
+                    key=f"{ACCOUNT_SPAM}:{acc_id}",
+                    severity="high",
+                    title=f"{row['label']}: SpamBlock — не отправляет ни в один чат "
+                    f"(закрыто {row['blocked']}, остальные проверены)",
+                    todo="подождать окончания лимита (проверяю @SpamBot каждые 3 ч) или заменить аккаунт",
+                )
+            )
+    return out
+
+
+def _need_escalation(needs: list[ChatNeed]) -> Escalation | None:
+    buy = accounts_to_buy(needs)
+    short = [n for n in needs if n.deficit > 0]
+    if not buy or not short:
+        return None
+    lines = ", ".join(
+        f"{n.title}: есть {n.eligible} из {n.needed}" for n in short[:6]
+    )
+    more = f" и ещё {len(short) - 6} чатов" if len(short) > 6 else ""
+    prio = any(n.priority for n in short)
+    return Escalation(
+        key="need_accounts",
+        severity="high" if prio else "medium",
+        title=f"Нужно ещё ≈{buy} новых аккаунтов, чтобы в чатах писали не реже раза в 5 минут. "
+        f"Сейчас с учётом всего, что починю сама: {lines}{more}",
+        todo=f"добавьте ≈{buy} чистых аккаунтов (кнопка «Session», пост задать) — "
+        f"сама вступлю во все чаты и настрою",
+    )
+
+
 async def _remember(store: Store, results: list[ActionResult], now: datetime) -> None:
     if not results:
         return
@@ -353,7 +414,7 @@ async def sync_incidents(store: Store, result: CycleResult) -> None:
     keep: set[tuple[str, int | None, int | None]] = set()
     per_chat: dict[tuple[str, int], list[PairFacts]] = defaultdict(list)
     for f, d in result.diagnoses:
-        if not d.is_problem or d.cause in {"banned", "muted"}:
+        if not d.is_problem:
             continue
         if d.cause in {ACCOUNT_SPAM, SESSION_DEAD}:
             k = (d.cause, f.account_id, None)
@@ -435,13 +496,21 @@ async def run_cycle(
             labels = {f.account_id: f.account_label for f, _d in result.diagnoses}
             done_accounts: set[int] = set()
             # порядок: сначала вступить, потом настроить
+            private = {f.chat_pk: f.is_private for f, _d in result.diagnoses}
+            limited = {f.account_id for f, _d in result.diagnoses if f.account_spam == "limited"}
             for action in (JOIN, SETUP, RESETUP):
                 for (act_name, acc_id), pks in list(plan.items()):
                     if act_name != action:
                         continue
                     if acc_id not in done_accounts and len(done_accounts) >= MAX_ACCOUNTS_PER_CYCLE:
                         continue
-                    pks = pks[:MAX_PAIRS_PER_ACCOUNT]
+                    cap = MAX_PAIRS_PER_ACCOUNT
+                    if acc_id in limited:
+                        # SpamBlock: сначала пробуем закрытые чаты (там чаще можно писать),
+                        # и понемногу — каждая неудача закрывает пару до конца лимита
+                        pks = sorted(pks, key=lambda pk: not private.get(pk, False))
+                        cap = SPAMBLOCK_PROBES
+                    pks = pks[:cap]
                     done_accounts.add(acc_id)
                     for pk in pks:
                         await _record_attempt(store, action, acc_id, pk, now)
@@ -464,7 +533,37 @@ async def run_cycle(
                 )
             await _remember(store, result.actions, now)
 
+    # Аккаунт с лимитом SpamBot: очередь настроена, но сообщения не уходят даже после
+    # пересоздания — значит в этот чат ему нельзя. Закрываем пару до конца лимита (≥ сутки)
+    # и пробуем другие чаты, а не долбим этот.
+    by_pair = {(f.account_id, f.chat_pk): f for f, _d in result.diagnoses}
+    for act_name, acc_id, chat_pk in list(exhausted):
+        f = by_pair.get((acc_id, chat_pk))
+        if act_name == RESETUP and f is not None and f.account_spam == "limited":
+            until = parse_spam_until_safe(f)
+            await store.upsert_restriction(
+                acc_id,
+                chat_pk,
+                "spamblock",
+                reason="ограничение аккаунта (@SpamBot): сообщения в этот чат не уходят",
+                until_at=to_iso(until),
+            )
+            exhausted.discard((act_name, acc_id, chat_pk))
+            result.diagnoses = [
+                (pf, Diagnosis(SPAMBLOCKED, "medium", text="SpamBlock: сообщения не уходят"))
+                if (pf.account_id, pf.chat_pk) == (acc_id, chat_pk)
+                else (pf, dd)
+                for pf, dd in result.diagnoses
+            ]
+
     result.escalations = _escalations(result.diagnoses, exhausted)
+    result.escalations += _spam_escalations(result.diagnoses)
+    result.needs = compute_needs(result.diagnoses, get_settings().priority_keys)
+    need = _need_escalation(result.needs)
+    if need is not None:
+        result.escalations.append(need)
+    order = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
+    result.escalations.sort(key=lambda e: (order.get(e.severity, 5), e.title))
     await sync_incidents(store, result)
     await store.set_setting("marketer_last_run_at", to_iso(now))
     return result

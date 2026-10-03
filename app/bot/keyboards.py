@@ -345,9 +345,9 @@ def reports_kb(
     days: list[tuple[int, str]] | None = None,
 ) -> InlineKeyboardMarkup:
     toggle = (
-        ib("Мониторинг: выкл", "mk_toggle", icon="block")
+        ib("Маркетолог: выкл", "mk_toggle", icon="block")
         if marketer_on
-        else ib("Мониторинг: вкл", "mk_toggle", icon="check")
+        else ib("Маркетолог: вкл", "mk_toggle", icon="check")
     )
     fix = (
         ib("Автофикс: выкл", "mk_autofix", icon="block")

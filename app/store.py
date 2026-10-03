@@ -2421,3 +2421,31 @@ class Store:
             cur = await db.execute("SELECT MIN(sent_at) FROM send_events")
             row = await cur.fetchone()
         return (row[0] if row and row[0] else "") or ""
+
+    async def resolve_restrictions_kind(self, account_id: int, kind: str) -> list[int]:
+        """Снять все активные ограничения вида kind у аккаунта; вернуть chat_pk."""
+        async with self._connect() as db:
+            cur = await db.execute(
+                "SELECT chat_pk FROM chat_restrictions WHERE account_id=? AND kind=? AND active=1",
+                (account_id, kind),
+            )
+            pks = [int(r[0]) for r in await cur.fetchall()]
+            if pks:
+                await db.execute(
+                    "UPDATE chat_restrictions SET active=0, resolved_at=? "
+                    "WHERE account_id=? AND kind=? AND active=1",
+                    (_now(), account_id, kind),
+                )
+                await db.execute(
+                    "UPDATE setup_states SET status='pending', fail_count=0, last_error='' "
+                    "WHERE account_id=? AND status<>'ok' AND chat_pk IN (%s)"
+                    % ",".join("?" for _ in pks),
+                    (account_id, *pks),
+                )
+                await db.commit()
+            return pks
+
+    async def list_restrictions_expired(self, now_iso: str) -> list[Restriction]:
+        """Активные мут/spamblock, у которых срок вышел (пора перепроверить)."""
+        rows = await self.list_restrictions(kinds=("mute", "nowrite", "spamblock"))
+        return [r for r in rows if r.until_at and r.until_at <= now_iso]

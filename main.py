@@ -94,10 +94,7 @@ async def main() -> None:
         if not scan:
             # мут закончился → проверяем сразу, а не ждём плановый скан
             now_iso = datetime.now(timezone.utc).isoformat(timespec="seconds")
-            scan = any(
-                r.until_at and r.until_at <= now_iso
-                for r in await store.list_restrictions(kinds=("mute", "nowrite"))
-            )
+            scan = bool(await store.list_restrictions_expired(now_iso))
         admin_id = next(iter(settings.admins), None)
         spawn_facts(
             store,
@@ -115,6 +112,13 @@ async def main() -> None:
         admin_id = next(iter(settings.admins), None)
         summary = await run_spam_due(store, bot, admin_id)
         log.info("%s", summary)
+
+    async def bans_weekly():
+        # бан-база: раз в неделю только читаем статус (не вступаем/не пишем)
+        from app.jobs.bans import recheck_bans
+
+        admin_id = next(iter(settings.admins), None)
+        log.info("%s", await recheck_bans(store, bot, admin_id))
 
     async def advisor_tick():
         from app.jobs.advisor import run_advisor
@@ -179,6 +183,18 @@ async def main() -> None:
         minutes=30,
         coalesce=True,
         max_instances=1,
+    )
+    scheduler.add_job(
+        bans_weekly,
+        "cron",
+        id="bans_weekly",
+        replace_existing=True,
+        day_of_week="mon",
+        hour=11,
+        minute=40,
+        timezone=settings.timezone,
+        misfire_grace_time=3600,
+        coalesce=True,
     )
     scheduler.add_job(
         advisor_tick,
