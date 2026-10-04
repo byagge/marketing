@@ -54,6 +54,10 @@ class Settings(BaseSettings):
     # Empty / unset → start_hour - 1 (wrapped).
     nonpremium_reschedule_hour: int | None = None
 
+    # Dead account (расходник): пост во все доступные чаты максимально часто.
+    # Минимум ≈14 мин, иначе 99 scheduled-слотов не покрывают сутки.
+    dead_interval_minutes: int = 15
+
     # Keep Telethon accounts looking active (UpdateStatus online → offline).
     # Interval ~3.5h ± 30m ≈ каждые 3–4 часа.
     online_ping_hours: float = 3.5

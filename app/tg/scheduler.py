@@ -234,6 +234,7 @@ async def schedule_chat_posts(
     allow_media: bool = True,
     clear_existing: bool = True,
     pause: float = 0.7,
+    offset_minutes: int = 0,
 ) -> dict[str, Any]:
     from app.config import get_settings
 
@@ -261,6 +262,7 @@ async def schedule_chat_posts(
         posts_count=count,
         tz=tz,
         start_hour=start_hour,
+        offset_minutes=offset_minutes,
     )
 
     success = 0
@@ -341,6 +343,7 @@ async def schedule_chat_forwards(
     repeat_period: int | None,
     clear_existing: bool = True,
     pause: float = 0.7,
+    offset_minutes: int = 0,
 ) -> dict[str, Any]:
     """Запланировать пересылки одного сообщения (с меткой Forwarded from)."""
     from app.config import get_settings
@@ -369,6 +372,7 @@ async def schedule_chat_forwards(
         posts_count=count,
         tz=tz,
         start_hour=start_hour,
+        offset_minutes=offset_minutes,
     )
 
     success = 0

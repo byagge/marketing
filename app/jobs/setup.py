@@ -11,7 +11,7 @@ from app.jobs import LogSink, runtime
 from app.models import Account, Chat, Post
 from app.sender_api import SenderAPI
 from app.store import Store
-from app.tg.client import telethon_client
+from app.tg.client import peer_id, telethon_client
 from app.tg.resolve import lookup_entity
 from app.tg.scheduler import (
     is_media_forbidden_error,
@@ -20,10 +20,10 @@ from app.tg.scheduler import (
     schedule_chat_posts,
 )
 from app.tg.unavailable import format_unavailable, is_chat_unavailable, is_unavailable_text
-from app.utils.chat_ids import chat_ids_match
+from app.utils.chat_ids import chat_id_aliases, chat_ids_match
 from app.utils.entities import entities_loads
 from app.utils.minutes import period_for_interval, suggest_minute
-from app.utils.schedule import resolve_repeat_period
+from app.utils.schedule import dead_interval, phase_offset_minutes, resolve_repeat_period
 from app.utils.templates import pick_post_for_chat, render_post
 from app.tg.sender_push import (
     apply_mentions_everywhere,
@@ -172,16 +172,22 @@ async def schedule_one_chat(
     *,
     skip_abandoned: bool = False,
     is_premium: bool = False,
+    dead: bool = False,
+    entity: Any | None = None,
 ) -> str:
     """
     Schedule posts for one chat.
+
+    dead=True — расходный аккаунт: свой плотный интервал, без минутного слота,
+    без setup_states/abandoned, ошибки молча → skipped. entity можно передать
+    готовый (уже найденный среди диалогов аккаунта).
 
     Returns: ok | skipped | abandoned | config_error | stopped
     """
     settings = get_settings()
     max_attempts = settings.setup_max_attempts
 
-    if skip_abandoned:
+    if skip_abandoned and not dead:
         state = await store.get_setup_state(account.id, chat.id)
         if state and state.is_abandoned:
             await log.emit(
@@ -216,13 +222,31 @@ async def schedule_one_chat(
             entities_loads(post.entities_json),
             chat.tag,
         )
-    slot = await store.slot_for(chat.id, account.id)
-    minute = slot.start_minute if slot else await ensure_minute(store, chat, account)
+    interval = chat.interval_minutes
+    offset = 0
+    if dead:
+        interval = dead_interval(chat.interval_minutes, settings.dead_interval_minutes)
+        minute = (account.id * 7) % 60
+    else:
+        slot = await store.slot_for(chat.id, account.id)
+        minute = slot.start_minute if slot else await ensure_minute(store, chat, account)
+        if chat.interval_minutes > 60:
+            slots = sorted(
+                await store.slots_for_chat(chat.id),
+                key=lambda sl: (int(sl.start_minute), int(sl.account_id)),
+            )
+            rank = next(
+                (i for i, sl in enumerate(slots) if sl.account_id == account.id), 0
+            )
+            offset = phase_offset_minutes(rank, chat.interval_minutes)
     repeat_period = resolve_repeat_period(is_premium, settings.repeat_period)
 
     try:
-        entity = await lookup_entity(client, chat)
         if entity is None:
+            entity = await lookup_entity(client, chat)
+        if entity is None:
+            if dead:
+                return "skipped"
             return await _fail_unavailable(
                 store,
                 account,
@@ -254,10 +278,11 @@ async def schedule_one_chat(
                 from_peer=from_peer,
                 message_id=msg_id,
                 start_minute=minute,
-                interval_minutes=chat.interval_minutes,
+                interval_minutes=interval,
                 start_hour=settings.start_hour,
                 tz=settings.tz,
                 repeat_period=repeat_period,
+                offset_minutes=offset,
             )
             # если фото-ссылка не прошла из-за медиа — пробуем text-link
             if (
@@ -288,10 +313,11 @@ async def schedule_one_chat(
                         from_peer=from_peer2,
                         message_id=msg_id2,
                         start_minute=minute,
-                        interval_minutes=chat.interval_minutes,
+                        interval_minutes=interval,
                         start_hour=settings.start_hour,
                         tz=settings.tz,
                         repeat_period=repeat_period,
+                        offset_minutes=offset,
                     )
         else:
             photo = post.photo_path or None
@@ -303,12 +329,13 @@ async def schedule_one_chat(
                 text=text,
                 entities=entities,
                 start_minute=minute,
-                interval_minutes=chat.interval_minutes,
+                interval_minutes=interval,
                 start_hour=settings.start_hour,
                 tz=settings.tz,
                 repeat_period=repeat_period,
                 photo_path=photo,
                 allow_media=want_media,
+                offset_minutes=offset,
             )
             if result.get("media_blocked") and want_media:
                 await store.update_chat(chat.id, allow_media=0)
@@ -316,6 +343,13 @@ async def schedule_one_chat(
                     f"{account.label}: «{chat.title}»: фото запрещено — дальше только текст"
                 )
     except Exception as e:
+        if dead:
+            await log.emit(
+                f"{account.label}: dead: «{chat.title}» пропущен "
+                f"({type(e).__name__}: {e})",
+                notify=False,
+            )
+            return "skipped"
         if is_chat_unavailable(e):
             return await _fail_unavailable(
                 store,
@@ -334,6 +368,16 @@ async def schedule_one_chat(
             account.id, chat.id, f"{type(e).__name__}: {e}", max_attempts=max_attempts
         )
         return "skipped"
+
+    if dead:
+        # Расходник: что успели запланировать — то и ладно, без счётчиков отказов.
+        await log.emit(
+            f"{account.label}: dead: «{chat.title}» {result['success']}/"
+            f"{result['planned']} слотов, каждые {interval} мин"
+            + (f" | {result['error']}" if result["error"] else ""),
+            notify=False,
+        )
+        return "ok" if result["success"] > 0 else "skipped"
 
     if result["success"] < result["planned"]:
         err = result["error"] or f"{result['success']}/{result['planned']}"
@@ -391,6 +435,8 @@ async def schedule_chats_batch(
     skip_abandoned: bool = False,
     job_kind: str = "setup",
     is_premium: bool = False,
+    dead: bool = False,
+    entities: dict[int, Any] | None = None,
 ) -> dict[str, list[str]]:
     """Schedule many chats; never aborts the whole batch on a missing chat."""
     buckets: dict[str, list[str]] = {
@@ -412,6 +458,8 @@ async def schedule_chats_batch(
             log,
             skip_abandoned=skip_abandoned,
             is_premium=is_premium,
+            dead=dead,
+            entity=(entities or {}).get(chat.id),
         )
         if outcome == "stopped":
             raise SetupError("Остановлено")
@@ -578,6 +626,9 @@ async def _configure_sender(
 async def run_setup(store: Store, account_id: int, bot: Bot, admin_chat_id: int) -> None:
     account = await store.get_account(account_id)
     if not account:
+        return
+    if account.is_dead:
+        await run_dead_setup(store, account_id, bot, admin_chat_id)
         return
     job = await store.create_job("setup", account.id)
     log = LogSink(store, job.id, bot, admin_chat_id)
@@ -765,6 +816,11 @@ async def run_setup_chats_only(
     empty = {"ok": [], "skipped": [], "abandoned": [], "config_error": []}
     if not account or not account.telethon_session or not chat_pks:
         return empty
+    if account.is_dead:
+        # Расходник: игнорируем список chat_pks, шлём во все доступные чаты.
+        return await run_dead_schedule(
+            store, account_id, bot, admin_chat_id, job_kind=job_kind
+        )
 
     posts = {
         "ru": await store.get_post(account.id, "ru"),
@@ -821,3 +877,176 @@ async def run_setup_chats_only(
     except Exception as e:
         await store.finish_job(job.id, "error", f"{type(e).__name__}: {e}")
         return empty
+
+
+async def member_schedule_chats(
+    client: TelegramClient, chats: list[Chat]
+) -> dict[int, Any]:
+    """
+    Чаты каталога, в которых аккаунт реально состоит (по его диалогам).
+    Один проход по диалогам, без get_entity на каждый чат → без лишних FloodWait.
+    Возвращает chat.id → entity.
+    """
+    by_alias: dict[str, Any] = {}
+    by_username: dict[str, Any] = {}
+    async for dialog in client.iter_dialogs():
+        ent = dialog.entity
+        for alias in chat_id_aliases(peer_id(ent)) | chat_id_aliases(
+            getattr(ent, "id", None)
+        ):
+            by_alias.setdefault(alias, ent)
+        uname = (getattr(ent, "username", None) or "").strip().casefold()
+        if uname:
+            by_username[uname] = ent
+
+    found: dict[int, Any] = {}
+    for chat in chats:
+        ent = None
+        for alias in chat_id_aliases(chat.chat_id):
+            ent = by_alias.get(alias)
+            if ent is not None:
+                break
+        if ent is None and chat.username:
+            ent = by_username.get(chat.username.strip().lstrip("@").casefold())
+        if ent is not None:
+            found[chat.id] = ent
+    return found
+
+
+async def run_dead_schedule(
+    store: Store,
+    account_id: int,
+    bot: Bot | None,
+    admin_chat_id: int | None,
+    *,
+    job_kind: str = "setup_dead",
+) -> dict[str, list[str]]:
+    """
+    Dead-аккаунт: слать максимум во все schedule-чаты, где он уже состоит.
+
+    Без проверок и счётчиков отказов: нет чата / бан / мут → молча пропускаем.
+    Минутные слоты не занимаем (сетка живых аккаунтов не страдает), уведомлений
+    админу не шлём (LogSink без бота) — итог только в job_logs.
+    """
+    account = await store.get_account(account_id)
+    empty: dict[str, list[str]] = {
+        "ok": [], "skipped": [], "abandoned": [], "config_error": []
+    }
+    if not account or not account.telethon_session:
+        return empty
+
+    posts = {
+        "ru": await store.get_post(account.id, "ru"),
+        "en": await store.get_post(account.id, "en"),
+        "ru_short": await store.get_post(account.id, "ru_short"),
+        "en_short": await store.get_post(account.id, "en_short"),
+    }
+    if not any(
+        (p.text or "").strip() or p.has_text_link or p.has_photo_link
+        for p in posts.values()
+    ):
+        return empty
+
+    schedule_chats = [
+        c for c in await store.list_chats(enabled_only=True) if c.is_schedule
+    ]
+    if not schedule_chats:
+        return empty
+
+    job = await store.create_job(job_kind, account.id)
+    log = LogSink(store, job.id)  # без бота — тишина
+    try:
+        async with telethon_client(account.telethon_session) as client:
+            me = await client.get_me()
+            is_premium = bool(getattr(me, "premium", False))
+            await store.update_account(account.id, is_premium=1 if is_premium else 0)
+            account = await store.get_account(account.id) or account
+            member = await member_schedule_chats(client, schedule_chats)
+            targets = [c for c in schedule_chats if c.id in member]
+            buckets = await schedule_chats_batch(
+                store,
+                client,
+                account,
+                targets,
+                posts,
+                log,
+                job_kind=job_kind,
+                is_premium=is_premium,
+                dead=True,
+                entities=member,
+            )
+            buckets["skipped"] = buckets.get("skipped", []) + [
+                c.title for c in schedule_chats if c.id not in member
+            ]
+        await store.finish_job(
+            job.id,
+            "done",
+            f"{account.label} [dead]: ok={len(buckets['ok'])} "
+            f"skip={len(buckets['skipped'])} premium={int(account.has_premium)}",
+        )
+        return buckets
+    except SetupError as e:
+        await store.finish_job(
+            job.id, "cancelled" if str(e) == "Остановлено" else "error", str(e)
+        )
+        return empty
+    except Exception as e:
+        await store.finish_job(job.id, "error", f"{type(e).__name__}: {e}")
+        return empty
+
+
+async def run_dead_setup(
+    store: Store,
+    account_id: int,
+    bot: Bot | None,
+    admin_chat_id: int | None,
+) -> None:
+    """Ручной «Старт» для dead-аккаунта: schedule везде, где состоит + sender best-effort."""
+    account = await store.get_account(account_id)
+    if not account:
+        return
+    await store.update_account(account.id, status="running", last_error="")
+    try:
+        buckets = await run_dead_schedule(
+            store, account_id, bot, admin_chat_id, job_kind="setup"
+        )
+        sender_note = ""
+        if account.has_sender:
+            job = await store.create_job("setup_dead_sender", account.id)
+            log = LogSink(store, job.id)
+            try:
+                chats = await store.list_chats(enabled_only=True)
+                posts = {
+                    "ru": await store.get_post(account.id, "ru"),
+                    "en": await store.get_post(account.id, "en"),
+                    "ru_short": await store.get_post(account.id, "ru_short"),
+                    "en_short": await store.get_post(account.id, "en_short"),
+                }
+                n = await _configure_sender(
+                    store,
+                    account,
+                    posts,
+                    [c for c in chats if c.is_schedule],
+                    [c for c in chats if c.kind == "sender"],
+                    log,
+                )
+                sender_note = f" | sender: {n} чатов"
+                await store.finish_job(job.id, "done", sender_note)
+            except Exception as e:
+                sender_note = " | sender: не вышло (игнор)"
+                await store.finish_job(job.id, "error", f"{type(e).__name__}: {e}")
+        await store.update_account(account.id, status="done", last_error="")
+        if bot and admin_chat_id:
+            try:
+                await bot.send_message(
+                    admin_chat_id,
+                    f"\U0001F480 {account.label} [dead]: schedule в "
+                    f"{len(buckets['ok'])} чатах, недоступно/пропущено "
+                    f"{len(buckets['skipped'])}{sender_note}",
+                )
+            except Exception:
+                pass
+    finally:
+        current = await store.get_account(account_id)
+        if current and current.status == "running":
+            await store.update_account(account_id, status="idle")

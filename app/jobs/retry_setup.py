@@ -8,7 +8,7 @@ from aiogram import Bot
 from app.config import get_settings
 from app.jobs.health import run_health_all
 from app.jobs.parallel import map_batches, setup_parallel_defaults
-from app.jobs.setup import run_setup_chats_only
+from app.jobs.setup import run_dead_schedule, run_setup_chats_only
 from app.store import Store
 from app.tg.client import telethon_client
 
@@ -101,6 +101,8 @@ async def run_weekly_recheck(store: Store, bot: Bot, admin_chat_id: int) -> None
     # After reset, last_attempt_at is kept but fail_count=0 — force all pending into a try.
     # Also include enabled schedule chats that never got a state yet? Weekly focuses on
     # previously failed ones; brand-new chats are handled by manual setup.
+    dead_ids = {a.id for a in await store.list_accounts() if a.is_dead}
+    pending = [st for st in pending if st.account_id not in dead_ids]
     by_account: dict[int, list[int]] = defaultdict(list)
     for state in pending:
         by_account[state.account_id].append(state.chat_pk)
@@ -192,6 +194,16 @@ async def run_nonpremium_daily_reschedule(
             await store.update_account(acc.id, is_premium=1 if is_premium else 0)
             if is_premium:
                 return ("premium", None)
+            if acc.is_dead:
+                # Расходник без Premium: каждый день пересобираем во все доступные чаты.
+                buckets = await run_dead_schedule(
+                    store,
+                    acc.id,
+                    bot,
+                    admin_chat_id,
+                    job_kind="setup_daily_nonpremium",
+                )
+                return ("ok", buckets)
             ok_states = await store.list_setup_states(acc.id, statuses=["ok"])
             renew_pks = [s.chat_pk for s in ok_states if s.chat_pk in enabled_pks]
             if not renew_pks:

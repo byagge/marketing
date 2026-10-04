@@ -55,8 +55,9 @@ def accounts_html(accounts: list[Account]) -> str:
         live = pe("check") if acc.has_telethon else pe("block")
         run = f" {pe('robot')} фон" if runtime.is_running("setup", acc.id) else ""
         uname = f"@{acc.username}" if acc.username else escape(acc.label)
+        dead = " \U0001F480" if acc.dead else ""
         lines.append(
-            f"{live} <b>{escape(uname)}</b> <code>#{acc.id}</code>{run}\n"
+            f"{live} <b>{escape(uname)}</b> <code>#{acc.id}</code>{dead}{run}\n"
             f"   статус: <code>{escape(acc.status)}</code>"
         )
     return "\n".join(lines)
@@ -116,7 +117,9 @@ def account_html(acc: Account, ru=None, en=None) -> str:
         f"{'' if acc.is_premium else ' · суточный cron без repeat'}\n"
         f"{pe('monitor')} Pyrogram: {on_off(bool(acc.pyrogram_session))}\n"
         f"{pe('up')} Online ping: {on_off(bool(acc.online_ping_enabled))}"
-        f"{'' if acc.telethon_session else ' (нужен Telethon)'}\n\n"
+        f"{'' if acc.telethon_session else ' (нужен Telethon)'}\n"
+        f"\U0001F480 Dead-режим: {on_off(acc.dead)}"
+        f"{' · карантин: шлёт во все доступные чаты, без проверок' if acc.dead else ''}\n\n"
         f"{sender_mode}"
         f"{err}\n\n"
         f"{pe('info')} Schedule — чаты из каталога. "

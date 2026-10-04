@@ -131,6 +131,8 @@ def account_kb(acc: Account, running: bool = False) -> InlineKeyboardMarkup:
     )
     ping_label = "Online ping: вкл" if acc.online_ping_enabled else "Online ping: выкл"
     ping_icon = "check" if acc.online_ping_enabled else "block"
+    dead_label = "\U0001F480 Dead-режим: вкл" if acc.dead else "Dead-режим: выкл"
+    dead_icon = "warn" if acc.dead else "check"
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [start],
@@ -143,6 +145,7 @@ def account_kb(acc: Account, running: bool = False) -> InlineKeyboardMarkup:
             [ib("Вступить по папке", "acc_folder", acc.id, icon="folder")],
             [ib("Проверить schedule", "health_go", acc.id, icon="search")],
             [ib(ping_label, "acc_online", acc.id, icon=ping_icon)],
+            [ib(dead_label, "acc_dead", acc.id, icon=dead_icon)],
             [
                 ib("Telethon", "acc_tl", acc.id, icon="lock"),
                 ib("Pyrogram", "acc_pg", acc.id, icon="monitor"),

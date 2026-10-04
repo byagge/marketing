@@ -241,6 +241,10 @@ async def _migrate_accounts_premium(db: aiosqlite.Connection) -> None:
         await db.execute(
             "ALTER TABLE accounts ADD COLUMN online_ping INTEGER NOT NULL DEFAULT 1"
         )
+    if "is_dead" not in cols:
+        await db.execute(
+            "ALTER TABLE accounts ADD COLUMN is_dead INTEGER NOT NULL DEFAULT 0"
+        )
 
 
 async def _migrate_chats_invite(db: aiosqlite.Connection) -> None:
@@ -282,6 +286,7 @@ def _account(row: aiosqlite.Row) -> Account:
         sender_account_id=row["sender_account_id"] or "",
         is_premium=int(row["is_premium"] if "is_premium" in keys else 0) or 0,
         online_ping=online_ping,
+        is_dead=int(row["is_dead"] or 0) if "is_dead" in keys else 0,
         status=row["status"] or "idle",
         last_error=row["last_error"] or "",
         created_at=row["created_at"] or "",
@@ -897,6 +902,7 @@ class Store:
                 "JOIN chats c ON c.id=s.chat_pk "
                 "LEFT JOIN accounts a ON a.id=s.account_id "
                 "WHERE s.status='pending' "
+                "AND COALESCE(a.is_dead, 0)=0 "
                 "AND s.fail_count < ? "
                 "AND c.enabled=1 AND c.kind='schedule' "
                 "AND ("
@@ -1020,6 +1026,15 @@ class Store:
                 (chat_pk, account_id),
             )
             await db.commit()
+
+    async def delete_slots_for_account(self, account_id: int) -> int:
+        """Освободить все минутные слоты аккаунта (для dead-режима)."""
+        async with self._connect() as db:
+            cur = await db.execute(
+                "DELETE FROM minute_slots WHERE account_id=?", (account_id,)
+            )
+            await db.commit()
+            return int(cur.rowcount or 0)
 
     async def occupied_minutes(self, chat_pk: int, exclude_account: int | None = None) -> list[int]:
         slots = await self.slots_for_chat(chat_pk)

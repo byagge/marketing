@@ -24,7 +24,8 @@ async def rebalance_minute_table(
     only_assigned=True  — только уже назначенные пары, минуты выровнять.
     """
     chats = [c for c in await store.list_chats(kind="schedule") if c.enabled]
-    accounts = await store.list_accounts()
+    # dead-аккаунты минутные слоты не занимают
+    accounts = [a for a in await store.list_accounts() if not a.is_dead]
     if not chats:
         return {"chats": 0, "accounts": len(accounts), "slots": 0, "mode": "empty"}
 

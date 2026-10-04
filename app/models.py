@@ -17,10 +17,16 @@ class Account:
     sender_account_id: str = ""
     is_premium: int = 0
     online_ping: int = 1
+    # 1 = «dead account»: расходник, без строгих проверок, шлёт во все доступные чаты
+    is_dead: int = 0
     status: str = "idle"
     last_error: str = ""
     created_at: str = ""
     updated_at: str = ""
+
+    @property
+    def dead(self) -> bool:
+        return bool(self.is_dead)
 
     @property
     def display(self) -> str:

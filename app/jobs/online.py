@@ -45,7 +45,7 @@ async def run_online_ping(
     accounts = [
         a
         for a in await store.list_accounts()
-        if a.telethon_session and a.online_ping_enabled
+        if a.telethon_session and a.online_ping_enabled and not a.is_dead
     ]
 
     async def _schedule_next() -> datetime:
