@@ -90,7 +90,7 @@ def main_menu() -> InlineKeyboardMarkup:
             [ib("Настройка", "setup", icon="robot"), ib("Чаты", "chats", icon="users")],
             [ib("Таблица", "table", icon="clock"), ib("Sender", "sender", icon="link")],
             [ib("Аккаунты", "accounts", icon="user"), ib("Online", "online", icon="star")],
-            [ib("Session", "mk_session", icon="inbox")],
+            [ib("Session", "mk_session", icon="inbox"), ib("Экспорт", "export", icon="chart")],
             [ib("Отчёты", "reports", icon="chart"), ib("Проверка", "health", icon="search")],
             [ib("Инфо", "info", icon="info")],
         ]
@@ -327,6 +327,7 @@ def table_chats_kb(
         rows.append([ib("Остановить перенастройку", "tbl_reall_stop", icon="down")])
     else:
         rows.append([ib("Перенастроить все", "tbl_reall", icon="robot")])
+    rows.append([ib("Перераспределить по факту", "tbl_smart", icon="search")])
     rows.append([ib("Только таблицу", "tbl_rebal", icon="stack")])
     rows.append([ib("Скачать Excel", "tbl_dl", icon="inbox")])
     rows.append([ib("Загрузить Excel", "tbl_ul", icon="folder")])

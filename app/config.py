@@ -54,6 +54,10 @@ class Settings(BaseSettings):
     # Empty / unset → start_hour - 1 (wrapped).
     nonpremium_reschedule_hour: int | None = None
 
+    # Без Premium (нет repeat): держим расписание на столько часов дальше суток, чтобы
+    # опоздавшая ночная пересборка не оставляла чат без отправок.
+    nonpremium_extra_hours: float = 6.0
+
     # Dead account (расходник): пост во все доступные чаты максимально часто.
     # Минимум ≈14 мин, иначе 99 scheduled-слотов не покрывают сутки.
     dead_interval_minutes: int = 15

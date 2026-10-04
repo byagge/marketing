@@ -18,6 +18,7 @@ from app.bot import setup_routers
 from app.bot.middlewares import AdminOnlyMiddleware
 from app.config import ensure_dirs, get_settings
 from app.context import ctx
+from app.jobs.balance import run_smart_rebalance
 from app.jobs.health import weekly_cron_args
 from app.jobs.online import run_online_ping_tick
 from app.jobs.retry_setup import (
@@ -72,6 +73,14 @@ async def main() -> None:
         admin_id = next(iter(settings.admins), None)
         await run_nonpremium_daily_reschedule(store, bot, admin_id)
 
+    async def auto_rebalance():
+        # Факты → кто реально пишет → равномерные слоты. Молча, если менять нечего.
+        admin_id = next(iter(settings.admins), None)
+        try:
+            await run_smart_rebalance(store, bot, admin_id, collect=True, notify="changes")
+        except Exception:
+            log.exception("auto rebalance failed")
+
     async def online_tick():
         summary = await run_online_ping_tick(store)
         log.info("%s", summary)
@@ -101,6 +110,15 @@ async def main() -> None:
         replace_existing=True,
         minutes=15,
     )
+    if settings.auto_rebalance:
+        scheduler.add_job(
+            auto_rebalance,
+            "interval",
+            id="smart_rebalance",
+            replace_existing=True,
+            hours=max(0.5, float(settings.rebalance_every_hours)),
+            next_run_time=datetime.now(scheduler.timezone) + timedelta(minutes=20),
+        )
     run_at = datetime.now(scheduler.timezone) + timedelta(seconds=45)
     scheduler.add_job(
         online_tick,
@@ -115,7 +133,7 @@ async def main() -> None:
     log.info(
         "Marketing bot starting (weekly=%s %s:00, setup_retry=daily %s:00, "
         "nonpremium_reschedule=daily %s:00, online_ping=%s every %sh±%ss, "
-        "retry_days=%s, max_attempts=%s)",
+        "retry_days=%s, max_attempts=%s, auto_rebalance=%s every %sh)",
         settings.weekly_health_dow,
         settings.weekly_health_hour,
         settings.setup_retry_hour,
@@ -125,6 +143,8 @@ async def main() -> None:
         online_cfg.jitter_sec,
         settings.setup_retry_days,
         settings.setup_max_attempts,
+        "on" if settings.auto_rebalance else "off",
+        settings.rebalance_every_hours,
     )
     await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
 

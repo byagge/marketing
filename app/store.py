@@ -98,6 +98,7 @@ CREATE TABLE IF NOT EXISTS chat_facts (
     last_sent_at TEXT NOT NULL DEFAULT '',
     error TEXT NOT NULL DEFAULT '',
     checked_at TEXT NOT NULL DEFAULT '',
+    scheduled_count INTEGER,
     PRIMARY KEY (account_id, chat_pk)
 );
 
@@ -260,6 +261,13 @@ async def _migrate_accounts_premium(db: aiosqlite.Connection) -> None:
         )
 
 
+async def _migrate_chat_facts(db: aiosqlite.Connection) -> None:
+    cur = await db.execute("PRAGMA table_info(chat_facts)")
+    cols = [row[1] for row in await cur.fetchall()]
+    if cols and "scheduled_count" not in cols:
+        await db.execute("ALTER TABLE chat_facts ADD COLUMN scheduled_count INTEGER")
+
+
 async def _migrate_setup_states(db: aiosqlite.Connection) -> None:
     cur = await db.execute("PRAGMA table_info(setup_states)")
     cols = [row[1] for row in await cur.fetchall()]
@@ -387,6 +395,7 @@ class Store:
             await _migrate_accounts_premium(db)
             await _migrate_chats_invite(db)
             await _migrate_setup_states(db)
+            await _migrate_chat_facts(db)
             for key, value in DEFAULT_SETTINGS.items():
                 await db.execute(
                     "INSERT OR IGNORE INTO settings(key, value) VALUES(?, ?)",
@@ -1064,18 +1073,28 @@ class Store:
             )
             await db.commit()
 
+    async def raw_rows(self, sql: str, args: tuple = ()) -> list[dict[str, Any]]:
+        """Только чтение (для экспорта отчёта): произвольный SELECT → список словарей."""
+        if not sql.lstrip().lower().startswith("select"):
+            raise ValueError("raw_rows: только SELECT")
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(sql, args)
+            return [dict(r) for r in await cur.fetchall()]
+
     async def upsert_fact(self, fact) -> None:
         """Факт по паре «аккаунт × чат» (членство, права, отправки за 24 ч)."""
         async with self._connect() as db:
             await db.execute(
                 "INSERT INTO chat_facts(account_id, chat_pk, member, can_send, "
-                "mute_until, sent_24h, last_sent_at, error, checked_at) "
-                "VALUES(?,?,?,?,?,?,?,?,?) "
+                "mute_until, sent_24h, last_sent_at, error, checked_at, scheduled_count) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?) "
                 "ON CONFLICT(account_id, chat_pk) DO UPDATE SET "
                 "member=excluded.member, can_send=excluded.can_send, "
                 "mute_until=excluded.mute_until, sent_24h=excluded.sent_24h, "
                 "last_sent_at=excluded.last_sent_at, error=excluded.error, "
-                "checked_at=excluded.checked_at",
+                "checked_at=excluded.checked_at, "
+                "scheduled_count=excluded.scheduled_count",
                 (
                     fact.account_id,
                     fact.chat_pk,
@@ -1086,6 +1105,7 @@ class Store:
                     fact.last_sent_at or "",
                     fact.error or "",
                     fact.checked_at or "",
+                    getattr(fact, "scheduled_count", None),
                 ),
             )
             await db.commit()
@@ -1113,6 +1133,7 @@ class Store:
                 last_sent_at=r["last_sent_at"] or "",
                 error=r["error"] or "",
                 checked_at=r["checked_at"] or "",
+                scheduled_count=r["scheduled_count"],
             )
             for r in rows
         ]

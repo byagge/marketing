@@ -267,6 +267,7 @@ async def schedule_one_chat(
             )
             offset = phase_offset_minutes(rank, chat.interval_minutes)
     repeat_period = resolve_repeat_period(is_premium, settings.repeat_period)
+    extra_hours = 0.0 if repeat_period else float(settings.nonpremium_extra_hours)
     prior = await store.get_setup_state(account.id, chat.id) if (sync and not dead) else None
     fallback_used = False
 
@@ -311,6 +312,7 @@ async def schedule_one_chat(
                 mode="forward", from_peer=str(from_peer), msg_id=int(msg_id),
                 interval=interval, minute=minute, offset=offset,
                 repeat=bool(repeat_period), hour=settings.start_hour,
+                extra=extra_hours,
             )
             result = await schedule_chat_forwards(
                 client=client,
@@ -324,6 +326,7 @@ async def schedule_one_chat(
                 repeat_period=repeat_period,
                 offset_minutes=offset,
                 sync=_sync_for(sig),
+                extra_hours=extra_hours,
             )
             # если фото-ссылка не прошла из-за медиа — пробуем text-link
             if (
@@ -369,6 +372,7 @@ async def schedule_one_chat(
                 mode="post", text=text, entities=entities, photo=_photo_stamp(photo),
                 allow_media=want_media, interval=interval, minute=minute,
                 offset=offset, repeat=bool(repeat_period), hour=settings.start_hour,
+                extra=extra_hours,
             )
             result = await schedule_chat_posts(
                 client=client,
@@ -384,6 +388,7 @@ async def schedule_one_chat(
                 allow_media=want_media,
                 offset_minutes=offset,
                 sync=_sync_for(sig),
+                extra_hours=extra_hours,
             )
             if result.get("media_blocked") and want_media:
                 fallback_used = True

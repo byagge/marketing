@@ -113,3 +113,43 @@ async def test_working_member_without_slot_gets_one(store, monkeypatch):
     await balance_mod.run_smart_rebalance(store, collect=False)
     assert newbie.id in {s.account_id for s in await store.slots_for_chat(chat.id)}
     assert newbie.id in calls
+
+
+async def test_pair_with_empty_schedule_is_rebuilt_even_if_state_ok(store, monkeypatch):
+    chat, accs = await _setup(store, 6)
+    for a in accs:
+        await _fact(store, a, chat, scheduled_count=24)
+    await _fact(store, accs[2], chat, scheduled_count=0)  # «настроено, но сообщений нет»
+
+    calls = []
+
+    async def fake_setup(store_, aid, pks, bot, admin, **kw):
+        calls.append(aid)
+        return {}
+
+    import app.jobs.setup as setup_mod
+
+    monkeypatch.setattr(setup_mod, "run_setup_chats_only", fake_setup)
+    await balance_mod.run_smart_rebalance(store, collect=False)
+    assert calls == [accs[2].id]
+
+
+async def test_premium_with_legacy_23_slots_is_rebuilt_once(store, monkeypatch):
+    chat, accs = await _setup(store, 4)
+    await store.update_account(accs[0].id, is_premium=1)
+    await store.update_account(accs[1].id, is_premium=0)
+    for a in accs:
+        await _fact(store, a, chat, scheduled_count=23)  # старая сетка без 24-го слота
+
+    calls = []
+
+    async def fake_setup(store_, aid, pks, bot, admin, **kw):
+        calls.append(aid)
+        return {}
+
+    import app.jobs.setup as setup_mod
+
+    monkeypatch.setattr(setup_mod, "run_setup_chats_only", fake_setup)
+    await balance_mod.run_smart_rebalance(store, collect=False)
+    # Premium (repeat) должен иметь 24 → пересобрать; без Premium 23 ≥ половины → не трогаем
+    assert calls == [accs[0].id]

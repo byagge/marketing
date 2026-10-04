@@ -178,6 +178,8 @@ class PairFact:
     last_sent_at: str = ""
     error: str = ""
     checked_at: str = ""
+    # сколько scheduled-сообщений реально стоит у аккаунта в этом чате (None = не проверяли)
+    scheduled_count: int | None = None
 
 
 def _parse_iso(value: str) -> datetime | None:

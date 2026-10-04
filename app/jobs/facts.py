@@ -16,6 +16,7 @@ from app.config import get_settings
 from app.jobs import LogSink, runtime
 from app.jobs.parallel import map_batches, setup_parallel_defaults
 from app.jobs.setup import member_schedule_chats
+from app.tg.scheduler import fetch_scheduled
 from app.models import Account, Chat
 from app.store import Store
 from app.tg.client import telethon_client
@@ -113,6 +114,11 @@ async def collect_account_facts(
             username=getattr(me, "username", None) or None,
         )
         member = await member_schedule_chats(client, chats)
+        if not member:
+            ok_states = await store.list_setup_states(account.id, statuses=["ok"])
+            if len(ok_states) >= 3:
+                # пустой результат при многих «ok» — скорее сбой выдачи диалогов, чем выход из всех чатов
+                raise RuntimeError("список диалогов не содержит ни одного чата каталога — не доверяю")
         for chat in chats:
             ent = member.get(chat.id)
             if ent is None:
@@ -124,6 +130,14 @@ async def collect_account_facts(
             await asyncio.sleep(pause)
             sent, last, err2 = await probe_sent(client, ent, since)
             await asyncio.sleep(pause)
+            sched: int | None
+            try:
+                sched = len(await fetch_scheduled(client, ent))
+            except Exception as e:
+                sched, err3 = None, f"{type(e).__name__}: {e}"
+            else:
+                err3 = ""
+            await asyncio.sleep(pause)
             facts.append(
                 PairFact(
                     account.id,
@@ -133,8 +147,9 @@ async def collect_account_facts(
                     mute_until=mute_until,
                     sent_24h=sent,
                     last_sent_at=last,
-                    error="; ".join(e for e in (err1, err2) if e),
+                    error="; ".join(e for e in (err1, err2, err3) if e),
                     checked_at=checked,
+                    scheduled_count=sched,
                 )
             )
     return facts

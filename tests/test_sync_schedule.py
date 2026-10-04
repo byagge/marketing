@@ -167,3 +167,33 @@ async def test_first_ok_at_is_sticky(store):
     await store.record_setup_fail(acc.id, chat.id, "boom", max_attempts=3)
     s3 = await store.record_setup_ok(acc.id, chat.id, "y")
     assert s3.first_ok_at >= s1.first_ok_at and s3.sig == "y"
+
+
+async def test_nonpremium_horizon_extends_but_premium_does_not():
+    tg = FakeTelegram()
+    res = await _build(tg, extra_hours=6)
+    assert 24 < len(tg.msgs) <= 30 and res["success"] == len(tg.msgs)
+    assert len({m.date for m in tg.msgs}) == len(tg.msgs)
+
+    tg2 = FakeTelegram()
+    await _build(tg2, extra_hours=6, repeat_period=86400)
+    assert len(tg2.msgs) == 24  # repeat Premium: горизонт не нужен
+
+
+async def test_horizon_never_exceeds_telegram_limit():
+    tg = FakeTelegram()
+    await _build(tg, interval_minutes=15, extra_hours=6)  # 90 слотов + extra > 99 → без extra
+    assert len(tg.msgs) == 90
+
+
+async def test_fact_scheduled_count_roundtrip(store):
+    from app.utils.balance import PairFact
+
+    acc = await store.add_account("a")
+    chat = await store.add_chat("C", "-1001", kind="schedule")
+    await store.upsert_fact(PairFact(acc.id, chat.id, member=1, scheduled_count=17))
+    [f] = await store.list_facts()
+    assert f.scheduled_count == 17
+    await store.upsert_fact(PairFact(acc.id, chat.id, member=1))
+    [f] = await store.list_facts()
+    assert f.scheduled_count is None

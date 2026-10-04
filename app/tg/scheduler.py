@@ -11,7 +11,9 @@ from telethon.errors import FloodWaitError, RPCError
 from telethon.tl import functions, types
 
 from app.utils.entities import to_telethon_entities
-from app.utils.schedule import build_schedule_times, posts_count_for_interval
+from datetime import timedelta
+
+from app.utils.schedule import MAX_SCHEDULED, build_schedule_times, posts_count_for_interval
 
 log = logging.getLogger(__name__)
 
@@ -94,6 +96,23 @@ async def fetch_scheduled(client: TelegramClient, target_entity) -> list:
             return list(getattr(result, "messages", None) or [])
         except FloodWaitError as e:
             await asyncio.sleep(e.seconds + 1)
+
+
+def extend_horizon(
+    times: list[datetime], extra_hours: float, repeat_period: int | None, tz
+) -> list[datetime]:
+    """
+    Без repeat расписание живёт ровно до следующей пересборки. Добавляем слоты
+    «завтрашнего» дня на extra_hours вперёд (сегодняшние ближайшие + 1 день),
+    чтобы пересборка, пришедшая позже вчерашней, не оставила чат пустым.
+    Не добавляем, если упрёмся в лимит Telegram на scheduled в чате.
+    """
+    if repeat_period or not extra_hours or not times:
+        return times
+    horizon = datetime.now(tz) + timedelta(hours=float(extra_hours))
+    extra = [t + timedelta(days=1) for t in times if t <= horizon]
+    merged = sorted(set(times) | set(extra))
+    return merged if len(merged) <= MAX_SCHEDULED else times
 
 
 def _minute_key(dt: datetime) -> int:
@@ -285,6 +304,7 @@ async def schedule_chat_posts(
     pause: float = 0.7,
     offset_minutes: int = 0,
     sync: bool = False,
+    extra_hours: float = 0.0,
 ) -> dict[str, Any]:
     from app.config import get_settings
 
@@ -310,6 +330,7 @@ async def schedule_chat_posts(
         start_hour=start_hour,
         offset_minutes=offset_minutes,
     )
+    times = extend_horizon(times, extra_hours, repeat_period, tz)
     cleared = 0
     kept = 0
     todo = times
@@ -403,6 +424,7 @@ async def schedule_chat_forwards(
     pause: float = 0.7,
     offset_minutes: int = 0,
     sync: bool = False,
+    extra_hours: float = 0.0,
 ) -> dict[str, Any]:
     """Запланировать пересылки одного сообщения (с меткой Forwarded from)."""
     from app.config import get_settings
@@ -429,6 +451,7 @@ async def schedule_chat_forwards(
         start_hour=start_hour,
         offset_minutes=offset_minutes,
     )
+    times = extend_horizon(times, extra_hours, repeat_period, tz)
     cleared = 0
     kept = 0
     todo = times

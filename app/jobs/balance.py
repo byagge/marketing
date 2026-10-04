@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import logging
 from collections import defaultdict
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 
 from aiogram import Bot
@@ -19,7 +20,9 @@ from app.config import get_settings
 from app.jobs import LogSink, maintenance_lock, runtime
 from app.jobs.facts import run_collect_facts
 from app.jobs.parallel import map_batches, setup_parallel_defaults
+from app.models import Account, Chat
 from app.store import Store
+from app.utils.schedule import posts_count_for_interval
 from app.utils.balance import (
     MUTED,
     NOT_MEMBER,
@@ -88,6 +91,104 @@ def _fmt_plan(title: str, interval: int, plan: ChatPlan, counts: dict[str, int])
     return head + (" | " + ", ".join(notes) if notes else " | ок")
 
 
+@dataclass
+class ChatAnalysis:
+    chat: Chat
+    index: int
+    current: dict[int, int]  # account_id → минута (как сейчас в БД)
+    statuses: dict[int, str]  # account_id → working/muted/not_member/…
+    unscheduled: list[int]  # нужна (пере)сборка расписания
+    counts: dict[str, int]  # сколько аккаунтов в каждом нерабочем статусе
+    plan: ChatPlan
+    chat_alive: bool
+    sent_24h_total: int
+    facts: list[PairFact] = field(default_factory=list)
+
+
+async def analyze_state(
+    store: Store,
+    accounts: dict[int, Account],
+    chats: list[Chat],
+    facts: list[PairFact],
+    *,
+    now: datetime | None = None,
+) -> tuple[list[ChatAnalysis], dict[int, Account], list[PairFact]]:
+    """Один и тот же разбор «что реально работает» для перераспределения и для отчёта."""
+    settings = get_settings()
+    now = now or datetime.now(timezone.utc)
+    fact_by = {(f.account_id, f.chat_pk): f for f in facts}
+    states = {(s.account_id, s.chat_pk): s for s in await store.list_setup_states()}
+    max_age = timedelta(hours=settings.facts_max_age_hours)
+    silent_after = timedelta(hours=settings.silent_after_hours)
+    out: list[ChatAnalysis] = []
+    for idx, chat in enumerate(chats):
+        slots = await store.slots_for_chat(chat.id)
+        current = {s.account_id: s.start_minute for s in slots}
+        chat_facts = [f for (aid, cpk), f in fact_by.items() if cpk == chat.id]
+        chat_alive = sum(1 for f in chat_facts if (f.sent_24h or 0) > 0) >= 3
+
+        statuses: dict[int, str] = {}
+        unscheduled: list[int] = []
+        expected = posts_count_for_interval(chat.interval_minutes)
+        for aid in accounts:
+            st = states.get((aid, chat.id))
+            f = fact_by.get((aid, chat.id))
+            status = classify_pair(
+                f,
+                state_ok=bool(st and st.status == "ok"),
+                state_ok_since=st.first_ok_at if st else "",
+                now=now,
+                max_age=max_age,
+                silent_after=silent_after,
+                chat_alive=chat_alive,
+            )
+            statuses[aid] = status
+            acc = accounts.get(aid)
+            # Premium держит расписание на repeat: должно стоять ровно полные сутки.
+            # Меньше (старые 23 слота с дырой ~40 мин) → пересобрать один раз.
+            need = expected if (acc and acc.has_premium) else max(1, expected // 2)
+            low = (
+                f is not None
+                and f.scheduled_count is not None
+                and f.scheduled_count < need
+            )
+            if status == WORKING and (not (st and st.status == "ok") or low):
+                unscheduled.append(aid)
+        # слоты мёртвых/удалённых/без сессии — всегда освобождаем
+        for aid in current:
+            if aid not in accounts:
+                statuses[aid] = NOT_MEMBER
+
+        plan = plan_chat(
+            interval_minutes=chat.interval_minutes,
+            current=current,
+            statuses=statuses,
+            unscheduled=unscheduled,
+            chat_index=idx,
+            chats_total=len(chats),
+            factor=settings.rebalance_gap_factor,
+        )
+        counts: dict[str, int] = defaultdict(int)
+        for aid, status in statuses.items():
+            if aid in accounts and status != WORKING:
+                counts[status] += 1
+        out.append(
+            ChatAnalysis(
+                chat=chat,
+                index=idx,
+                current=current,
+                statuses=statuses,
+                unscheduled=unscheduled,
+                counts=dict(counts),
+                plan=plan,
+                chat_alive=chat_alive,
+                sent_24h_total=sum((f.sent_24h or 0) for f in chat_facts),
+                facts=chat_facts,
+            )
+        )
+    return out, accounts, facts
+
+
 async def run_smart_rebalance(
     store: Store,
     bot: Bot | None = None,
@@ -124,67 +225,21 @@ async def run_smart_rebalance(
                 age is None or age > timedelta(minutes=settings.facts_fresh_minutes)
             ):
                 await sink.emit("Собираю факты (состоит/права/отправки)…", notify=False)
-                await run_collect_facts(store, None, None)
+                await run_collect_facts(store, None, None, only_account_ids=set(accounts))
                 facts = await store.list_facts()
             if not facts:
                 report = "Нет фактов — нечего считать (соберите факты)"
                 await store.finish_job(job.id, "error", report)
                 return report
 
-            fact_by = {(f.account_id, f.chat_pk): f for f in facts}
-            states = {
-                (s.account_id, s.chat_pk): s for s in await store.list_setup_states()
-            }
-            max_age = timedelta(hours=settings.facts_max_age_hours)
-            silent_after = timedelta(hours=settings.silent_after_hours)
-            now = datetime.now(timezone.utc)
-
+            analyses, _acc, _facts = await analyze_state(store, accounts, chats, facts)
             lines: list[str] = []
             by_account: dict[int, list[int]] = defaultdict(list)
             total_changed = total_evicted = total_added = 0
 
-            for idx, chat in enumerate(chats):
-                slots = await store.slots_for_chat(chat.id)
-                current = {s.account_id: s.start_minute for s in slots}
-                chat_facts = [f for (aid, cpk), f in fact_by.items() if cpk == chat.id]
-                alive = sum(1 for f in chat_facts if (f.sent_24h or 0) > 0)
-                chat_alive = alive >= 3
-
-                statuses: dict[int, str] = {}
-                unscheduled: list[int] = []
-                for aid in accounts:
-                    st = states.get((aid, chat.id))
-                    status = classify_pair(
-                        fact_by.get((aid, chat.id)),
-                        state_ok=bool(st and st.status == "ok"),
-                        state_ok_since=st.first_ok_at if st else "",
-                        now=now,
-                        max_age=max_age,
-                        silent_after=silent_after,
-                        chat_alive=chat_alive,
-                    )
-                    statuses[aid] = status
-                    if status == WORKING and not (st and st.status == "ok"):
-                        unscheduled.append(aid)
-                # слоты мёртвых/удалённых/без сессии — всегда освобождаем
-                for aid in current:
-                    if aid not in accounts:
-                        statuses[aid] = NOT_MEMBER
-
-                plan = plan_chat(
-                    interval_minutes=chat.interval_minutes,
-                    current=current,
-                    statuses=statuses,
-                    unscheduled=unscheduled,
-                    chat_index=idx,
-                    chats_total=len(chats),
-                    factor=settings.rebalance_gap_factor,
-                )
-                counts: dict[str, int] = defaultdict(int)
-                for aid, status in statuses.items():
-                    if aid in accounts and status != WORKING:
-                        counts[status] += 1
-                lines.append(_fmt_plan(chat.title, chat.interval_minutes, plan, counts))
+            for an in analyses:
+                chat, plan, current = an.chat, an.plan, an.current
+                lines.append(_fmt_plan(chat.title, chat.interval_minutes, plan, an.counts))
 
                 touched = bool(plan.evict or plan.added or plan.rebalanced or plan.changed)
                 if not touched or plan.skipped_reason:
