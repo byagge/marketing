@@ -53,6 +53,10 @@ class JobRuntime:
 
 runtime = JobRuntime()
 
+# Тяжёлые операции над расписанием (суточная пересборка, перераспределение) не
+# должны идти одновременно: иначе пересборка стирает то, что только что собрали.
+maintenance_lock = asyncio.Lock()
+
 
 class LogSink:
     def __init__(self, store: Store, job_id: int, bot=None, chat_id: int | None = None) -> None:

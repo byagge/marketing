@@ -4,7 +4,7 @@ import math
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
-COVER_HOURS = 23
+DAY_MINUTES = 24 * 60
 MAX_SCHEDULED = 99
 
 
@@ -22,14 +22,21 @@ def resolve_repeat_period(is_premium: bool, configured: int | None) -> int | Non
 
 
 def posts_count_for_interval(interval_minutes: int) -> int:
-    minutes = max(1, int(interval_minutes))
-    needed = max(1, math.ceil((COVER_HOURS * 60) / minutes))
+    """
+    Сколько слотов нужно, чтобы сетка закрывала РОВНО сутки.
+
+    Слот = interval + 1 мин дрейфа. Раньше брали 23 часа — для 60 мин это 23 слота
+    по 61 мин = 23,4 ч, и каждые сутки у всех аккаунтов чата оставалась общая дыра
+    ≈40 мин (около 08:20–09:00, на репите Premium и после суточной пересборки).
+    """
+    step = max(1, int(interval_minutes)) + 1
+    needed = max(1, round(DAY_MINUTES / step))
     return min(needed, MAX_SCHEDULED)
 
 
 def dead_interval(chat_interval: int, dead_setting: int) -> int:
     """Интервал для dead-аккаунта: чаще, но не плотнее, чем покрывают 99 слотов на сутки."""
-    floor = math.ceil((COVER_HOURS * 60) / MAX_SCHEDULED)
+    floor = math.ceil(DAY_MINUTES / MAX_SCHEDULED) - 1
     return max(floor, min(int(chat_interval), int(dead_setting)))
 
 

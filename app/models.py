@@ -190,6 +190,10 @@ class SetupState:
     last_error: str = ""
     account_label: str = ""
     chat_title: str = ""
+    # когда пара впервые стала рабочей (не сбрасывается ночной пересборкой)
+    first_ok_at: str = ""
+    # отпечаток настроек, с которыми собрано расписание (текст/минута/интервал…)
+    sig: str = ""
 
     @property
     def is_ok(self) -> bool:

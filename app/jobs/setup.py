@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 from pathlib import Path
 from typing import Any
 
@@ -37,6 +39,10 @@ from app.tg.sender_push import (
 
 class SetupError(Exception):
     pass
+
+
+# Эти задачи пересобирают расписание часто — для них доливаем недостающее, а не сносим всё.
+SYNC_JOB_KINDS = frozenset({"setup_daily_nonpremium", "rebalance"})
 
 
 async def ensure_minute(store: Store, chat: Chat, account: Account) -> int:
@@ -162,6 +168,23 @@ async def _fail_unavailable(
     return "skipped"
 
 
+def schedule_signature(**parts: Any) -> str:
+    """Отпечаток всего, что влияет на содержимое и время scheduled-сообщений."""
+    raw = json.dumps(parts, sort_keys=True, ensure_ascii=False, default=str)
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
+
+
+def _photo_stamp(path: str | None) -> list[Any] | None:
+    if not path:
+        return None
+    p = Path(path)
+    try:
+        st = p.stat()
+    except OSError:
+        return [path, None, None]
+    return [path, st.st_size, int(st.st_mtime)]
+
+
 async def schedule_one_chat(
     store: Store,
     client: TelegramClient,
@@ -174,9 +197,13 @@ async def schedule_one_chat(
     is_premium: bool = False,
     dead: bool = False,
     entity: Any | None = None,
+    sync: bool = False,
 ) -> str:
     """
     Schedule posts for one chat.
+
+    sync=True — если настройки (текст, минута, интервал…) не менялись с прошлой
+    успешной сборки, не пересоздаём всё, а доливаем только недостающие слоты.
 
     dead=True — расходный аккаунт: свой плотный интервал, без минутного слота,
     без setup_states/abandoned, ошибки молча → skipped. entity можно передать
@@ -240,7 +267,15 @@ async def schedule_one_chat(
             )
             offset = phase_offset_minutes(rank, chat.interval_minutes)
     repeat_period = resolve_repeat_period(is_premium, settings.repeat_period)
+    prior = await store.get_setup_state(account.id, chat.id) if (sync and not dead) else None
+    fallback_used = False
 
+    def _sync_for(sig: str) -> bool:
+        return bool(
+            sync and not dead and prior and prior.status == "ok" and prior.sig and prior.sig == sig
+        )
+
+    sig = ""
     try:
         if entity is None:
             entity = await lookup_entity(client, chat)
@@ -272,6 +307,11 @@ async def schedule_one_chat(
         if use_link:
             from_peer, msg_id = post.pick_forward(want_photo=want_media)  # type: ignore[misc]
             assert from_peer is not None
+            sig = schedule_signature(
+                mode="forward", from_peer=str(from_peer), msg_id=int(msg_id),
+                interval=interval, minute=minute, offset=offset,
+                repeat=bool(repeat_period), hour=settings.start_hour,
+            )
             result = await schedule_chat_forwards(
                 client=client,
                 target=entity,
@@ -283,6 +323,7 @@ async def schedule_one_chat(
                 tz=settings.tz,
                 repeat_period=repeat_period,
                 offset_minutes=offset,
+                sync=_sync_for(sig),
             )
             # если фото-ссылка не прошла из-за медиа — пробуем text-link
             if (
@@ -299,6 +340,7 @@ async def schedule_one_chat(
                     or "forbidden" in err.casefold()
                     or result["success"] == 0
                 ):
+                    fallback_used = True
                     await store.update_chat(chat.id, allow_media=0)
                     chat = await store.get_chat(chat.id) or chat
                     from_peer2, msg_id2 = post.pick_forward(want_photo=False)  # type: ignore[misc]
@@ -323,6 +365,11 @@ async def schedule_one_chat(
             photo = post.photo_path or None
             if not want_media:
                 photo = None
+            sig = schedule_signature(
+                mode="post", text=text, entities=entities, photo=_photo_stamp(photo),
+                allow_media=want_media, interval=interval, minute=minute,
+                offset=offset, repeat=bool(repeat_period), hour=settings.start_hour,
+            )
             result = await schedule_chat_posts(
                 client=client,
                 target=entity,
@@ -336,8 +383,10 @@ async def schedule_one_chat(
                 photo_path=photo,
                 allow_media=want_media,
                 offset_minutes=offset,
+                sync=_sync_for(sig),
             )
             if result.get("media_blocked") and want_media:
+                fallback_used = True
                 await store.update_chat(chat.id, allow_media=0)
                 await log.emit(
                     f"{account.label}: «{chat.title}»: фото запрещено — дальше только текст"
@@ -402,7 +451,8 @@ async def schedule_one_chat(
         )
         return "skipped"
 
-    await store.record_setup_ok(account.id, chat.id)
+    # при откате на текст/ссылку фактический контент ≠ sig → пусть следующий раз соберёт заново
+    await store.record_setup_ok(account.id, chat.id, "" if fallback_used else sig)
     tag_note = f" | тег {chat.tag}" if chat.tag.strip() else ""
     mode_note = " | forward" if result.get("mode") == "forward" else ""
     photo_note = ""
@@ -437,6 +487,7 @@ async def schedule_chats_batch(
     is_premium: bool = False,
     dead: bool = False,
     entities: dict[int, Any] | None = None,
+    sync: bool = False,
 ) -> dict[str, list[str]]:
     """Schedule many chats; never aborts the whole batch on a missing chat."""
     buckets: dict[str, list[str]] = {
@@ -460,6 +511,7 @@ async def schedule_chats_batch(
             is_premium=is_premium,
             dead=dead,
             entity=(entities or {}).get(chat.id),
+            sync=sync,
         )
         if outcome == "stopped":
             raise SetupError("Остановлено")
@@ -862,6 +914,8 @@ async def run_setup_chats_only(
                 skip_abandoned=skip_abandoned,
                 job_kind=job_kind,
                 is_premium=is_premium,
+                # ночная пересборка/перераспределение: не трогаем то, что уже стоит как надо
+                sync=job_kind in SYNC_JOB_KINDS,
             )
         report = (
             f"{account.label}: ok={len(buckets.get('ok', []))} "

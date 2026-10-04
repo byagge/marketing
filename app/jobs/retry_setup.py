@@ -6,6 +6,7 @@ from collections import defaultdict
 from aiogram import Bot
 
 from app.config import get_settings
+from app.jobs import maintenance_lock
 from app.jobs.health import run_health_all
 from app.jobs.parallel import map_batches, setup_parallel_defaults
 from app.jobs.setup import run_dead_schedule, run_setup_chats_only
@@ -152,6 +153,14 @@ async def run_weekly_recheck(store: Store, bot: Bot, admin_chat_id: int) -> None
 
 
 async def run_nonpremium_daily_reschedule(
+    store: Store, bot: Bot | None, admin_chat_id: int | None
+) -> str:
+    # не параллельно с перераспределением слотов (оно пересобирает те же расписания)
+    async with maintenance_lock:
+        return await _run_nonpremium_daily_reschedule(store, bot, admin_chat_id)
+
+
+async def _run_nonpremium_daily_reschedule(
     store: Store, bot: Bot | None, admin_chat_id: int | None
 ) -> str:
     """
