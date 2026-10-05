@@ -17,6 +17,8 @@ class Account:
     sender_account_id: str = ""
     is_premium: int = 0
     online_ping: int = 1
+    # 1 = «dead account»: расходник, без строгих проверок, шлёт во все доступные чаты
+    is_dead: int = 0
     status: str = "idle"
     last_error: str = ""
     created_at: str = ""
@@ -30,6 +32,10 @@ class Account:
     @property
     def is_spam_limited(self) -> bool:
         return self.spam_status == "limited"
+
+    @property
+    def dead(self) -> bool:
+        return bool(self.is_dead)
 
     @property
     def display(self) -> str:
@@ -193,6 +199,10 @@ class SetupState:
     last_error: str = ""
     account_label: str = ""
     chat_title: str = ""
+    # когда пара впервые стала рабочей (не сбрасывается ночной пересборкой)
+    first_ok_at: str = ""
+    # отпечаток настроек, с которыми собрано расписание (текст/минута/интервал…)
+    sig: str = ""
 
     @property
     def is_ok(self) -> bool:

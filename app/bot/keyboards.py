@@ -91,7 +91,7 @@ def main_menu() -> InlineKeyboardMarkup:
             [ib("Таблица", "table", icon="clock"), ib("Sender", "sender", icon="link")],
             [ib("Факты отправки", "fact", icon="chart"), ib("Баны / муты", "restr", icon="shield")],
             [ib("Аккаунты", "accounts", icon="user"), ib("Online", "online", icon="star")],
-            [ib("Session", "mk_session", icon="inbox")],
+            [ib("Session", "mk_session", icon="inbox"), ib("Экспорт", "export", icon="chart")],
             [ib("Отчёты", "reports", icon="chart"), ib("Проверка", "health", icon="search")],
             [ib("Инфо", "info", icon="info")],
         ]
@@ -132,6 +132,8 @@ def account_kb(acc: Account, running: bool = False) -> InlineKeyboardMarkup:
     )
     ping_label = "Online ping: вкл" if acc.online_ping_enabled else "Online ping: выкл"
     ping_icon = "check" if acc.online_ping_enabled else "block"
+    dead_label = "\U0001F480 Dead-режим: вкл" if acc.dead else "Dead-режим: выкл"
+    dead_icon = "warn" if acc.dead else "check"
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [start],
@@ -148,6 +150,7 @@ def account_kb(acc: Account, running: bool = False) -> InlineKeyboardMarkup:
             [ib("Вступить по папке", "acc_folder", acc.id, icon="folder")],
             [ib("Проверить schedule", "health_go", acc.id, icon="search")],
             [ib(ping_label, "acc_online", acc.id, icon=ping_icon)],
+            [ib(dead_label, "acc_dead", acc.id, icon=dead_icon)],
             [
                 ib("Telethon", "acc_tl", acc.id, icon="lock"),
                 ib("Pyrogram", "acc_pg", acc.id, icon="monitor"),
@@ -330,6 +333,7 @@ def table_chats_kb(
     else:
         rows.append([ib("Перенастроить все", "tbl_reall", icon="robot")])
     rows.append([ib("Факт: последний час / сутки", "fact", icon="chart")])
+    rows.append([ib("Перераспределить по факту", "tbl_smart", icon="search")])
     rows.append([ib("Только таблицу", "tbl_rebal", icon="stack")])
     rows.append([ib("Скачать Excel", "tbl_dl", icon="inbox")])
     rows.append([ib("Загрузить Excel", "tbl_ul", icon="folder")])

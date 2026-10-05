@@ -54,6 +54,27 @@ class Settings(BaseSettings):
     # Empty / unset → start_hour - 1 (wrapped).
     nonpremium_reschedule_hour: int | None = None
 
+    # Без Premium (нет repeat): держим расписание на столько часов дальше суток, чтобы
+    # опоздавшая ночная пересборка не оставляла чат без отправок.
+    nonpremium_extra_hours: float = 6.0
+
+    # Dead account (расходник): пост во все доступные чаты максимально часто.
+    # Минимум ≈14 мин, иначе 99 scheduled-слотов не покрывают сутки.
+    dead_interval_minutes: int = 15
+
+    # Перераспределение слотов по фактически работающим аккаунтам.
+    auto_rebalance: bool = True
+    rebalance_every_hours: float = 3.0
+    # перекос: макс. пауза > ideal * factor (и > ideal + 2 мин) → раздвигаем
+    rebalance_gap_factor: float = 1.5
+    # факты (членство/права/отправки) старше этого считаем устаревшими → «unknown»
+    facts_max_age_hours: float = 30.0
+    # перед перераспределением не пересобираем факты, если им меньше N минут
+    facts_fresh_minutes: int = 120
+    facts_chat_pause_sec: float = 0.3
+    # настроено давно, но за сутки 0 отправок → «молчит»
+    silent_after_hours: float = 26.0
+
     # Keep Telethon accounts looking active (UpdateStatus online → offline).
     # Interval ~3.5h ± 30m ≈ каждые 3–4 часа.
     online_ping_hours: float = 3.5

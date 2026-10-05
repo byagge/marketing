@@ -1,5 +1,6 @@
 from app.bot.handlers.acc_chats import router as acc_chats_router
 from app.bot.handlers.accounts import router as accounts_router
+from app.bot.handlers.balance import router as balance_router
 from app.bot.handlers.chats import router as chats_router
 from app.bot.handlers.facts import router as facts_router
 from app.bot.handlers.membership import router as membership_router
@@ -15,6 +16,7 @@ from app.bot.handlers.table import router as table_router
 __all__ = [
     "acc_chats_router",
     "accounts_router",
+    "balance_router",
     "facts_router",
     "restrictions_router",
     "chats_router",

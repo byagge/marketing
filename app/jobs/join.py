@@ -366,7 +366,11 @@ async def run_join_all_accounts(
 ) -> str:
     from app.jobs.parallel import map_batches, setup_parallel_defaults
 
-    accounts = [a for a in await store.list_accounts() if a.telethon_session]
+    accounts = [
+        a
+        for a in await store.list_accounts()
+        if a.telethon_session and not a.is_dead
+    ]
     job = await store.create_job("join_all_accounts", None)
     log = LogSink(store, job.id, bot, admin_chat_id)
     lines: list[str] = []

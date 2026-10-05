@@ -11,7 +11,9 @@ from telethon.errors import FloodWaitError, RPCError
 from telethon.tl import functions, types
 
 from app.utils.entities import to_telethon_entities
-from app.utils.schedule import build_schedule_times, posts_count_for_interval
+from datetime import timedelta
+
+from app.utils.schedule import MAX_SCHEDULED, build_schedule_times, posts_count_for_interval
 
 log = logging.getLogger(__name__)
 
@@ -112,6 +114,59 @@ async def fetch_scheduled(client: TelegramClient, target_entity) -> list:
             await flood_sleep(e)
 
 
+def extend_horizon(
+    times: list[datetime], extra_hours: float, repeat_period: int | None, tz
+) -> list[datetime]:
+    """
+    Без repeat расписание живёт ровно до следующей пересборки. Добавляем слоты
+    «завтрашнего» дня на extra_hours вперёд (сегодняшние ближайшие + 1 день),
+    чтобы пересборка, пришедшая позже вчерашней, не оставила чат пустым.
+    Не добавляем, если упрёмся в лимит Telegram на scheduled в чате.
+    """
+    if repeat_period or not extra_hours or not times:
+        return times
+    horizon = datetime.now(tz) + timedelta(hours=float(extra_hours))
+    extra = [t + timedelta(days=1) for t in times if t <= horizon]
+    merged = sorted(set(times) | set(extra))
+    return merged if len(merged) <= MAX_SCHEDULED else times
+
+
+def _minute_key(dt: datetime) -> int:
+    """Ключ минуты (UTC epoch/60): Telegram хранит время scheduled с точностью до секунды."""
+    return int(dt.timestamp() // 60)
+
+
+async def reconcile_scheduled(
+    client: TelegramClient,
+    target_entity,
+    times: list[datetime],
+) -> tuple[list[datetime], list[int], int]:
+    """
+    Сверить уже стоящие scheduled с нужной сеткой.
+
+    Returns: (чего не хватает — создать, лишние id — удалить, сколько уже стоит как надо).
+    Позволяет не пересоздавать ~24 сообщения на пару каждую ночь: экономит FloodWait
+    и не оставляет аккаунт без расписания на время пересборки.
+    """
+    old = await fetch_scheduled(client, target_entity)
+    by_minute: dict[int, list[Any]] = {}
+    for m in old:
+        date = getattr(m, "date", None)
+        if date is None:
+            continue
+        by_minute.setdefault(_minute_key(date), []).append(m)
+    keep_ids: set[int] = set()
+    missing: list[datetime] = []
+    for when in times:
+        bucket = by_minute.get(_minute_key(when))
+        if bucket:
+            keep_ids.add(bucket.pop(0).id)
+        else:
+            missing.append(when)
+    stale = [m.id for m in old if m.id not in keep_ids]
+    return missing, stale, len(keep_ids)
+
+
 async def delete_scheduled(
     client: TelegramClient,
     target_entity,
@@ -121,7 +176,20 @@ async def delete_scheduled(
     messages = await fetch_scheduled(client, target_entity)
     if not messages:
         return 0
-    ids = [m.id for m in messages]
+    return await delete_scheduled_ids(
+        client, target_entity, [m.id for m in messages], pause=pause
+    )
+
+
+async def delete_scheduled_ids(
+    client: TelegramClient,
+    target_entity,
+    ids: list[int],
+    *,
+    pause: float = 0.12,
+) -> int:
+    if not ids:
+        return 0
     deleted = 0
     for start in range(0, len(ids), 100):
         batch = ids[start : start + 100]
@@ -251,6 +319,9 @@ async def schedule_chat_posts(
     clear_existing: bool = True,
     pause: float = 0.7,
     rolling: bool = False,
+    offset_minutes: int = 0,
+    sync: bool = False,
+    extra_hours: float = 0.0,
 ) -> dict[str, Any]:
     from app.config import get_settings
 
@@ -267,10 +338,6 @@ async def schedule_chat_posts(
         or getattr(entity, "username", None)
         or str(utils.get_peer_id(entity))
     )
-    cleared = 0
-    if clear_existing:
-        cleared = await delete_scheduled(client, entity, pause=del_pause)
-
     count = None if rolling else posts_count_for_interval(interval_minutes)
     times = build_schedule_times(
         start_minute=start_minute,
@@ -279,15 +346,28 @@ async def schedule_chat_posts(
         tz=tz,
         start_hour=start_hour,
         rolling=rolling,
+        offset_minutes=offset_minutes,
     )
+    times = extend_horizon(times, extra_hours, repeat_period, tz)
+    cleared = 0
+    kept = 0
+    todo = times
+    if clear_existing:
+        if sync:
+            todo, stale_ids, kept = await reconcile_scheduled(client, entity, times)
+            cleared = await delete_scheduled_ids(
+                client, entity, stale_ids, pause=del_pause
+            )
+        else:
+            cleared = await delete_scheduled(client, entity, pause=del_pause)
 
-    success = 0
+    success = kept
     last_error = ""
     media_blocked = False
     used_photo_any = False
     period = int(repeat_period) if repeat_period else None
     effective_allow = allow_media
-    for i, when in enumerate(times, start=1):
+    for i, when in enumerate(todo, start=1):
         try:
             _sent, used_photo = await send_scheduled_post(
                 client=client,
@@ -335,6 +415,7 @@ async def schedule_chat_posts(
         "title": title,
         "peer_id": int(utils.get_peer_id(entity)),
         "cleared": cleared,
+        "kept": kept,
         "planned": len(times),
         "success": success,
         "error": last_error,
@@ -360,6 +441,9 @@ async def schedule_chat_forwards(
     clear_existing: bool = True,
     pause: float = 0.7,
     rolling: bool = False,
+    offset_minutes: int = 0,
+    sync: bool = False,
+    extra_hours: float = 0.0,
 ) -> dict[str, Any]:
     """Запланировать пересылки одного сообщения (с меткой Forwarded from)."""
     from app.config import get_settings
@@ -377,10 +461,6 @@ async def schedule_chat_forwards(
         or getattr(entity, "username", None)
         or str(utils.get_peer_id(entity))
     )
-    cleared = 0
-    if clear_existing:
-        cleared = await delete_scheduled(client, entity, pause=del_pause)
-
     count = None if rolling else posts_count_for_interval(interval_minutes)
     times = build_schedule_times(
         start_minute=start_minute,
@@ -389,12 +469,25 @@ async def schedule_chat_forwards(
         tz=tz,
         start_hour=start_hour,
         rolling=rolling,
+        offset_minutes=offset_minutes,
     )
+    times = extend_horizon(times, extra_hours, repeat_period, tz)
+    cleared = 0
+    kept = 0
+    todo = times
+    if clear_existing:
+        if sync:
+            todo, stale_ids, kept = await reconcile_scheduled(client, entity, times)
+            cleared = await delete_scheduled_ids(
+                client, entity, stale_ids, pause=del_pause
+            )
+        else:
+            cleared = await delete_scheduled(client, entity, pause=del_pause)
 
-    success = 0
+    success = kept
     last_error = ""
     period = int(repeat_period) if repeat_period else None
-    for when in times:
+    for when in todo:
         try:
             await send_scheduled_forward(
                 client,
@@ -414,6 +507,7 @@ async def schedule_chat_forwards(
         "title": title,
         "peer_id": int(utils.get_peer_id(entity)),
         "cleared": cleared,
+        "kept": kept,
         "planned": len(times),
         "success": success,
         "error": last_error,

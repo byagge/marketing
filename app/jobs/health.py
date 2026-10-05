@@ -59,7 +59,7 @@ async def run_health_all(store: Store, bot: Bot, admin_chat_id: int) -> None:
         return
     await safe_send(bot, admin_chat_id, f"Недельная проверка schedule | {len(accounts)} аккаунтов")
     for acc in accounts:
-        if not acc.telethon_session:
+        if not acc.telethon_session or acc.is_dead:
             continue
         try:
             await run_health(store, acc.id, bot, admin_chat_id)

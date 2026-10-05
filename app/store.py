@@ -107,6 +107,20 @@ CREATE TABLE IF NOT EXISTS setup_states (
     UNIQUE(account_id, chat_pk)
 );
 
+CREATE TABLE IF NOT EXISTS chat_facts (
+    account_id INTEGER NOT NULL,
+    chat_pk INTEGER NOT NULL,
+    member INTEGER,
+    can_send INTEGER,
+    mute_until TEXT NOT NULL DEFAULT '',
+    sent_24h INTEGER,
+    last_sent_at TEXT NOT NULL DEFAULT '',
+    error TEXT NOT NULL DEFAULT '',
+    checked_at TEXT NOT NULL DEFAULT '',
+    scheduled_count INTEGER,
+    PRIMARY KEY (account_id, chat_pk)
+);
+
 CREATE TABLE IF NOT EXISTS settings (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
@@ -413,6 +427,30 @@ async def _migrate_accounts_premium(db: aiosqlite.Connection) -> None:
         await db.execute(
             "ALTER TABLE accounts ADD COLUMN online_ping INTEGER NOT NULL DEFAULT 1"
         )
+    if "is_dead" not in cols:
+        await db.execute(
+            "ALTER TABLE accounts ADD COLUMN is_dead INTEGER NOT NULL DEFAULT 0"
+        )
+
+
+async def _migrate_chat_facts(db: aiosqlite.Connection) -> None:
+    cur = await db.execute("PRAGMA table_info(chat_facts)")
+    cols = [row[1] for row in await cur.fetchall()]
+    if cols and "scheduled_count" not in cols:
+        await db.execute("ALTER TABLE chat_facts ADD COLUMN scheduled_count INTEGER")
+
+
+async def _migrate_setup_states(db: aiosqlite.Connection) -> None:
+    cur = await db.execute("PRAGMA table_info(setup_states)")
+    cols = [row[1] for row in await cur.fetchall()]
+    if not cols:
+        return
+    if "first_ok_at" not in cols:
+        await db.execute(
+            "ALTER TABLE setup_states ADD COLUMN first_ok_at TEXT NOT NULL DEFAULT ''"
+        )
+    if "sig" not in cols:
+        await db.execute("ALTER TABLE setup_states ADD COLUMN sig TEXT NOT NULL DEFAULT ''")
 
 
 async def _migrate_accounts_spam(db: aiosqlite.Connection) -> None:
@@ -464,6 +502,7 @@ def _account(row: aiosqlite.Row) -> Account:
         sender_account_id=row["sender_account_id"] or "",
         is_premium=int(row["is_premium"] if "is_premium" in keys else 0) or 0,
         online_ping=online_ping,
+        is_dead=int(row["is_dead"] or 0) if "is_dead" in keys else 0,
         status=row["status"] or "idle",
         last_error=row["last_error"] or "",
         created_at=row["created_at"] or "",
@@ -541,6 +580,8 @@ def _setup_state(row: aiosqlite.Row) -> SetupState:
         last_error=row["last_error"] or "",
         account_label=(row["account_label"] if "account_label" in keys else "") or "",
         chat_title=(row["chat_title"] if "chat_title" in keys else "") or "",
+        first_ok_at=(row["first_ok_at"] if "first_ok_at" in keys else "") or "",
+        sig=(row["sig"] if "sig" in keys else "") or "",
     )
 
 
@@ -598,6 +639,8 @@ class Store:
             await _migrate_accounts_premium(db)
             await _migrate_accounts_spam(db)
             await _migrate_chats_invite(db)
+            await _migrate_setup_states(db)
+            await _migrate_chat_facts(db)
             for key, value in DEFAULT_SETTINGS.items():
                 await db.execute(
                     "INSERT OR IGNORE INTO settings(key, value) VALUES(?, ?)",
@@ -764,6 +807,7 @@ class Store:
             await db.execute("PRAGMA foreign_keys = ON")
             await db.execute("DELETE FROM setup_states WHERE account_id=?", (account_id,))
             await db.execute("DELETE FROM minute_slots WHERE account_id=?", (account_id,))
+            await db.execute("DELETE FROM chat_facts WHERE account_id=?", (account_id,))
             await db.execute("DELETE FROM posts WHERE account_id=?", (account_id,))
             for table in (
                 "send_events",
@@ -1040,6 +1084,7 @@ class Store:
             await db.execute("DELETE FROM send_events WHERE chat_pk=?", (chat_pk,))
             await db.execute("DELETE FROM send_scans WHERE chat_pk=?", (chat_pk,))
             await db.execute("DELETE FROM chat_restrictions WHERE chat_pk=?", (chat_pk,))
+            await db.execute("DELETE FROM chat_facts WHERE chat_pk=?", (chat_pk,))
             await db.execute("DELETE FROM chats WHERE id=?", (chat_pk,))
             await db.commit()
 
@@ -1058,16 +1103,22 @@ class Store:
             row = await cur.fetchone()
         return _setup_state(row) if row else None
 
-    async def record_setup_ok(self, account_id: int, chat_pk: int) -> SetupState:
+    async def record_setup_ok(
+        self, account_id: int, chat_pk: int, sig: str = ""
+    ) -> SetupState:
         now = _now()
         async with self._connect() as db:
             await db.execute(
                 "INSERT INTO setup_states(account_id, chat_pk, status, fail_count, "
-                "last_attempt_at, last_error) VALUES(?, ?, 'ok', 0, ?, '') "
+                "last_attempt_at, last_error, first_ok_at, sig) "
+                "VALUES(?, ?, 'ok', 0, ?, '', ?, ?) "
                 "ON CONFLICT(account_id, chat_pk) DO UPDATE SET "
                 "status='ok', fail_count=0, last_attempt_at=excluded.last_attempt_at, "
-                "last_error=''",
-                (account_id, chat_pk, now),
+                "last_error='', sig=excluded.sig, "
+                "first_ok_at=CASE WHEN setup_states.status='ok' "
+                "AND setup_states.first_ok_at<>'' THEN setup_states.first_ok_at "
+                "ELSE excluded.first_ok_at END",
+                (account_id, chat_pk, now, now, sig or ""),
             )
             await db.commit()
         state = await self.get_setup_state(account_id, chat_pk)
@@ -1158,6 +1209,7 @@ class Store:
                 "JOIN chats c ON c.id=s.chat_pk "
                 "LEFT JOIN accounts a ON a.id=s.account_id "
                 "WHERE s.status='pending' "
+                "AND COALESCE(a.is_dead, 0)=0 "
                 "AND s.fail_count < ? "
                 "AND c.enabled=1 AND c.kind='schedule' "
                 "AND ("
@@ -1334,6 +1386,80 @@ class Store:
                 (chat_pk, account_id),
             )
             await db.commit()
+
+    async def raw_rows(self, sql: str, args: tuple = ()) -> list[dict[str, Any]]:
+        """Только чтение (для экспорта отчёта): произвольный SELECT → список словарей."""
+        if not sql.lstrip().lower().startswith("select"):
+            raise ValueError("raw_rows: только SELECT")
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(sql, args)
+            return [dict(r) for r in await cur.fetchall()]
+
+    async def upsert_fact(self, fact) -> None:
+        """Факт по паре «аккаунт × чат» (членство, права, отправки за 24 ч)."""
+        async with self._connect() as db:
+            await db.execute(
+                "INSERT INTO chat_facts(account_id, chat_pk, member, can_send, "
+                "mute_until, sent_24h, last_sent_at, error, checked_at, scheduled_count) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?) "
+                "ON CONFLICT(account_id, chat_pk) DO UPDATE SET "
+                "member=excluded.member, can_send=excluded.can_send, "
+                "mute_until=excluded.mute_until, sent_24h=excluded.sent_24h, "
+                "last_sent_at=excluded.last_sent_at, error=excluded.error, "
+                "checked_at=excluded.checked_at, "
+                "scheduled_count=excluded.scheduled_count",
+                (
+                    fact.account_id,
+                    fact.chat_pk,
+                    fact.member,
+                    fact.can_send,
+                    fact.mute_until or "",
+                    fact.sent_24h,
+                    fact.last_sent_at or "",
+                    fact.error or "",
+                    fact.checked_at or "",
+                    getattr(fact, "scheduled_count", None),
+                ),
+            )
+            await db.commit()
+
+    async def list_facts(self, account_id: int | None = None) -> list:
+        from app.utils.balance import PairFact
+
+        sql = "SELECT * FROM chat_facts"
+        args: list[Any] = []
+        if account_id is not None:
+            sql += " WHERE account_id=?"
+            args.append(account_id)
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(sql, args)
+            rows = await cur.fetchall()
+        return [
+            PairFact(
+                account_id=r["account_id"],
+                chat_pk=r["chat_pk"],
+                member=r["member"],
+                can_send=r["can_send"],
+                mute_until=r["mute_until"] or "",
+                sent_24h=r["sent_24h"],
+                last_sent_at=r["last_sent_at"] or "",
+                error=r["error"] or "",
+                checked_at=r["checked_at"] or "",
+                scheduled_count=r["scheduled_count"],
+            )
+            for r in rows
+        ]
+
+    async def delete_slots_for_account(self, account_id: int) -> int:
+        """Освободить все минутные слоты аккаунта (для dead-режима)."""
+        async with self._connect() as db:
+            cur = await db.execute(
+                "DELETE FROM minute_slots WHERE account_id=?", (account_id,)
+            )
+            await db.commit()
+            return int(cur.rowcount or 0)
 
     async def occupied_minutes(self, chat_pk: int, exclude_account: int | None = None) -> list[int]:
         slots = await self.slots_for_chat(chat_pk)

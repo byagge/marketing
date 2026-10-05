@@ -20,7 +20,7 @@ def test_past_slots_move_to_tomorrow():
 
 
 def test_posts_count_hour():
-    assert posts_count_for_interval(60) == 23
+    assert posts_count_for_interval(60) == 24
 
 
 def test_half_hour_count():
@@ -73,3 +73,22 @@ def test_fixed_grid_loses_morning_slots_when_job_is_late():
     times = build_schedule_times(5, 60, now=now, tz=tz, start_hour=9)
     # слоты 09:05 и 10:06 уехали на завтра — сегодня они потеряны
     assert sum(1 for t in times if t.day == 3 and t.hour in (9, 10)) >= 2
+
+
+def _max_daily_gap(minutes, interval):
+    """Макс. пауза между отправками чата за сутки (репит 24 ч → считаем по кругу)."""
+    now = datetime(2026, 10, 4, 8, 0, tzinfo=TZ)
+    pts = set()
+    for m in minutes:
+        for t in build_schedule_times(m, interval, now=now, tz=TZ, start_hour=9):
+            pts.add(t.hour * 60 + t.minute)
+    pts = sorted(pts)
+    return max(((pts[(i + 1) % len(pts)] - pts[i]) % 1440) or 1440 for i in range(len(pts)))
+
+
+def test_daily_grid_has_no_morning_hole():
+    # регрессия: при 23 слотах пауза доходила до ~43 мин около 08:20
+    even12 = [(i * 60) // 12 for i in range(12)]
+    even30 = [(i * 60) // 30 for i in range(30)]
+    assert _max_daily_gap(even12, 60) <= 7
+    assert _max_daily_gap(even30, 60) <= 4
