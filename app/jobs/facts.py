@@ -256,6 +256,28 @@ async def run_facts_collection(
     if bot and admin_chat_id and (not quiet or failed_names):
         await safe_send(bot, admin_chat_id, summary)
     log.info(summary)
+    # Самолечение: после фактов в фоне перераспределить слоты (если дыры).
+    # collect=True — PairFact для balance; notify=changes — человеку только если что-то чинили.
+    try:
+        from app.config import get_settings as _gs
+        from app.jobs.balance import run_smart_rebalance
+
+        if _gs().auto_rebalance and not runtime.is_running("smart_rebalance", 0):
+
+            async def _reb() -> None:
+                try:
+                    await run_smart_rebalance(
+                        store, bot, admin_chat_id, collect=True, notify="changes"
+                    )
+                except Exception:  # noqa: BLE001
+                    log.exception("post-facts auto rebalance failed")
+
+            try:
+                runtime.spawn("smart_rebalance", 0, _reb())
+            except RuntimeError:
+                pass
+    except Exception:  # noqa: BLE001
+        log.exception("post-facts auto rebalance schedule failed")
     return summary
 
 

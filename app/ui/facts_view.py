@@ -91,6 +91,8 @@ async def window_view(
         f"({get_settings().timezone}) · отправок: {len(events)}"
     )
     # серым — минуты, по которым данных ещё нет (сбор раз в час / сбор был позже)
+    from app.jobs import runtime
+
     scans = await store.list_scans()
     collected_until = max((parse_utc(sc[2]) for sc in scans if parse_utc(sc[2])), default=None)
     first_event = parse_utc(await store.first_send_at())
@@ -101,12 +103,22 @@ async def window_view(
             grey.add(i)
         elif first_event is not None and t < first_event:
             grey.add(i)
+    collected_minutes = max(0, minutes - len(grey))
+    collecting = runtime.is_running("facts", 0)
     footer = (
         "Закрашено — отправка подтверждена историей чата; пусто — не отправлено; "
         "серое — данные ещё не собраны"
         if grey
         else ""
     )
+    if grey:
+        subtitle += (
+            f" · данные собраны до "
+            f"{fmt_local(collected_until, '%H:%M') if collected_until else '—'} "
+            f"({collected_minutes}/{minutes} мин)"
+        )
+    if collecting:
+        subtitle += " · идёт сбор…"
     png = try_grid_png(
         title,
         subtitle,
@@ -117,8 +129,6 @@ async def window_view(
         footer=footer,
         grey_rows=grey,
     )
-    if grey:
-        subtitle += f" · данные собраны до {fmt_local(collected_until, '%H:%M') if collected_until else '—'}"
 
     per_chat: dict[int, list[datetime]] = {}
     for _a, chat_pk, sent_at in events:
@@ -126,32 +136,50 @@ async def window_view(
         if dt:
             per_chat.setdefault(chat_pk, []).append(dt.astimezone(tz))
     expected = await _expected_by_chat(store)
-    factor = minutes / 60.0
+    # Норму считаем только по уже собранным минутам — иначе «10 из 574» пугает впустую.
+    factor = (collected_minutes / 60.0) if minutes else 0.0
+    known_end = (
+        collected_until.astimezone(tz)
+        if collected_until is not None
+        else base
+    )
+    known_end = min(known_end, end_local)
+    if known_end < base:
+        known_end = base
 
     lines = [
         f"{pe('chart')} <b>{escape(title)}</b>",
         f"{escape(subtitle)}",
     ]
+    if collecting or (grey and collected_minutes < minutes):
+        lines.append(
+            f"{pe('warn')} Окно ещё не дочитано — серое ≠ «не отправили». "
+            f"Норма ниже пересчитана на собранные {collected_minutes} мин."
+        )
     exp_total = sum(expected.get(c.id, 0.0) for c in chats) * factor
     lines.append(
         f"Всего: <b>{len(events)}</b> в <b>{len(per_chat)}</b> из {len(chats)} чатов "
-        f"(ожидалось ≈{exp_total:.0f})"
+        f"(ожидалось ≈{exp_total:.0f}"
+        + (f" за {collected_minutes} мин" if collected_minutes < minutes else "")
+        + ")"
     )
     for chat in chats:
         if not is_priority(chat):
             continue
         times = per_chat.get(chat.id, [])
         exp = expected.get(chat.id, 0.0) * factor
-        pause = _max_pause(times, base, end_local)
+        pause = _max_pause(times, base, known_end if known_end > base else end_local)
         lines.append(
             f"{pe('star')} <b>{escape(chat.display_name)}</b>: {len(times)} "
             f"(ожид. ≈{exp:.0f}) · макс. пауза {pause} мин"
         )
-    silent = [c.display_name for c in chats if c.id not in per_chat]
-    if silent:
-        names = ", ".join(escape(n) for n in silent[:6])
-        more = f" +{len(silent) - 6}" if len(silent) > 6 else ""
-        lines.append(f"{pe('block')} Без отправок: {names}{more}")
+    # «Без отправок» только когда окно уже собрано — иначе ложная тревога.
+    if collected_minutes >= minutes and not collecting:
+        silent = [c.display_name for c in chats if c.id not in per_chat]
+        if silent:
+            names = ", ".join(escape(n) for n in silent[:6])
+            more = f" +{len(silent) - 6}" if len(silent) > 6 else ""
+            lines.append(f"{pe('block')} Без отправок: {names}{more}")
     if len(chats) > MAX_COLS:
         lines.append(f"<i>Показаны первые {MAX_COLS} чатов из {len(chats)}</i>")
     lines.append(await _freshness(store))

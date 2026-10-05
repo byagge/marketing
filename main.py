@@ -261,6 +261,15 @@ async def main() -> None:
         replace_existing=True,
         run_date=mk_startup,
     )
+    # После рестарта сразу дочитать факты (а не ждать :07) → дальше авто-rebalance.
+    facts_startup = datetime.now(scheduler.timezone) + timedelta(minutes=1)
+    scheduler.add_job(
+        facts_tick,
+        "date",
+        id="facts_startup",
+        replace_existing=True,
+        run_date=facts_startup,
+    )
     morning_args = marketer_morning_cron_args()
     scheduler.add_job(
         marketer_morning,
