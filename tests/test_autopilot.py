@@ -1,0 +1,350 @@
+import contextvars
+from contextlib import asynccontextmanager
+from pathlib import Path
+
+import pytest
+
+from app.config import Settings
+from app.jobs import autopilot
+from app.store import Store
+from app.tg.join import JoinResult, MembershipReport
+
+
+class FakeBot:
+    def __init__(self) -> None:
+        self.sent: list[tuple[int, str]] = []
+
+    async def send_message(self, chat_id, text, **kw):
+        self.sent.append((chat_id, text))
+
+
+@pytest.fixture
+async def store(tmp_path: Path):
+    db = Store(tmp_path / "ap.db")
+    await db.init()
+    return db
+
+
+@pytest.fixture
+def world(monkeypatch):
+    """Подмена Telethon: членство и вступление задаются тестом."""
+
+    class World:
+        member: set[tuple[str, int]] = set()  # (label, chat_pk) уже в чате
+        join_status: dict[tuple[str, int], tuple[str, str]] = {}
+        joins: list[tuple[str, int]] = []
+        setup_calls: list[tuple[int, list[int]]] = []
+        sender_calls: list[int] = []
+        _var = contextvars.ContextVar("acc", default="")
+
+        @property
+        def current(self) -> str:
+            return self._var.get()
+
+        @current.setter
+        def current(self, value: str) -> None:
+            self._var.set(value)
+
+    w = World()
+    w.member, w.join_status, w.joins = set(), {}, []
+    w.setup_calls, w.sender_calls = [], []
+
+    cfg = Settings(
+        _env_file=None,
+        autopilot_join_pause_min_sec=0,
+        autopilot_join_pause_max_sec=0,
+        autopilot_join_per_tick=3,
+    )
+    monkeypatch.setattr(autopilot, "get_settings", lambda: cfg)
+
+    @asynccontextmanager
+    async def fake_open(acc):
+        w.current = acc.label
+        yield object()
+
+    async def fake_check(client, chats):
+        rep = MembershipReport()
+        for chat in chats:
+            if (w.current, chat.id) in w.member:
+                rep.joined.append(chat)
+            elif chat.has_join_link:
+                rep.missing.append(chat)
+            else:
+                rep.no_link.append(chat)
+        return rep
+
+    async def fake_join(client, chat, **kw):
+        w.joins.append((w.current, chat.id))
+        status, detail = w.join_status.get((w.current, chat.id), ("joined", ""))
+        if status in {"joined", "captcha_ok", "already"}:
+            w.member.add((w.current, chat.id))
+        return JoinResult(chat.display_name, chat.id, status, detail)
+
+    async def fake_setup(store, account_id, chat_pks, bot, admin, **kw):
+        w.setup_calls.append((account_id, list(chat_pks)))
+        titles = [(await store.get_chat(pk)).title for pk in chat_pks]
+        for pk in chat_pks:
+            await store.record_setup_ok(account_id, pk)
+        return {"ok": titles, "skipped": [], "abandoned": [], "config_error": []}
+
+    async def fake_sender(store, account_id, bot, admin, **kw):
+        w.sender_calls.append(account_id)
+        return 1
+
+    monkeypatch.setattr(autopilot, "_open_client", fake_open)
+    monkeypatch.setattr(autopilot, "check_membership", fake_check)
+    monkeypatch.setattr(autopilot, "join_one", fake_join)
+    monkeypatch.setattr(autopilot, "run_setup_chats_only", fake_setup)
+    monkeypatch.setattr(autopilot, "run_sender_refresh", fake_sender)
+    return w
+
+
+async def _acc(store: Store, label: str, **fields):
+    acc = await store.add_account(label)
+    await store.update_account(acc.id, telethon_session=f"/tmp/{label}.session", **fields)
+    return await store.get_account(acc.id)
+
+
+async def test_joins_missing_chat_then_configures_schedule(store, world):
+    acc = await _acc(store, "tron")
+    chat = await store.add_chat("MARKET 404", "-1001", kind="schedule", invite_link="https://t.me/+abc")
+    bot = FakeBot()
+
+    summary = await autopilot.run_autopilot(store, bot, 777, force=True)
+
+    assert world.joins == [("tron", chat.id)]
+    assert world.setup_calls == [(acc.id, [chat.id])]
+    assert len(bot.sent) == 1 and bot.sent[0][0] == 777
+    assert "Вступил" in bot.sent[0][1] and "tron → MARKET 404" in bot.sent[0][1]
+    assert "Настроил отправку" in bot.sent[0][1]
+    st = await store.get_join_state(acc.id, chat.id)
+    assert st.status == "member"
+    assert summary
+
+
+async def test_nothing_to_do_is_silent(store, world):
+    await _acc(store, "tron")
+    chat = await store.add_chat("C", "-1001", kind="schedule", invite_link="https://t.me/+abc")
+    world.member.add(("tron", chat.id))
+    # настройка уже была
+    acc = (await store.list_accounts())[0]
+    await store.record_setup_ok(acc.id, chat.id)
+    bot = FakeBot()
+
+    summary = await autopilot.run_autopilot(store, bot, 777, force=True)
+
+    assert bot.sent == []
+    assert world.joins == [] and world.setup_calls == []
+    assert "всё в порядке" in summary
+
+
+async def test_member_without_setup_gets_configured_without_joining(store, world):
+    acc = await _acc(store, "tron")
+    chat = await store.add_chat("LSA", "-1001", kind="schedule", invite_link="https://t.me/+abc")
+    world.member.add(("tron", chat.id))
+    bot = FakeBot()
+
+    await autopilot.run_autopilot(store, bot, 777, force=True)
+
+    assert world.joins == []
+    assert world.setup_calls == [(acc.id, [chat.id])]
+
+
+async def test_disabled_pair_and_banned_pair_are_left_alone(store, world):
+    acc = await _acc(store, "tron")
+    c_off = await store.add_chat("Off", "-1001", invite_link="https://t.me/+a")
+    c_ban = await store.add_chat("Banned", "-1002", invite_link="https://t.me/+b")
+    c_ok = await store.add_chat("Ok", "-1003", invite_link="https://t.me/+c")
+    await store.set_chat_send_enabled(acc.id, c_off.id, False)
+    await store.record_ban(acc.id, c_ban.id, "join_ban")
+    await store.mark_ban_notified([(await store.get_ban(acc.id, c_ban.id)).id])
+
+    await autopilot.run_autopilot(store, FakeBot(), 1, force=True)
+
+    assert world.joins == [("tron", c_ok.id)]
+
+
+async def test_join_ban_is_recorded_and_reported_once(store, world):
+    acc = await _acc(store, "tron")
+    chat = await store.add_chat("MARKET 404", "-1001", invite_link="https://t.me/+abc")
+    world.join_status[("tron", chat.id)] = (
+        "failed",
+        "UserBannedInChannelError: You're banned from sending messages",
+    )
+    bot = FakeBot()
+
+    await autopilot.run_autopilot(store, bot, 777, force=True)
+
+    ban = await store.get_ban(acc.id, chat.id)
+    assert ban is not None and ban.active and ban.reason == "join_ban" and ban.notified == 1
+    texts = "\n".join(t for _, t in bot.sent)
+    assert "Новые баны" in texts and "MARKET 404" in texts and "tron" in texts
+    assert "Рекомендация" in texts
+
+    # следующий проход: пара забанена → автопилот её не трогает и молчит
+    bot2 = FakeBot()
+    world.joins.clear()
+    await autopilot.run_autopilot(store, bot2, 777, force=True)
+    assert world.joins == []
+    assert bot2.sent == []
+
+
+async def test_flood_stops_account_and_does_not_count_as_failure(store, world):
+    acc = await _acc(store, "tron")
+    c1 = await store.add_chat("A", "-1001", invite_link="https://t.me/+a")
+    c2 = await store.add_chat("B", "-1002", invite_link="https://t.me/+b")
+    world.join_status[("tron", c1.id)] = ("failed", "FloodWait 40s")
+    world.join_status[("tron", c2.id)] = ("failed", "FloodWait 40s")
+
+    await autopilot.run_autopilot(store, FakeBot(), 1, force=True)
+
+    assert len(world.joins) == 1  # после FloodWait аккаунт больше не дёргаем
+    st = await store.get_join_state(acc.id, world.joins[0][1])
+    assert st.fail_count == 0 and st.status == "pending"
+
+
+async def test_join_budget_per_tick(store, world):
+    await _acc(store, "tron")
+    for i in range(5):
+        await store.add_chat(f"C{i}", f"-100{i}", invite_link=f"https://t.me/+h{i}")
+
+    await autopilot.run_autopilot(store, FakeBot(), 1, force=True)
+    assert len(world.joins) == 3  # autopilot_join_per_tick
+
+    world.joins.clear()
+    await autopilot.run_autopilot(store, FakeBot(), 1, force=True)
+    assert len(world.joins) == 2  # остальные на следующем проходе
+
+
+async def test_failed_join_backoff_then_manual_for_bad_invite(store, world):
+    acc = await _acc(store, "tron")
+    chat = await store.add_chat("Dead invite", "-1001", invite_link="https://t.me/+abc")
+    world.join_status[("tron", chat.id)] = ("failed", "инвайт недействителен: InviteHashExpiredError")
+    bot = FakeBot()
+
+    await autopilot.run_autopilot(store, bot, 1, force=True)
+
+    st = await store.get_join_state(acc.id, chat.id)
+    assert st.status == "manual"
+    assert "Нужна помощь" in bot.sent[0][1] and "Dead invite" in bot.sent[0][1]
+
+    world.joins.clear()
+    bot2 = FakeBot()
+    await autopilot.run_autopilot(store, bot2, 1, force=True)
+    assert world.joins == [] and bot2.sent == []  # не долбим, пока не сбросите вручную
+
+    await store.reset_join_states()
+    await autopilot.run_autopilot(store, FakeBot(), 1, force=True)
+    assert world.joins == [("tron", chat.id)]
+
+
+async def test_needs_manual_when_no_way_to_join(store, world):
+    await _acc(store, "tron")
+    await store.add_chat("Nowhere", "nowhere")  # ни ссылки, ни username
+    bot = FakeBot()
+
+    await autopilot.run_autopilot(store, bot, 1, force=True)
+
+    assert world.joins == []
+    assert "Nowhere" in bot.sent[0][1] and "нет ссылки" in bot.sent[0][1]
+    bot2 = FakeBot()
+    await autopilot.run_autopilot(store, bot2, 1, force=True)
+    assert bot2.sent == []  # сообщили один раз
+
+
+async def test_removed_from_chat_confirmed_by_two_checks(store, world):
+    acc = await _acc(store, "tron")
+    chat = await store.add_chat("MARKET 404", "-1001", invite_link="https://t.me/+abc")
+    await store.record_setup_ok(acc.id, chat.id)
+    world.member.add(("tron", chat.id))
+
+    await autopilot.run_autopilot(store, FakeBot(), 1, force=True)  # был в чате
+    world.member.clear()
+
+    bot = FakeBot()
+    await autopilot.run_autopilot(store, bot, 1, force=True)  # 1-й пропуск
+    assert await store.get_ban(acc.id, chat.id) is None
+    assert world.joins == []  # не лезем обратно в чат, из которого, возможно, выкинули
+    assert bot.sent == []
+
+    bot = FakeBot()
+    await autopilot.run_autopilot(store, bot, 1, force=True)  # 2-й пропуск — вылет подтверждён
+    ban = await store.get_ban(acc.id, chat.id)
+    assert ban is not None and ban.reason == "removed" and ban.active
+    text = "\n".join(t for _, t in bot.sent)
+    assert "Вылетели" in text and "Новые баны" in text
+    assert world.joins == []
+
+
+async def test_returning_member_clears_removed_ban(store, world):
+    acc = await _acc(store, "tron")
+    chat = await store.add_chat("C", "-1001", invite_link="https://t.me/+abc")
+    await store.record_ban(acc.id, chat.id, "removed")
+    await store.clear_ban(acc.id, chat.id)  # админ снял метку вручную
+    await store.reset_pair_join(acc.id, chat.id)
+    world.member.add(("tron", chat.id))
+    await autopilot.run_autopilot(store, FakeBot(), 1, force=True)
+    assert await store.active_ban_pairs() == set()
+
+
+async def test_sender_chat_triggers_sender_refresh_only_for_sender_account(store, world):
+    a1 = await _acc(store, "with_sender", sender_account_id="sid1")
+    await _acc(store, "no_sender")
+    chat = await store.add_chat("Услуги", "-1001", kind="sender", invite_link="https://t.me/+abc")
+
+    await autopilot.run_autopilot(store, FakeBot(), 1, force=True)
+
+    assert set(world.joins) == {("with_sender", chat.id), ("no_sender", chat.id)}
+    assert world.sender_calls == [a1.id]
+    assert world.setup_calls == []  # sender-чаты не планируются через schedule
+
+
+async def test_sender_off_account_still_joins_but_not_refreshed(store, world):
+    await _acc(store, "off", sender_account_id="sid1", sender_enabled=0)
+    chat = await store.add_chat("Услуги", "-1001", kind="sender", invite_link="https://t.me/+abc")
+
+    await autopilot.run_autopilot(store, FakeBot(), 1, force=True)
+
+    assert world.joins == [("off", chat.id)]
+    assert world.sender_calls == []
+
+
+async def test_disabled_autopilot_does_nothing_unless_forced(store, world):
+    await _acc(store, "tron")
+    await store.add_chat("C", "-1001", invite_link="https://t.me/+abc")
+    await store.set_setting("autopilot_enabled", "0")
+
+    assert await autopilot.run_autopilot(store, FakeBot(), 1) == "Автопилот выключен"
+    assert world.joins == []
+    await autopilot.run_autopilot(store, FakeBot(), 1, force=True)
+    assert len(world.joins) == 1
+
+
+async def test_busy_account_is_skipped(store, world, monkeypatch):
+    await _acc(store, "tron")
+    await store.add_chat("C", "-1001", invite_link="https://t.me/+abc")
+    monkeypatch.setattr(
+        autopilot.runtime, "is_running", lambda kind, aid: kind == "setup" and aid != 0
+    )
+    await autopilot.run_autopilot(store, FakeBot(), 1, force=True)
+    assert world.joins == []
+
+
+async def test_one_account_error_does_not_break_others(store, world, monkeypatch):
+    await _acc(store, "bad")
+    await _acc(store, "good")
+    chat = await store.add_chat("C", "-1001", invite_link="https://t.me/+abc")
+    real_check = autopilot.check_membership
+
+    async def flaky(client, chats):
+        if world.current == "bad":
+            raise RuntimeError("session revoked")
+        return await real_check(client, chats)
+
+    monkeypatch.setattr(autopilot, "check_membership", flaky)
+    bot = FakeBot()
+    await autopilot.run_autopilot(store, bot, 1, force=True)
+
+    assert ("good", chat.id) in world.joins
+    text = "\n".join(t for _, t in bot.sent)
+    assert "bad" in text and "session revoked" in text

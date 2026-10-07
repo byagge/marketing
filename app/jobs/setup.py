@@ -9,7 +9,7 @@ from telethon import TelegramClient
 from app.config import get_settings
 from app.jobs import LogSink, runtime
 from app.models import Account, Chat, Post
-from app.sender_api import SenderAPI
+from app.sender_api import SenderAPI, SenderAPIError
 from app.store import Store
 from app.tg.client import telethon_client
 from app.tg.resolve import lookup_entity
@@ -19,10 +19,18 @@ from app.tg.scheduler import (
     schedule_chat_forwards,
     schedule_chat_posts,
 )
+from app.jobs.bans import register_ban
 from app.tg.unavailable import format_unavailable, is_chat_unavailable, is_unavailable_text
 from app.utils.chat_ids import chat_ids_match
 from app.utils.entities import entities_loads
 from app.utils.minutes import period_for_interval, suggest_minute
+from app.utils.send_policy import (
+    classify_failure,
+    effective_interval_minutes,
+    effective_interval_seconds,
+    is_send_allowed,
+    pick_text_override,
+)
 from app.utils.schedule import resolve_repeat_period
 from app.utils.templates import pick_post_for_chat, render_post
 from app.tg.sender_push import (
@@ -144,6 +152,10 @@ async def _fail_unavailable(
     state = await store.record_setup_fail(
         account.id, chat.id, error, max_attempts=max_attempts
     )
+    if classify_failure(error) == "ban":
+        await register_ban(
+            store, account, chat, "send_ban", error, log.bot, log.chat_id
+        )
     prefix = f"{account.label}: "
     if state.is_abandoned:
         await log.emit(
@@ -160,6 +172,39 @@ async def _fail_unavailable(
         "error",
     )
     return "skipped"
+
+
+async def clear_scheduled_for_pair(
+    client: TelegramClient,
+    chat: Chat,
+    account: Account,
+    reason: str,
+    log: LogSink,
+) -> int:
+    """Пара выключена/забанена — убираем уже запланированные сообщения в чате."""
+    from app.tg.scheduler import delete_scheduled
+
+    try:
+        entity = await lookup_entity(client, chat)
+        if entity is None:
+            return 0
+        deleted = await delete_scheduled(
+            client, entity, pause=get_settings().schedule_delete_pause_sec
+        )
+    except Exception as e:
+        await log.emit(
+            f"{account.label}: «{chat.title}» отключён ({reason}), но очистка "
+            f"schedule не удалась: {type(e).__name__}: {e}",
+            "error",
+            notify=False,
+        )
+        return 0
+    await log.emit(
+        f"{account.label}: «{chat.title}» отключён ({reason}) — убрал {deleted} "
+        f"запланированных",
+        notify=False,
+    )
+    return deleted
 
 
 async def schedule_one_chat(
@@ -191,9 +236,22 @@ async def schedule_one_chat(
             )
             return "abandoned"
 
+    pref = await store.get_chat_pref(account.id, chat.id)
+    ban = await store.get_ban(account.id, chat.id)
+    allowed, why = is_send_allowed(account, chat, pref, bool(ban and ban.active))
+    if not allowed:
+        await clear_scheduled_for_pair(client, chat, account, why, log)
+        return "disabled"
+    override = pick_text_override(pref)
+    interval_min = effective_interval_minutes(chat)
+
     post = pick_post_for_chat(posts, chat)
-    use_link = post.is_link_mode and (post.has_text_link or post.has_photo_link)
-    if not use_link and not post.text.strip():
+    use_link = (
+        override is None
+        and post.is_link_mode
+        and (post.has_text_link or post.has_photo_link)
+    )
+    if override is None and not use_link and not post.text.strip():
         await log.emit(
             f"{account.label}: Пропуск schedule «{chat.title}»: нет текста "
             f"({'короткий ' if chat.uses_short_text else ''}{chat.lang})",
@@ -210,12 +268,20 @@ async def schedule_one_chat(
                 "error",
             )
             return "config_error"
+    elif override is not None:
+        # свой текст пары — строго как задан, без фото аккаунта
+        text, entities = render_post(
+            override,
+            entities_loads(pref.entities_json),
+            chat.tag,
+        )
     else:
         text, entities = render_post(
             post.text,
             entities_loads(post.entities_json),
             chat.tag,
         )
+    photo_src = None if override is not None else (post.photo_path or None)
     slot = await store.slot_for(chat.id, account.id)
     minute = slot.start_minute if slot else await ensure_minute(store, chat, account)
     repeat_period = resolve_repeat_period(is_premium, settings.repeat_period)
@@ -235,7 +301,7 @@ async def schedule_one_chat(
         want_media = chat.media_allowed
         if want_media and (
             (use_link and post.has_photo_link)
-            or (not use_link and bool(post.photo_path))
+            or (not use_link and bool(photo_src))
         ):
             if not await peer_allows_photos(client, entity):
                 want_media = False
@@ -254,7 +320,7 @@ async def schedule_one_chat(
                 from_peer=from_peer,
                 message_id=msg_id,
                 start_minute=minute,
-                interval_minutes=chat.interval_minutes,
+                interval_minutes=interval_min,
                 start_hour=settings.start_hour,
                 tz=settings.tz,
                 repeat_period=repeat_period,
@@ -288,13 +354,13 @@ async def schedule_one_chat(
                         from_peer=from_peer2,
                         message_id=msg_id2,
                         start_minute=minute,
-                        interval_minutes=chat.interval_minutes,
+                        interval_minutes=interval_min,
                         start_hour=settings.start_hour,
                         tz=settings.tz,
                         repeat_period=repeat_period,
                     )
         else:
-            photo = post.photo_path or None
+            photo = photo_src
             if not want_media:
                 photo = None
             result = await schedule_chat_posts(
@@ -303,7 +369,7 @@ async def schedule_one_chat(
                 text=text,
                 entities=entities,
                 start_minute=minute,
-                interval_minutes=chat.interval_minutes,
+                interval_minutes=interval_min,
                 start_hour=settings.start_hour,
                 tz=settings.tz,
                 repeat_period=repeat_period,
@@ -430,7 +496,20 @@ async def _configure_sender(
     """Configure Autoposter for this account only (не трогаем другие аккаунты)."""
     settings = get_settings()
     api = SenderAPI(settings.sender_api_url, settings.sender_api_key)
+    if not account.sender_on:
+        sid = (account.sender_account_id or "").strip()
+        if sid:
+            try:
+                await api.spam_stop(sid)
+            except SenderAPIError as e:
+                await log.emit(
+                    f"{account.label}: sender выключен, но стоп не прошёл: {e}", "error"
+                )
+        await log.emit(f"{account.label}: sender выключен вручную — настройку пропускаю")
+        return 0
     sender_id = await ensure_sender_account(store, account, api, log)
+    prefs = await store.prefs_for_account(account.id)
+    banned_pks = {b.chat_pk for b in await store.list_bans(account_id=account.id)}
     ss = await store.sender_settings()
 
     ru_text, ru_ents = render_post(
@@ -520,11 +599,31 @@ async def _configure_sender(
             )
 
     sender_count = 0
+    disabled_n = 0
     for live in targets:
         if runtime.cancelled("setup", account.id):
             raise SetupError("Остановлено")
         cid = str(live.get("chat_id"))
         catalog = match_catalog_chat(cid, sender_chats)
+        pref = prefs.get(catalog.id) if catalog else None
+        if catalog:
+            allowed, why = is_send_allowed(
+                account, catalog, pref, catalog.id in banned_pks
+            )
+            if not allowed:
+                try:
+                    await api.patch_chat(sender_id, cid, active=False)
+                except SenderAPIError as e:
+                    await log.emit(
+                        f"Sender: не удалось выключить «{catalog.title}»: {e}", "error"
+                    )
+                disabled_n += 1
+                await log.emit(
+                    f"Sender: «{catalog.title}» выключен для {account.label} ({why})",
+                    notify=False,
+                )
+                continue
+        override = pick_text_override(pref)
         if catalog:
             post = pick_post_for_chat(posts, catalog)
             tag = catalog.tag
@@ -535,14 +634,28 @@ async def _configure_sender(
             tag = None
             title = live.get("title") or cid
             kind_note = "полн."
-        text, ents = render_post(
-            post.text,
-            entities_loads(post.entities_json),
-            tag,
-        )
+        if override is not None:
+            text, ents = render_post(override, entities_loads(pref.entities_json), tag)
+            kind_note = "свой текст"
+        else:
+            text, ents = render_post(
+                post.text,
+                entities_loads(post.entities_json),
+                tag,
+            )
         await push_chat_text(
             api, sender_id, cid, text, ents, mentions_enabled=mentions_on
         )
+        if catalog and int(catalog.max_posts_per_account or 0) > 0:
+            try:
+                await api.patch_chat(
+                    sender_id, cid, interval=effective_interval_seconds(catalog)
+                )
+                kind_note += f", лимит {catalog.max_posts_per_account}/сут"
+            except SenderAPIError as e:
+                await log.emit(
+                    f"Sender: лимит постов для «{title}» не применился: {e}", "error"
+                )
         sender_count += 1
         await log.emit(
             f"Sender: включил «{title}» ({kind_note}, "
@@ -564,7 +677,8 @@ async def _configure_sender(
             api, sender_id, enabled=cloak_on, text=cloak_text
         )
         await log.emit(
-            f"{account.label}: sender запущен на {sender_count} чатов "
+            f"{account.label}: sender запущен на {sender_count} чатов"
+            f"{f' (выключено вручную/баном: {disabled_n})' if disabled_n else ''} "
             f"(schedule mute, mention=off, cloak="
             f"{'on' if cloak_res.get('enabled') else 'off'})"
         )
@@ -821,3 +935,46 @@ async def run_setup_chats_only(
     except Exception as e:
         await store.finish_job(job.id, "error", f"{type(e).__name__}: {e}")
         return empty
+
+
+async def run_sender_refresh(
+    store: Store,
+    account_id: int,
+    bot: Bot | None = None,
+    admin_chat_id: int | None = None,
+    *,
+    job_kind: str = "sender_refresh",
+) -> int:
+    """Перенастроить только sender у аккаунта (без пересборки schedule)."""
+    account = await store.get_account(account_id)
+    if not account or not account.has_sender:
+        return 0
+    posts = {
+        "ru": await store.get_post(account.id, "ru"),
+        "en": await store.get_post(account.id, "en"),
+        "ru_short": await store.get_post(account.id, "ru_short"),
+        "en_short": await store.get_post(account.id, "en_short"),
+    }
+    has_any = any(
+        (p.text or "").strip() or p.has_text_link or p.has_photo_link for p in posts.values()
+    )
+    job = await store.create_job(job_kind, account.id)
+    log = LogSink(store, job.id, bot, admin_chat_id)
+    if not has_any:
+        await store.finish_job(job.id, "error", "нет поста")
+        await log.emit(f"{account.label}: sender не настроен — задайте пост", "error")
+        return 0
+    try:
+        chats = await store.list_chats(enabled_only=True)
+        schedule_chats = [c for c in chats if c.is_schedule]
+        sender_chats = [c for c in chats if c.kind == "sender"]
+        count = await _configure_sender(
+            store, account, posts, schedule_chats, sender_chats, log
+        )
+        await store.finish_job(job.id, "done", f"sender: {count} чатов")
+        return count
+    except Exception as e:
+        err = f"{type(e).__name__}: {e}"
+        await store.finish_job(job.id, "error", err)
+        await log.emit(f"{account.label}: sender не настроен — {err}", "error")
+        return 0

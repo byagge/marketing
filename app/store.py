@@ -9,7 +9,20 @@ from typing import Any
 import aiosqlite
 
 from app.config import DB_PATH, POSTS_DIR, ensure_dirs
-from app.models import Account, Chat, Job, JobLog, MinuteSlot, OnlinePingSettings, Post, SenderSettings, SetupState
+from app.models import (
+    Account,
+    AccountChatPref,
+    Chat,
+    ChatBan,
+    Job,
+    JobLog,
+    JoinState,
+    MinuteSlot,
+    OnlinePingSettings,
+    Post,
+    SenderSettings,
+    SetupState,
+)
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS accounts (
@@ -88,6 +101,41 @@ CREATE TABLE IF NOT EXISTS setup_states (
     UNIQUE(account_id, chat_pk)
 );
 
+CREATE TABLE IF NOT EXISTS account_chat_prefs (
+    account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    chat_pk INTEGER NOT NULL REFERENCES chats(id) ON DELETE CASCADE,
+    send_enabled INTEGER NOT NULL DEFAULT 1,
+    text TEXT NOT NULL DEFAULT '',
+    entities_json TEXT NOT NULL DEFAULT '[]',
+    updated_at TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (account_id, chat_pk)
+);
+
+CREATE TABLE IF NOT EXISTS chat_bans (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    chat_pk INTEGER NOT NULL REFERENCES chats(id) ON DELETE CASCADE,
+    reason TEXT NOT NULL DEFAULT '',
+    detail TEXT NOT NULL DEFAULT '',
+    detected_at TEXT NOT NULL,
+    notified INTEGER NOT NULL DEFAULT 0,
+    active INTEGER NOT NULL DEFAULT 1,
+    UNIQUE(account_id, chat_pk)
+);
+
+CREATE TABLE IF NOT EXISTS join_states (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    chat_pk INTEGER NOT NULL REFERENCES chats(id) ON DELETE CASCADE,
+    status TEXT NOT NULL DEFAULT 'pending',
+    fail_count INTEGER NOT NULL DEFAULT 0,
+    miss_count INTEGER NOT NULL DEFAULT 0,
+    last_attempt_at TEXT NOT NULL DEFAULT '',
+    last_member_at TEXT NOT NULL DEFAULT '',
+    last_error TEXT NOT NULL DEFAULT '',
+    UNIQUE(account_id, chat_pk)
+);
+
 CREATE TABLE IF NOT EXISTS settings (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
@@ -131,6 +179,9 @@ DEFAULT_SETTINGS = {
     "online_hold_seconds": "4",
     "online_ping_last_at": "",
     "online_ping_next_at": "",
+    "autopilot_enabled": "1",
+    "autopilot_last_at": "",
+    "autopilot_last_summary": "",
 }
 
 
@@ -241,6 +292,10 @@ async def _migrate_accounts_premium(db: aiosqlite.Connection) -> None:
         await db.execute(
             "ALTER TABLE accounts ADD COLUMN online_ping INTEGER NOT NULL DEFAULT 1"
         )
+    if "sender_enabled" not in cols:
+        await db.execute(
+            "ALTER TABLE accounts ADD COLUMN sender_enabled INTEGER NOT NULL DEFAULT 1"
+        )
 
 
 async def _migrate_chats_invite(db: aiosqlite.Connection) -> None:
@@ -259,6 +314,9 @@ async def _migrate_chats_invite(db: aiosqlite.Connection) -> None:
         "is_join_request": "ALTER TABLE chats ADD COLUMN is_join_request INTEGER NOT NULL DEFAULT 0",
         "text_kind": "ALTER TABLE chats ADD COLUMN text_kind TEXT NOT NULL DEFAULT 'full'",
         "allow_media": "ALTER TABLE chats ADD COLUMN allow_media INTEGER NOT NULL DEFAULT 1",
+        "max_posts_per_account": (
+            "ALTER TABLE chats ADD COLUMN max_posts_per_account INTEGER NOT NULL DEFAULT 0"
+        ),
     }
     for name, sql in alters.items():
         if name not in cols:
@@ -282,6 +340,11 @@ def _account(row: aiosqlite.Row) -> Account:
         sender_account_id=row["sender_account_id"] or "",
         is_premium=int(row["is_premium"] if "is_premium" in keys else 0) or 0,
         online_ping=online_ping,
+        sender_enabled=(
+            int(row["sender_enabled"])
+            if "sender_enabled" in keys and row["sender_enabled"] is not None
+            else 1
+        ),
         status=row["status"] or "idle",
         last_error=row["last_error"] or "",
         created_at=row["created_at"] or "",
@@ -320,6 +383,7 @@ def _chat(row: aiosqlite.Row) -> Chat:
         is_join_request=_i("is_join_request", 0),
         text_kind=_s("text_kind", "full") or "full",
         allow_media=_i("allow_media", 1),
+        max_posts_per_account=_i("max_posts_per_account", 0),
         created_at=row["created_at"] or "",
     )
 
@@ -518,6 +582,9 @@ class Store:
         async with self._connect() as db:
             await db.execute("PRAGMA foreign_keys = ON")
             await db.execute("DELETE FROM setup_states WHERE account_id=?", (account_id,))
+            await db.execute("DELETE FROM account_chat_prefs WHERE account_id=?", (account_id,))
+            await db.execute("DELETE FROM chat_bans WHERE account_id=?", (account_id,))
+            await db.execute("DELETE FROM join_states WHERE account_id=?", (account_id,))
             await db.execute("DELETE FROM minute_slots WHERE account_id=?", (account_id,))
             await db.execute("DELETE FROM posts WHERE account_id=?", (account_id,))
             await db.execute("DELETE FROM accounts WHERE id=?", (account_id,))
@@ -761,6 +828,7 @@ class Store:
             "is_join_request",
             "text_kind",
             "allow_media",
+            "max_posts_per_account",
         }
         fields = {k: v for k, v in fields.items() if k in allowed}
         if "garant_bot" in fields and fields["garant_bot"] is not None:
@@ -783,6 +851,9 @@ class Store:
         async with self._connect() as db:
             await db.execute("PRAGMA foreign_keys = ON")
             await db.execute("DELETE FROM setup_states WHERE chat_pk=?", (chat_pk,))
+            await db.execute("DELETE FROM account_chat_prefs WHERE chat_pk=?", (chat_pk,))
+            await db.execute("DELETE FROM chat_bans WHERE chat_pk=?", (chat_pk,))
+            await db.execute("DELETE FROM join_states WHERE chat_pk=?", (chat_pk,))
             await db.execute("DELETE FROM minute_slots WHERE chat_pk=?", (chat_pk,))
             await db.execute("DELETE FROM chats WHERE id=?", (chat_pk,))
             await db.commit()
@@ -1121,3 +1192,343 @@ class Store:
             )
             for r in rows
         ]
+
+
+    # ---- пары аккаунт × чат: выключатель отправки и свой текст -------------
+
+    @staticmethod
+    def _pref(row: aiosqlite.Row | None, account_id: int, chat_pk: int) -> AccountChatPref:
+        if not row:
+            return AccountChatPref(account_id=account_id, chat_pk=chat_pk)
+        return AccountChatPref(
+            account_id=int(row["account_id"]),
+            chat_pk=int(row["chat_pk"]),
+            send_enabled=int(row["send_enabled"]),
+            text=row["text"] or "",
+            entities_json=row["entities_json"] or "[]",
+        )
+
+    async def get_chat_pref(self, account_id: int, chat_pk: int) -> AccountChatPref:
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                "SELECT * FROM account_chat_prefs WHERE account_id=? AND chat_pk=?",
+                (account_id, chat_pk),
+            )
+            return self._pref(await cur.fetchone(), account_id, chat_pk)
+
+    async def prefs_for_account(self, account_id: int) -> dict[int, AccountChatPref]:
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                "SELECT * FROM account_chat_prefs WHERE account_id=?", (account_id,)
+            )
+            rows = await cur.fetchall()
+        return {int(r["chat_pk"]): self._pref(r, account_id, int(r["chat_pk"])) for r in rows}
+
+    async def prefs_for_chat(self, chat_pk: int) -> dict[int, AccountChatPref]:
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                "SELECT * FROM account_chat_prefs WHERE chat_pk=?", (chat_pk,)
+            )
+            rows = await cur.fetchall()
+        return {int(r["account_id"]): self._pref(r, int(r["account_id"]), chat_pk) for r in rows}
+
+    async def set_chat_send_enabled(
+        self, account_id: int, chat_pk: int, enabled: bool
+    ) -> AccountChatPref:
+        await self.set_chat_send_enabled_bulk(account_id, [chat_pk], enabled)
+        return await self.get_chat_pref(account_id, chat_pk)
+
+    async def set_chat_send_enabled_bulk(
+        self, account_id: int, chat_pks: list[int], enabled: bool
+    ) -> int:
+        now = _now()
+        async with self._connect() as db:
+            for pk in chat_pks:
+                await db.execute(
+                    "INSERT INTO account_chat_prefs(account_id, chat_pk, send_enabled, updated_at) "
+                    "VALUES(?,?,?,?) "
+                    "ON CONFLICT(account_id, chat_pk) DO UPDATE SET "
+                    "send_enabled=excluded.send_enabled, updated_at=excluded.updated_at",
+                    (account_id, pk, 1 if enabled else 0, now),
+                )
+            await db.commit()
+        return len(chat_pks)
+
+    async def set_chat_text(
+        self,
+        account_id: int,
+        chat_pk: int,
+        text: str,
+        entities: list[dict[str, Any]] | None = None,
+    ) -> AccountChatPref:
+        now = _now()
+        async with self._connect() as db:
+            await db.execute(
+                "INSERT INTO account_chat_prefs(account_id, chat_pk, text, entities_json, updated_at) "
+                "VALUES(?,?,?,?,?) "
+                "ON CONFLICT(account_id, chat_pk) DO UPDATE SET "
+                "text=excluded.text, entities_json=excluded.entities_json, "
+                "updated_at=excluded.updated_at",
+                (
+                    account_id,
+                    chat_pk,
+                    text or "",
+                    json.dumps(entities or [], ensure_ascii=False),
+                    now,
+                ),
+            )
+            await db.commit()
+        return await self.get_chat_pref(account_id, chat_pk)
+
+    async def clear_chat_text(self, account_id: int, chat_pk: int) -> AccountChatPref:
+        return await self.set_chat_text(account_id, chat_pk, "", [])
+
+    # ---- база банов ---------------------------------------------------------
+
+    @staticmethod
+    def _ban(row: aiosqlite.Row) -> ChatBan:
+        keys = row.keys()
+        return ChatBan(
+            id=int(row["id"]),
+            account_id=int(row["account_id"]),
+            chat_pk=int(row["chat_pk"]),
+            reason=row["reason"] or "",
+            detail=row["detail"] or "",
+            detected_at=row["detected_at"] or "",
+            notified=int(row["notified"] or 0),
+            active=int(row["active"] or 0),
+            account_label=(row["account_label"] if "account_label" in keys else "") or "",
+            chat_title=(row["chat_title"] if "chat_title" in keys else "") or "",
+        )
+
+    _BAN_SELECT = (
+        "SELECT b.*, COALESCE(a.label,'') AS account_label, "
+        "COALESCE(c.title,'') AS chat_title "
+        "FROM chat_bans b "
+        "LEFT JOIN accounts a ON a.id=b.account_id "
+        "LEFT JOIN chats c ON c.id=b.chat_pk "
+    )
+
+    async def get_ban(self, account_id: int, chat_pk: int) -> ChatBan | None:
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                self._BAN_SELECT + "WHERE b.account_id=? AND b.chat_pk=?",
+                (account_id, chat_pk),
+            )
+            row = await cur.fetchone()
+        return self._ban(row) if row else None
+
+    async def record_ban(
+        self, account_id: int, chat_pk: int, reason: str, detail: str = ""
+    ) -> tuple[ChatBan, bool]:
+        """Занести бан. is_new=True, если до этого активного бана пары не было."""
+        existing = await self.get_ban(account_id, chat_pk)
+        is_new = existing is None or not existing.active
+        now = _now()
+        async with self._connect() as db:
+            if existing is None:
+                await db.execute(
+                    "INSERT INTO chat_bans(account_id, chat_pk, reason, detail, detected_at, "
+                    "notified, active) VALUES(?,?,?,?,?,0,1)",
+                    (account_id, chat_pk, reason, (detail or "")[:500], now),
+                )
+            elif is_new:
+                await db.execute(
+                    "UPDATE chat_bans SET reason=?, detail=?, detected_at=?, notified=0, "
+                    "active=1 WHERE account_id=? AND chat_pk=?",
+                    (reason, (detail or "")[:500], now, account_id, chat_pk),
+                )
+            await db.commit()
+        ban = await self.get_ban(account_id, chat_pk)
+        assert ban is not None
+        return ban, is_new
+
+    async def mark_ban_notified(self, ban_ids: list[int]) -> None:
+        if not ban_ids:
+            return
+        async with self._connect() as db:
+            await db.executemany(
+                "UPDATE chat_bans SET notified=1 WHERE id=?", [(i,) for i in ban_ids]
+            )
+            await db.commit()
+
+    async def clear_ban(
+        self, account_id: int, chat_pk: int, *, reasons: tuple[str, ...] | None = None
+    ) -> bool:
+        sql = "UPDATE chat_bans SET active=0 WHERE account_id=? AND chat_pk=? AND active=1"
+        args: list[Any] = [account_id, chat_pk]
+        if reasons:
+            sql += f" AND reason IN ({','.join('?' for _ in reasons)})"
+            args.extend(reasons)
+        async with self._connect() as db:
+            cur = await db.execute(sql, args)
+            await db.commit()
+            return bool(cur.rowcount)
+
+    async def list_bans(
+        self, *, active_only: bool = True, account_id: int | None = None
+    ) -> list[ChatBan]:
+        sql = self._BAN_SELECT + "WHERE 1=1"
+        args: list[Any] = []
+        if active_only:
+            sql += " AND b.active=1"
+        if account_id is not None:
+            sql += " AND b.account_id=?"
+            args.append(account_id)
+        sql += " ORDER BY c.title COLLATE NOCASE, a.label COLLATE NOCASE"
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(sql, args)
+            return [self._ban(r) for r in await cur.fetchall()]
+
+    async def active_ban_pairs(self) -> set[tuple[int, int]]:
+        return {(b.account_id, b.chat_pk) for b in await self.list_bans(active_only=True)}
+
+    # ---- автовступление: состояние пары ------------------------------------
+
+    @staticmethod
+    def _join_state(row: aiosqlite.Row) -> JoinState:
+        keys = row.keys()
+        return JoinState(
+            id=int(row["id"]),
+            account_id=int(row["account_id"]),
+            chat_pk=int(row["chat_pk"]),
+            status=row["status"] or "pending",
+            fail_count=int(row["fail_count"] or 0),
+            miss_count=int(row["miss_count"] or 0),
+            last_attempt_at=row["last_attempt_at"] or "",
+            last_member_at=row["last_member_at"] or "",
+            last_error=row["last_error"] or "",
+            account_label=(row["account_label"] if "account_label" in keys else "") or "",
+            chat_title=(row["chat_title"] if "chat_title" in keys else "") or "",
+        )
+
+    _JOIN_SELECT = (
+        "SELECT j.*, COALESCE(a.label,'') AS account_label, "
+        "COALESCE(c.title,'') AS chat_title "
+        "FROM join_states j "
+        "LEFT JOIN accounts a ON a.id=j.account_id "
+        "LEFT JOIN chats c ON c.id=j.chat_pk "
+    )
+
+    async def get_join_state(self, account_id: int, chat_pk: int) -> JoinState | None:
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                self._JOIN_SELECT + "WHERE j.account_id=? AND j.chat_pk=?",
+                (account_id, chat_pk),
+            )
+            row = await cur.fetchone()
+        return self._join_state(row) if row else None
+
+    async def join_states_for_account(self, account_id: int) -> dict[int, JoinState]:
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                self._JOIN_SELECT + "WHERE j.account_id=?", (account_id,)
+            )
+            rows = await cur.fetchall()
+        return {int(r["chat_pk"]): self._join_state(r) for r in rows}
+
+    async def list_join_states(self, statuses: list[str] | None = None) -> list[JoinState]:
+        sql = self._JOIN_SELECT + "WHERE 1=1"
+        args: list[Any] = []
+        if statuses:
+            sql += f" AND j.status IN ({','.join('?' for _ in statuses)})"
+            args.extend(statuses)
+        sql += " ORDER BY c.title COLLATE NOCASE, a.label COLLATE NOCASE"
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(sql, args)
+            return [self._join_state(r) for r in await cur.fetchall()]
+
+    async def _upsert_join_state(self, account_id: int, chat_pk: int, **fields: Any) -> None:
+        cols = ["account_id", "chat_pk", *fields.keys()]
+        placeholders = ",".join("?" for _ in cols)
+        updates = ", ".join(f"{k}=excluded.{k}" for k in fields)
+        async with self._connect() as db:
+            await db.execute(
+                f"INSERT INTO join_states({', '.join(cols)}) VALUES({placeholders}) "
+                f"ON CONFLICT(account_id, chat_pk) DO UPDATE SET {updates}",
+                [account_id, chat_pk, *fields.values()],
+            )
+            await db.commit()
+
+    async def mark_member(self, account_id: int, chat_pk: int) -> None:
+        """Проверка подтвердила членство: сбрасываем счётчики и «вылет»-баны."""
+        await self._upsert_join_state(
+            account_id,
+            chat_pk,
+            status="member",
+            fail_count=0,
+            miss_count=0,
+            last_member_at=_now(),
+            last_error="",
+        )
+        await self.clear_ban(account_id, chat_pk, reasons=("join_ban", "removed"))
+
+    async def mark_not_member(self, account_id: int, chat_pk: int) -> JoinState:
+        """Проверка не нашла аккаунт в чате; miss_count копится между проверками."""
+        existing = await self.get_join_state(account_id, chat_pk)
+        miss = (existing.miss_count if existing else 0) + 1
+        status = existing.status if existing else "pending"
+        if status == "member":
+            status = "pending"
+        await self._upsert_join_state(
+            account_id, chat_pk, status=status, miss_count=miss
+        )
+        state = await self.get_join_state(account_id, chat_pk)
+        assert state is not None
+        return state
+
+    async def record_join_result(
+        self,
+        account_id: int,
+        chat_pk: int,
+        *,
+        status: str,
+        error: str = "",
+        fail: bool = False,
+        max_attempts: int = 5,
+    ) -> JoinState:
+        existing = await self.get_join_state(account_id, chat_pk)
+        fail_count = (existing.fail_count if existing else 0) + (1 if fail else 0)
+        if fail and fail_count >= max_attempts and status == "pending":
+            status = "abandoned"
+        await self._upsert_join_state(
+            account_id,
+            chat_pk,
+            status=status,
+            fail_count=fail_count,
+            last_attempt_at=_now(),
+            last_error=(error or "")[:500],
+        )
+        state = await self.get_join_state(account_id, chat_pk)
+        assert state is not None
+        return state
+
+    async def reset_join_states(self, statuses: tuple[str, ...] = ("manual", "abandoned", "requested")) -> int:
+        async with self._connect() as db:
+            cur = await db.execute(
+                f"UPDATE join_states SET status='pending', fail_count=0, last_error='' "
+                f"WHERE status IN ({','.join('?' for _ in statuses)})",
+                list(statuses),
+            )
+            await db.commit()
+            return int(cur.rowcount or 0)
+
+    async def reset_pair_join(self, account_id: int, chat_pk: int) -> None:
+        """Забыть историю вступления пары (после снятия бана вручную)."""
+        await self._upsert_join_state(
+            account_id,
+            chat_pk,
+            status="pending",
+            fail_count=0,
+            miss_count=0,
+            last_member_at="",
+            last_error="",
+        )
