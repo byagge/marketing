@@ -18,6 +18,8 @@ from app.bot import setup_routers
 from app.bot.middlewares import AdminOnlyMiddleware
 from app.config import ensure_dirs, get_settings
 from app.context import ctx
+from app.jobs import runtime
+from app.jobs.autopilot import run_autopilot
 from app.jobs.balance import run_smart_rebalance
 from app.jobs.health import weekly_cron_args
 from app.jobs.marketer import (
@@ -157,6 +159,21 @@ async def main() -> None:
         summary = await run_online_ping_tick(store)
         log.info("%s", summary)
 
+    async def autopilot_tick():
+        if runtime.is_running("autopilot", 0):
+            return
+        admin_id = next(iter(sorted(settings.admins)), None)
+
+        async def _job():
+            summary = await run_autopilot(store, bot, admin_id)
+            log.info("autopilot: %s", (summary or "").splitlines()[0] if summary else "")
+
+        try:
+            task = runtime.spawn("autopilot", 0, _job())
+        except RuntimeError:
+            return
+        await task
+
     scheduler.add_job(
         weekly, "cron", id="weekly_health", replace_existing=True, **weekly_cron_args()
     )
@@ -233,6 +250,22 @@ async def main() -> None:
             hours=max(0.5, float(settings.rebalance_every_hours)),
             next_run_time=datetime.now(scheduler.timezone) + timedelta(minutes=20),
         )
+    scheduler.add_job(
+        autopilot_tick,
+        "interval",
+        id="autopilot_tick",
+        replace_existing=True,
+        minutes=max(5, int(settings.autopilot_interval_min)),
+        max_instances=1,
+        coalesce=True,
+    )
+    scheduler.add_job(
+        autopilot_tick,
+        "date",
+        id="autopilot_startup",
+        replace_existing=True,
+        run_date=datetime.now(scheduler.timezone) + timedelta(minutes=3),
+    )
     run_at = datetime.now(scheduler.timezone) + timedelta(seconds=45)
     scheduler.add_job(
         online_tick,

@@ -93,6 +93,7 @@ def main_menu() -> InlineKeyboardMarkup:
             [ib("Аккаунты", "accounts", icon="user"), ib("Online", "online", icon="star")],
             [ib("Session", "mk_session", icon="inbox"), ib("Экспорт", "export", icon="chart")],
             [ib("Отчёты", "reports", icon="chart"), ib("Проверка", "health", icon="search")],
+            [ib("Автопилот", "ap", icon="robot"), ib("Баны", "bans", icon="warn")],
             [ib("Инфо", "info", icon="info")],
         ]
     )
@@ -134,6 +135,8 @@ def account_kb(acc: Account, running: bool = False) -> InlineKeyboardMarkup:
     ping_icon = "check" if acc.online_ping_enabled else "block"
     dead_label = "\U0001F480 Dead-режим: вкл" if acc.dead else "Dead-режим: выкл"
     dead_icon = "warn" if acc.dead else "check"
+    sender_label = "Sender: вкл" if acc.sender_on else "Sender: ВЫКЛ"
+    sender_icon = "check" if acc.sender_on else "block"
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [start],
@@ -142,6 +145,8 @@ def account_kb(acc: Account, running: bool = False) -> InlineKeyboardMarkup:
                 ib("Leave", "leave_go", acc.id, icon="block"),
             ],
             [ib("Чаты аккаунта (вкл/выкл, текст)", "acc_cl", acc.id, icon="mega")],
+            [ib("Чаты аккаунта: выкл / тексты", "acp_list", acc.id, icon="pin")],
+            [ib(sender_label, "acc_sender", acc.id, icon=sender_icon)],
             [
                 ib("Ограничения / SpamBot", "restr_a", acc.id, icon="shield"),
                 ib("Проверка чатов", "acc_chats", acc.id, icon="users"),
@@ -311,6 +316,13 @@ def chat_kb(chat: Chat) -> InlineKeyboardMarkup:
     ]
     if chat.is_schedule:
         rows.append([ib("Таблица минут", "tbl", chat.id, icon="clock")])
+    limit = int(chat.max_posts_per_account or 0)
+    rows.append(
+        [
+            ib(f"Лимит: {limit}/акк/сут" if limit else "Лимит постов: нет", "chat_lim", chat.id, icon="shield"),
+            ib("Диагностика", "chat_diag", chat.id, icon="search"),
+        ]
+    )
     rows.append([ib("Удалить", "chat_del", chat.id, icon="warn")])
     rows.append([ib("Чаты", "chats", icon="users")])
     rows.append(home_row())

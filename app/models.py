@@ -19,6 +19,7 @@ class Account:
     online_ping: int = 1
     # 1 = «dead account»: расходник, без строгих проверок, шлёт во все доступные чаты
     is_dead: int = 0
+    sender_enabled: int = 1  # 0 = sender (Autoposter) для аккаунта выключен
     status: str = "idle"
     last_error: str = ""
     created_at: str = ""
@@ -53,6 +54,10 @@ class Account:
     @property
     def online_ping_enabled(self) -> bool:
         return bool(self.online_ping)
+
+    @property
+    def sender_on(self) -> bool:
+        return bool(self.sender_enabled)
 
     @property
     def has_sender(self) -> bool:
@@ -138,6 +143,8 @@ class Chat:
     is_join_request: int = 0
     text_kind: str = "full"  # full | short
     allow_media: int = 1  # 0 = чат без фото, шлём текст / text-link
+    # Жёсткий лимит чата: не более N постов на аккаунт за сутки (0 = без лимита)
+    max_posts_per_account: int = 0
     created_at: str = ""
 
     @property
@@ -396,3 +403,51 @@ class DailyReport:
     payload_json: str = "{}"
 
 
+@dataclass
+class AccountChatPref:
+    """Настройки пары аккаунт×чат: выключатель отправки и свой текст."""
+
+    account_id: int
+    chat_pk: int
+    send_enabled: int = 1
+    text: str = ""
+    entities_json: str = "[]"
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self.send_enabled)
+
+    @property
+    def has_text(self) -> bool:
+        return bool((self.text or "").strip())
+
+
+@dataclass
+class ChatBan:
+    id: int
+    account_id: int
+    chat_pk: int
+    reason: str  # join_ban | removed | send_ban
+    detail: str = ""
+    detected_at: str = ""
+    notified: int = 0
+    active: int = 1
+    account_label: str = ""
+    chat_title: str = ""
+
+
+@dataclass
+class JoinState:
+    """Прогресс автовступления аккаунта в чат."""
+
+    id: int
+    account_id: int
+    chat_pk: int
+    status: str = "pending"  # pending | member | requested | manual | abandoned
+    fail_count: int = 0
+    miss_count: int = 0
+    last_attempt_at: str = ""
+    last_member_at: str = ""
+    last_error: str = ""
+    account_label: str = ""
+    chat_title: str = ""

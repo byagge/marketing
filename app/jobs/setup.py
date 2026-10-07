@@ -21,6 +21,7 @@ from app.tg.scheduler import (
     schedule_chat_forwards,
     schedule_chat_posts,
 )
+from app.jobs.bans import register_ban
 from app.tg.restrictions import classify_text, record_restriction
 from app.tg.unavailable import format_unavailable, is_chat_unavailable, is_unavailable_text
 from app.utils.chat_ids import canon_chat_id, chat_id_aliases, chat_ids_match
@@ -28,6 +29,13 @@ from app.utils.timefmt import fmt_until
 from app.utils.entities import entities_loads
 from app.utils.minutes import period_for_interval, suggest_minute
 from app.utils.schedule import dead_interval, phase_offset_minutes, resolve_repeat_period
+from app.utils.send_policy import (
+    classify_failure,
+    effective_interval_minutes,
+    effective_interval_seconds,
+    is_send_allowed,
+    pick_text_override,
+)
 from app.utils.templates import pick_post_for_chat, render_post
 from app.tg.sender_push import (
     apply_mentions_everywhere,
@@ -211,6 +219,13 @@ async def _fail_unavailable(
             )
         except Exception:  # noqa: BLE001
             kind = hint
+    if kind == "ban" or classify_failure(error) == "ban":
+        try:
+            await register_ban(
+                store, account, chat, "send_ban", error, log.bot, log.chat_id
+            )
+        except Exception:  # noqa: BLE001
+            pass
     prev_state = await store.get_setup_state(account.id, chat.id)
     was_abandoned = bool(prev_state and prev_state.is_abandoned)
     state = await store.record_setup_fail(
@@ -255,9 +270,15 @@ async def _fail_unavailable(
 
 async def pair_blocked(store: Store, account: Account, chat: Chat) -> str | None:
     """Почему эту пару не настраиваем: disabled | banned | muted | None."""
+    # Production ChatPref (chat_key) + reporting AccountChatPref (chat_pk) + bans.
     pref = await store.get_pref(account.id, chat.chat_id)
     if not pref.is_enabled:
         return "disabled"
+    pair_pref = await store.get_chat_pref(account.id, chat.id)
+    ban = await store.get_ban(account.id, chat.id)
+    allowed, why = is_send_allowed(account, chat, pair_pref, bool(ban and ban.active))
+    if not allowed:
+        return why or "disabled"
     restr = await store.get_restriction(account.id, chat.id)
     if restr is not None:
         if restr.is_ban:
@@ -281,6 +302,40 @@ def _photo_stamp(path: str | None) -> list[Any] | None:
     except OSError:
         return [path, None, None]
     return [path, st.st_size, int(st.st_mtime)]
+
+
+
+async def clear_scheduled_for_pair(
+    client: TelegramClient,
+    chat: Chat,
+    account: Account,
+    reason: str,
+    log: LogSink,
+) -> int:
+    """Пара выключена/забанена — убираем уже запланированные сообщения в чате."""
+    from app.tg.scheduler import delete_scheduled
+
+    try:
+        entity = await lookup_entity(client, chat)
+        if entity is None:
+            return 0
+        deleted = await delete_scheduled(
+            client, entity, pause=get_settings().schedule_delete_pause_sec
+        )
+    except Exception as e:
+        await log.emit(
+            f"{account.label}: «{chat.title}» отключён ({reason}), но очистка "
+            f"schedule не удалась: {type(e).__name__}: {e}",
+            "error",
+            notify=False,
+        )
+        return 0
+    await log.emit(
+        f"{account.label}: «{chat.title}» отключён ({reason}) — убрал {deleted} "
+        f"запланированных",
+        notify=False,
+    )
+    return deleted
 
 
 async def schedule_one_chat(
@@ -316,9 +371,13 @@ async def schedule_one_chat(
         blocked = await pair_blocked(store, account, chat)
         if blocked:
             # выключено вручную / бан / мут — тихо пропускаем, в базе всё видно
+            await clear_scheduled_for_pair(client, chat, account, blocked, log)
             await log.emit(
                 f"{account.label}: «{chat.title}» пропущен ({blocked})", notify=False
             )
+            # send_policy (pair_off/banned/…) → outcome "disabled", причина в clear
+            if blocked in {"pair_off", "banned", "chat_off", "sender_off"}:
+                return "disabled"
             return blocked
 
     if skip_abandoned and not dead:
@@ -336,8 +395,14 @@ async def schedule_one_chat(
     custom = await store.get_chat_post(account.id, chat.chat_id)
     if custom is not None:
         post = custom  # свой текст для этого чата у этого аккаунта
-    use_link = post.is_link_mode and (post.has_text_link or post.has_photo_link)
-    if not use_link and not post.text.strip():
+    pair_pref = await store.get_chat_pref(account.id, chat.id)
+    override = pick_text_override(pair_pref)
+    use_link = (
+        override is None
+        and post.is_link_mode
+        and (post.has_text_link or post.has_photo_link)
+    )
+    if override is None and not use_link and not post.text.strip():
         await log.emit(
             f"{account.label}: Пропуск schedule «{chat.title}»: нет текста "
             f"({'короткий ' if chat.uses_short_text else ''}{chat.lang})",
@@ -354,6 +419,12 @@ async def schedule_one_chat(
                 "error",
             )
             return "config_error"
+    elif override is not None:
+        text, entities = render_post(
+            override,
+            entities_loads(pair_pref.entities_json),
+            chat.tag,
+        )
     else:
         text, entities = render_post(
             post.text,
@@ -366,6 +437,7 @@ async def schedule_one_chat(
         interval = dead_interval(chat.interval_minutes, settings.dead_interval_minutes)
         minute = (account.id * 7) % 60
     else:
+        interval = effective_interval_minutes(chat)
         slot = await store.slot_for(chat.id, account.id)
         minute = slot.start_minute if slot else await ensure_minute(store, chat, account)
         if chat.interval_minutes > 60:
@@ -479,7 +551,7 @@ async def schedule_one_chat(
                         offset_minutes=offset,
                     )
         else:
-            photo = post.photo_path or None
+            photo = None if override is not None else (post.photo_path or None)
             if not want_media:
                 photo = None
             sig = schedule_signature(
@@ -654,6 +726,20 @@ async def _configure_sender(
     """Configure Autoposter for this account only (не трогаем другие аккаунты)."""
     settings = get_settings()
     api = SenderAPI(settings.sender_api_url, settings.sender_api_key)
+    if not account.sender_on:
+        sid = (account.sender_account_id or "").strip()
+        if sid:
+            try:
+                await api.spam_stop(sid)
+            except SenderAPIError as e:
+                await log.emit(
+                    f"{account.label}: sender выключен, но стоп не прошёл: {e}",
+                    "error",
+                )
+        await log.emit(
+            f"{account.label}: sender выключен вручную — настройку пропускаю"
+        )
+        return 0
     sender_id = await ensure_sender_account(store, account, api, log)
     ss = await store.sender_settings()
 
@@ -779,17 +865,50 @@ async def _configure_sender(
         if custom is not None:
             post = custom
             kind_note = "свой"
-        text, ents = render_post(
-            post.text,
-            entities_loads(post.entities_json),
-            tag,
-        )
+        pair_pref = await store.get_chat_pref(account.id, catalog.id) if catalog else None
+        if catalog:
+            ban = await store.get_ban(account.id, catalog.id)
+            allowed, why = is_send_allowed(
+                account, catalog, pair_pref, bool(ban and ban.active)
+            )
+            if not allowed:
+                try:
+                    await api.patch_chat(sender_id, cid, active=False)
+                except SenderAPIError:
+                    pass
+                await log.emit(
+                    f"Sender: «{title}» выключен ({why})",
+                    notify=False,
+                )
+                continue
+        override = pick_text_override(pair_pref)
+        if override is not None:
+            text, ents = render_post(
+                override, entities_loads(pair_pref.entities_json), tag
+            )
+            kind_note = "свой текст"
+        else:
+            text, ents = render_post(
+                post.text,
+                entities_loads(post.entities_json),
+                tag,
+            )
         chat_mentions = (
             mentions_on if pref is None or pref.mention < 0 else bool(pref.mention)
         )
         await push_chat_text(
             api, sender_id, cid, text, ents, mentions_enabled=chat_mentions
         )
+        if catalog and int(catalog.max_posts_per_account or 0) > 0:
+            try:
+                await api.patch_chat(
+                    sender_id, cid, interval=effective_interval_seconds(catalog)
+                )
+                kind_note += f", лимит {catalog.max_posts_per_account}/сут"
+            except SenderAPIError as e:
+                await log.emit(
+                    f"Sender: лимит постов для «{title}» не применился: {e}", "error"
+                )
         sender_count += 1
         await log.emit(
             f"Sender: включил «{title}» ({kind_note}, "
@@ -1252,3 +1371,46 @@ async def run_dead_setup(
         current = await store.get_account(account_id)
         if current and current.status == "running":
             await store.update_account(account_id, status="idle")
+
+
+async def run_sender_refresh(
+    store: Store,
+    account_id: int,
+    bot: Bot | None = None,
+    admin_chat_id: int | None = None,
+    *,
+    job_kind: str = "sender_refresh",
+) -> int:
+    """Перенастроить только sender у аккаунта (без пересборки schedule)."""
+    account = await store.get_account(account_id)
+    if not account or not account.has_sender:
+        return 0
+    posts = {
+        "ru": await store.get_post(account.id, "ru"),
+        "en": await store.get_post(account.id, "en"),
+        "ru_short": await store.get_post(account.id, "ru_short"),
+        "en_short": await store.get_post(account.id, "en_short"),
+    }
+    has_any = any(
+        (p.text or "").strip() or p.has_text_link or p.has_photo_link for p in posts.values()
+    )
+    job = await store.create_job(job_kind, account.id)
+    log = LogSink(store, job.id, bot, admin_chat_id)
+    if not has_any:
+        await store.finish_job(job.id, "error", "нет поста")
+        await log.emit(f"{account.label}: sender не настроен — задайте пост", "error")
+        return 0
+    try:
+        chats = await store.list_chats(enabled_only=True)
+        schedule_chats = [c for c in chats if c.is_schedule]
+        sender_chats = [c for c in chats if c.kind == "sender"]
+        count = await _configure_sender(
+            store, account, posts, schedule_chats, sender_chats, log
+        )
+        await store.finish_job(job.id, "done", f"sender: {count} чатов")
+        return count
+    except Exception as e:
+        err = f"{type(e).__name__}: {e}"
+        await store.finish_job(job.id, "error", err)
+        await log.emit(f"{account.label}: sender не настроен — {err}", "error")
+        return 0

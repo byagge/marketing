@@ -74,3 +74,15 @@ class MakeSession(StatesGroup):
 
 class EditChatText(StatesGroup):
     text = State()
+
+
+class PairSearch(StatesGroup):
+    query = State()
+
+
+class PairText(StatesGroup):
+    text = State()
+
+
+class ChatLimit(StatesGroup):
+    value = State()

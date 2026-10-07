@@ -3,15 +3,17 @@ from aiogram import Dispatcher
 from app.bot.handlers import (
     acc_chats_router,
     accounts_router,
+    autopilot_router,
     balance_router,
-    facts_router,
-    restrictions_router,
     chats_router,
+    facts_router,
     membership_router,
     menu_router,
     online_router,
     ops_router,
     posts_router,
+    prefs_router,
+    restrictions_router,
     sender_router,
     session_maker_router,
     table_router,
@@ -21,6 +23,8 @@ from app.bot.handlers import (
 def setup_routers(dp: Dispatcher) -> None:
     dp.include_router(menu_router)
     dp.include_router(accounts_router)
+    dp.include_router(prefs_router)
+    dp.include_router(autopilot_router)
     dp.include_router(membership_router)
     dp.include_router(acc_chats_router)
     dp.include_router(facts_router)

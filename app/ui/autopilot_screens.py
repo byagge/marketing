@@ -1,0 +1,100 @@
+"""Экраны: чаты аккаунта (выключатели/тексты), автопилот, диагностика."""
+
+from __future__ import annotations
+
+from html import escape
+
+from app.models import Account, AccountChatPref, Chat, ChatBan, JoinState
+from app.ui.emoji import pe
+from app.utils.send_policy import effective_interval_minutes
+
+JOIN_STATUS_TEXT = {
+    "member": "в чате",
+    "pending": "ждёт вступления",
+    "requested": "заявка отправлена",
+    "manual": "нужно вручную",
+    "abandoned": "автопилот сдался",
+}
+
+
+def pair_mark(pref: AccountChatPref | None, ban: ChatBan | None) -> str:
+    if ban is not None and ban.active:
+        return "🚫"
+    if pref is not None and not pref.enabled:
+        return "⛔"
+    return "✅"
+
+
+def pair_list_html(
+    acc: Account,
+    shown: int,
+    total: int,
+    query: str,
+    off_n: int,
+    text_n: int,
+    ban_n: int,
+) -> str:
+    sender = "включён" if acc.sender_on else "ВЫКЛЮЧЕН"
+    q = f"\n{pe('search')} Поиск: <code>{escape(query)}</code> — найдено {shown} из {total}" if query else ""
+    return (
+        f"{pe('users')} <b>Чаты аккаунта {escape(acc.label)}</b>\n"
+        f"{pe('cube')} Sender аккаунта: <b>{sender}</b>\n"
+        f"✅ шлёт · ⛔ выключено вручную ({off_n}) · 🚫 бан ({ban_n}) · ✎ свой текст ({text_n})"
+        f"{q}\n\n"
+        f"Выберите чат, чтобы включить/выключить отправку или задать свой текст."
+    )
+
+
+def pair_card_html(
+    acc: Account,
+    chat: Chat,
+    pref: AccountChatPref,
+    ban: ChatBan | None,
+    join: JoinState | None,
+) -> str:
+    kind = "schedule" if chat.is_schedule else "sender"
+    send = f"{pe('check')} включена" if pref.enabled else f"{pe('block')} <b>ВЫКЛЮЧЕНА</b>"
+    lines = [
+        f"{pe('user')} <b>{escape(acc.label)}</b> → {pe('mega')} <b>{escape(chat.display_name)}</b> ({kind})",
+        f"Отправка: {send}",
+    ]
+    if kind == "sender" and not acc.sender_on:
+        lines.append(f"{pe('warn')} Sender у аккаунта выключен целиком — этот чат не шлёт.")
+    if ban is not None and ban.active:
+        lines.append(
+            f"{pe('warn')} <b>Бан:</b> {escape(ban.reason)} · {escape((ban.detected_at or '')[:16])} UTC"
+            + (f"\n<code>{escape(ban.detail[:200])}</code>" if ban.detail else "")
+        )
+    if pref.has_text:
+        prev = pref.text.strip().replace("\n", " ")
+        prev = prev[:160] + ("…" if len(prev) > 160 else "")
+        lines.append(f"{pe('bookmark')} Свой текст: <b>есть</b> ({len(pref.text)} симв., без фото)\n<i>{escape(prev)}</i>")
+    else:
+        lines.append(f"{pe('bookmark')} Свой текст: нет — берётся пост аккаунта")
+    if join is not None:
+        lines.append(
+            f"{pe('users')} Вступление: {escape(JOIN_STATUS_TEXT.get(join.status, join.status))}"
+            + (f" · <code>{escape(join.last_error[:120])}</code>" if join.last_error else "")
+        )
+    limit = int(chat.max_posts_per_account or 0)
+    if limit:
+        lines.append(
+            f"{pe('clock')} Лимит чата: {limit} постов/аккаунт/сутки "
+            f"(интервал не меньше {effective_interval_minutes(chat)} мин)"
+        )
+    return "\n".join(lines)
+
+
+def autopilot_html(enabled: bool, last_at: str, last_summary: str, open_bans: int, running: bool) -> str:
+    state = f"{pe('check')} <b>включён</b>" if enabled else f"{pe('block')} <b>выключен</b>"
+    run = f"\n{pe('robot')} Сейчас идёт проход…" if running else ""
+    when = escape((last_at or "—")[:16].replace("T", " ")) + (" UTC" if last_at else "")
+    summary = escape((last_summary or "").strip()[:1500]) or "—"
+    return (
+        f"{pe('robot')} <b>Автопилот</b>: {state}{run}\n\n"
+        f"Сам вступает в чаты, где аккаунта нет, настраивает отправку и пишет вам про баны "
+        f"и всё, где нужна ваша помощь.\n"
+        f"{pe('warn')} Активных банов в базе: <b>{open_bans}</b>\n"
+        f"{pe('clock')} Последний проход: {when}\n\n"
+        f"<b>Последняя сводка:</b>\n{summary}"
+    )

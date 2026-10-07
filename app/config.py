@@ -109,6 +109,17 @@ class Settings(BaseSettings):
     advisor_stop_share: float = 0.6
     advisor_warn_share: float = 0.35
 
+    # Автопилот: сам вступает в чаты, настраивает отправку, фиксирует баны.
+    autopilot_interval_min: int = 60
+    # Не более N вступлений на аккаунт за один проход (анти-Flood).
+    autopilot_join_per_tick: int = 3
+    autopilot_join_pause_min_sec: float = 20.0
+    autopilot_join_pause_max_sec: float = 45.0
+    autopilot_retry_hours: float = 6.0
+    autopilot_max_join_attempts: int = 5
+    # Не чаще раза в N часов перенастраивать sender аккаунта «по подозрению».
+    autopilot_sender_refresh_hours: float = 6.0
+
     @property
     def priority_keys(self) -> list[str]:
         return [p.strip().casefold() for p in self.priority_chats.split(",") if p.strip()]
