@@ -27,10 +27,16 @@ class SenderAPI:
         if not self.base:
             raise SenderAPIError("SENDER_API_URL не задан")
         url = f"{self.base}{path}"
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
-            response = await client.request(
-                method, url, headers=self._headers(), **kwargs
-            )
+        try:
+            async with httpx.AsyncClient(timeout=self.timeout) as client:
+                response = await client.request(
+                    method, url, headers=self._headers(), **kwargs
+                )
+        except httpx.HTTPError as e:
+            # Autoposter не запущен / сеть — для вызывающего это обычная ошибка API
+            raise SenderAPIError(
+                f"Autoposter недоступен: {type(e).__name__}: {e}".rstrip(": ")
+            ) from e
         if response.status_code == 401:
             raise SenderAPIError("Неверный API-ключ sender", 401)
         if response.status_code >= 400:

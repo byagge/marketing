@@ -72,6 +72,20 @@ class Settings(BaseSettings):
     # Не чаще раза в N часов перенастраивать sender аккаунта «по подозрению».
     autopilot_sender_refresh_hours: float = 6.0
 
+    # Спамблок (@SpamBot): проверка раз в N часов; нагрузка sender падает ступенями
+    # 50% сразу → 25% через ramp_1 часов → 0% (стоп sender) через ramp_2 часов.
+    # После снятия — recovery часов на 50%, потом 100%. dead_strikes повторов → dead.
+    spam_check_hours: float = 3.0
+    spam_ramp_hours_1: float = 6.0
+    spam_ramp_hours_2: float = 24.0
+    spam_recovery_hours: float = 6.0
+    spam_dead_strikes: int = 3
+    spam_strike_decay_days: int = 30
+
+    # «Ворота подписки»: сканируем чат на сообщение бота с кнопками-ссылками.
+    gate_checks_per_tick: int = 6
+    gate_recheck_hours: float = 12.0
+
     @property
     def nonpremium_hour(self) -> int:
         if self.nonpremium_reschedule_hour is not None:

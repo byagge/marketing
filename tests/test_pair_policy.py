@@ -7,6 +7,7 @@ import pytest
 from app.config import Settings
 from app.jobs import prefs as prefs_job
 from app.jobs import setup as setup_job
+from app.jobs import spam as spam_job
 from app.jobs import LogSink
 from app.models import Post
 from app.sender_api import SenderAPIError
@@ -71,6 +72,7 @@ def api(monkeypatch):
     FakeAPI.calls = []
     FakeAPI.live = []
     monkeypatch.setattr(setup_job, "SenderAPI", FakeAPI)
+    monkeypatch.setattr(spam_job, "SenderAPI", FakeAPI)
     monkeypatch.setattr(prefs_job, "_api", lambda: FakeAPI())
     return FakeAPI
 
@@ -355,7 +357,7 @@ async def test_apply_account_sender_toggle(store, api, monkeypatch):
         refreshed.append(account_id)
         return 4
 
-    monkeypatch.setattr(prefs_job, "run_sender_refresh", fake_refresh)
+    monkeypatch.setattr(setup_job, "run_sender_refresh", fake_refresh)
     await store.update_account(acc.id, sender_enabled=1)
     msg = await prefs_job.apply_account_sender(store, acc.id)
     assert refreshed == [acc.id] and "4" in msg

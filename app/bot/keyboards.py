@@ -132,8 +132,10 @@ def account_kb(acc: Account, running: bool = False) -> InlineKeyboardMarkup:
     )
     ping_label = "Online ping: вкл" if acc.online_ping_enabled else "Online ping: выкл"
     ping_icon = "check" if acc.online_ping_enabled else "block"
-    sender_label = "Sender: вкл" if acc.sender_on else "Sender: ВЫКЛ"
-    sender_icon = "check" if acc.sender_on else "block"
+    sender_label = "Отключить отправку по sender" if acc.sender_on else "Включить отправку по sender"
+    sender_icon = "block" if acc.sender_on else "check"
+    dead_label = "Вернуть из dead" if acc.is_dead else "Перевести в dead (только schedule)"
+    dead_icon = "check" if acc.is_dead else "warn"
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [start],
@@ -143,6 +145,10 @@ def account_kb(acc: Account, running: bool = False) -> InlineKeyboardMarkup:
             ],
             [ib("Чаты аккаунта: выкл / тексты", "acp_list", acc.id, icon="pin")],
             [ib(sender_label, "acc_sender", acc.id, icon=sender_icon)],
+            [
+                ib("Проверить спамблок", "acc_spam", acc.id, icon="shield"),
+                ib(dead_label, "acc_dead", acc.id, icon=dead_icon),
+            ],
             [ib("Проверка чатов", "acc_chats", acc.id, icon="users")],
             [ib("Вступить во все чаты", "acc_join_all", acc.id, icon="up")],
             [ib("Вступить по папке", "acc_folder", acc.id, icon="folder")],
@@ -308,6 +314,16 @@ def chat_kb(chat: Chat) -> InlineKeyboardMarkup:
     ]
     if chat.is_schedule:
         rows.append([ib("Таблица минут", "tbl", chat.id, icon="clock")])
+    rows.append(
+        [
+            ib(
+                "Писать нельзя: ДА" if chat.no_post else "Писать нельзя: нет",
+                "chat_nopost",
+                chat.id,
+                icon="block" if chat.no_post else "check",
+            )
+        ]
+    )
     limit = int(chat.max_posts_per_account or 0)
     rows.append(
         [

@@ -195,3 +195,12 @@ async def test_migration_adds_columns_to_legacy_db(tmp_path: Path):
     chat = (await store.list_chats())[0]
     assert acc.sender_on is True
     assert chat.max_posts_per_account == 0
+
+
+async def test_sender_api_network_errors_become_api_errors():
+    from app.sender_api import SenderAPI, SenderAPIError
+
+    api = SenderAPI("http://127.0.0.1:1", "k", timeout=1)  # порт закрыт
+    with pytest.raises(SenderAPIError) as ei:
+        await api.list_chats("sid")
+    assert "Autoposter недоступен" in str(ei.value)

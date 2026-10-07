@@ -111,10 +111,21 @@ def autopilot_kb(enabled: bool, running: bool) -> InlineKeyboardMarkup:
             )
         ],
         [ib("Сбросить «сдался / вручную»", "ap_reset", icon="hammer")],
-        [ib("База банов", "bans", icon="warn")],
+        [ib("База банов", "bans", icon="warn"), ib("Стоп-лист чатов", "sl", icon="block")],
         home_row(),
     ]
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def stoplist_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [ib("Изменить слова", "sl_edit", icon="hammer")],
+            [ib("Применить сейчас ко всем аккаунтам", "sl_apply", icon="up")],
+            [ib("Автопилот", "ap", icon="robot")],
+            home_row(),
+        ]
+    )
 
 
 def bans_kb() -> InlineKeyboardMarkup:
@@ -145,4 +156,5 @@ __all__ = [
     "diag_kb",
     "pair_card_kb",
     "pair_list_kb",
+    "stoplist_kb",
 ]

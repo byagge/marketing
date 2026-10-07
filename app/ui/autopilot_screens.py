@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from html import escape
 
-from app.models import Account, AccountChatPref, Chat, ChatBan, JoinState
+from app.models import Account, AccountChatPref, Chat, ChatBan, JoinState, SpamState
 from app.ui.emoji import pe
 from app.utils.send_policy import effective_interval_minutes
 
@@ -97,4 +97,59 @@ def autopilot_html(enabled: bool, last_at: str, last_summary: str, open_bans: in
         f"{pe('warn')} Активных банов в базе: <b>{open_bans}</b>\n"
         f"{pe('clock')} Последний проход: {when}\n\n"
         f"<b>Последняя сводка:</b>\n{summary}"
+    )
+
+
+def campaign_html(
+    acc: Account,
+    state: SpamState,
+    load: int,
+    schedule_n: int,
+    dead_strikes: int = 3,
+) -> str:
+    """Строка «в кампании ли аккаунт»: sender / schedule, спамблок, dead."""
+    sched = f"schedule: {schedule_n} чатов" if schedule_n else "schedule: нет настроенных чатов"
+    strikes = f" · спамблоков было: {state.strikes}/{dead_strikes}" if state.strikes else ""
+    head = f"{pe('mega')} <b>Кампания:</b> "
+    if acc.is_dead:
+        return (
+            f"{head}☠ <b>DEAD</b> — sender выключен навсегда, работает только "
+            f"{escape(sched)}{escape(strikes)}"
+        )
+    if not acc.sender_on:
+        return f"{head}⏸ <b>sender отключён вручную</b> — в кампании только {escape(sched)}"
+    if state.is_limited:
+        since = escape((state.limited_since or "")[:16].replace("T", " "))
+        until = (
+            f", Telegram снимет до {escape(state.limited_until[:16].replace('T', ' '))} UTC"
+            if state.limited_until
+            else ""
+        )
+        stop = "sender остановлен" if load <= 0 else f"sender {load}%"
+        return (
+            f"{head}🛡 <b>спамблок</b> с {since} UTC{until} — {stop}; "
+            f"{escape(sched)} без изменений{escape(strikes)}"
+        )
+    if not acc.has_sender:
+        return f"{head}ℹ sender не настроен — в кампании только {escape(sched)}"
+    if load < 100:
+        return (
+            f"{head}🔄 <b>восстановление после спамблока</b> — sender {load}%, "
+            f"{escape(sched)}{escape(strikes)}"
+        )
+    return f"{head}✅ <b>в кампании</b> — sender 100% + {escape(sched)}{escape(strikes)}"
+
+
+def stoplist_html(keywords: tuple[str, ...], flagged: list[str]) -> str:
+    words = ", ".join(f"<code>{escape(k)}</code>" for k in keywords) or "—"
+    chats = "\n".join(f"· {escape(t)}" for t in flagged[:30]) or "—"
+    more = f"\n· … ещё {len(flagged) - 30}" if len(flagged) > 30 else ""
+    return (
+        f"{pe('block')} <b>Стоп-лист: писать нельзя</b>\n\n"
+        f"Чаты, в которые писать нельзя (за это бан), — например «Отзывы». "
+        f"Туда не вступаем, не планируем и не шлём ни с одного аккаунта; "
+        f"если sender где-то уже активен — выключаем.\n\n"
+        f"{pe('search')} <b>Слова в названии:</b> {words}\n"
+        f"{pe('pin')} <b>Сейчас под запретом (каталог):</b>\n{chats}{more}\n\n"
+        f"Отдельный чат можно пометить на его карточке: «Писать нельзя»."
     )

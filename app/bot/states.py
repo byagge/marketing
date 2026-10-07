@@ -82,3 +82,7 @@ class PairText(StatesGroup):
 
 class ChatLimit(StatesGroup):
     value = State()
+
+
+class StopWords(StatesGroup):
+    value = State()

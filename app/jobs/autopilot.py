@@ -22,15 +22,18 @@ from aiogram import Bot
 from app.config import get_settings
 from app.jobs import runtime
 from app.jobs.bans import admin_target, format_ban_notice, register_ban
+from app.jobs.gate import gate_step
 from app.jobs.parallel import map_batches, setup_parallel_defaults
 from app.jobs.setup import run_sender_refresh, run_setup_chats_only
+from app.jobs.spam import account_load, run_spam_check, sync_sender_load
+from app.jobs.stoplist import sweep_stoplist
 from app.models import Account, Chat, JoinState
 from app.sender_api import SenderAPI, SenderAPIError
 from app.store import Store
 from app.tg.client import telethon_client
 from app.tg.join import check_membership, join_one, sort_chats_for_join
 from app.utils.chat_ids import chat_ids_match
-from app.utils.send_policy import classify_failure, join_due, removal_confirmed
+from app.utils.send_policy import classify_failure, is_no_post, join_due, removal_confirmed
 
 log = logging.getLogger("marketing.autopilot")
 
@@ -46,6 +49,9 @@ class AccountResult:
     failed: list[str] = field(default_factory=list)
     removed: list[str] = field(default_factory=list)
     setup_ok: list[str] = field(default_factory=list)
+    spam: list[str] = field(default_factory=list)
+    gates: list[str] = field(default_factory=list)
+    stopped: list[str] = field(default_factory=list)
     sender_refreshed: bool = False
     skipped: str = ""
     error: str = ""
@@ -59,6 +65,9 @@ class AccountResult:
             or self.failed
             or self.removed
             or self.setup_ok
+            or self.spam
+            or self.gates
+            or self.stopped
             or self.sender_refreshed
             or self.error
         )
@@ -132,20 +141,26 @@ async def process_account(
 
     prefs = await store.prefs_for_account(acc.id)
     banned = {b.chat_pk for b in await store.list_bans(account_id=acc.id)}
+    stoplist = await store.get_stoplist()
     eligible = [
         c
         for c in chats
-        if (prefs.get(c.id) is None or prefs[c.id].enabled) and c.id not in banned
+        if (prefs.get(c.id) is None or prefs[c.id].enabled)
+        and c.id not in banned
+        and not is_no_post(c, stoplist)  # «Отзывы» и т. п.: ни вступать, ни писать
     ]
-    if not eligible:
-        return res
 
-    chat_by_pk = {c.id: c for c in eligible}
     new_pks: set[int] = set()
+    member_pks: set[int] = set()
     joined_budget = max(0, int(cfg.autopilot_join_per_tick))
+    prev_state = await store.get_spam_state(acc.id)
 
     try:
         async with _open_client(acc) as client:
+            await _spam_step(store, acc, client, res)
+            # В спамблоке открытые чаты недоступны — вступления не тратим впустую.
+            if (await store.get_spam_state(acc.id)).is_limited:
+                joined_budget = 0
             report = await check_membership(client, eligible)
             member_pks = {c.id for c in report.joined}
             for chat in report.joined:
@@ -251,10 +266,43 @@ async def process_account(
                         )
                         tail = " — сдался, нужна помощь" if st.status == "abandoned" else ""
                         res.failed.append(f"{title}: {result.detail}{tail}")
+
+            # «Ворота подписки»: бот удаляет сообщение и просит подписаться на каналы.
+            if not is_cancelled():
+                members = [c for c in eligible if c.id in (member_pks | new_pks)]
+                try:
+                    for ev in await gate_step(
+                        store,
+                        client,
+                        acc,
+                        members,
+                        budget=cfg.gate_checks_per_tick,
+                        recheck_hours=cfg.gate_recheck_hours,
+                    ):
+                        if ev.kind == "resolved":
+                            res.gates.append(f"{ev.chat}: {ev.detail}")
+                        else:
+                            res.manual.append(f"{ev.chat}: {ev.detail}")
+                except Exception as e:
+                    res.failed.append(f"ворота подписки: {type(e).__name__}: {e}")
     except Exception as e:
         res.error = f"{type(e).__name__}: {e}"
         log.exception("autopilot: %s", acc.label)
         return res
+
+    # --- спамблок / dead: привести sender к нужной нагрузке -----------------------
+    acc = await store.get_account(acc.id) or acc
+    load = await account_load(store, acc)
+    refreshed = False
+    if load != prev_state.applied_load or (acc.is_dead and prev_state.applied_load != 0):
+        msg = await sync_sender_load(store, acc.id, None, None)
+        refreshed = bool(acc.has_sender)
+        res.sender_refreshed = refreshed
+        if acc.has_sender:  # без sender менять нечего — не шумим
+            res.spam.append(
+                f"{acc.label}: нагрузка sender {prev_state.applied_load}% → {load}% ({msg})"
+            )
+        res.sender_refreshed = False  # уже отражено строкой про нагрузку
 
     # --- настройка отправки там, где аккаунт уже в чате ---------------------
     in_chat = member_pks | new_pks
@@ -285,8 +333,13 @@ async def process_account(
             res.failed.append(f"schedule: {type(e).__name__}: {e}")
 
     sender_chats = [c for c in eligible if c.kind == "sender" and c.id in in_chat]
-    if sender_chats and not is_cancelled() and await _sender_needs_refresh(
-        store, acc, sender_chats, new_pks
+    if (
+        sender_chats
+        and not refreshed
+        and not acc.is_dead
+        and load > 0
+        and not is_cancelled()
+        and await _sender_needs_refresh(store, acc, sender_chats, new_pks)
     ):
         n = await run_sender_refresh(store, acc.id, None, None, job_kind="autopilot_sender")
         await store.set_setting(
@@ -296,7 +349,34 @@ async def process_account(
         res.sender_refreshed = True
         if n:
             res.setup_ok.append(f"sender×{n}")
+
+    # Чаты «писать нельзя» не должны оставаться активными в Autoposter ни у кого.
+    if (acc.sender_account_id or "").strip() and acc.sender_on and not acc.is_dead and load > 0:
+        res.stopped.extend(await sweep_stoplist(store, acc))
     return res
+
+
+async def _spam_step(store: Store, acc: Account, client, res: AccountResult) -> None:
+    """Проверка @SpamBot по расписанию; события → в сводку."""
+    check = await run_spam_check(store, acc, client)
+    if check.error and not check.skipped:
+        res.failed.append(f"@SpamBot: {check.error}")
+    state = await store.get_spam_state(acc.id)
+    cfg = get_settings()
+    for ev in check.events:
+        if ev == "limited_new":
+            until = f" (до {state.limited_until[:16].replace('T', ' ')} UTC)" if state.limited_until else ""
+            res.spam.append(
+                f"{acc.label}: 🛡 спамблок{until}, повтор {state.strikes}/{cfg.spam_dead_strikes} "
+                f"— снижаю нагрузку sender, schedule не трогаю"
+            )
+        elif ev == "cleared":
+            res.spam.append(f"{acc.label}: ✅ спамблок снят — возвращаю нагрузку постепенно")
+        elif ev == "dead":
+            res.spam.append(
+                f"{acc.label}: ☠ {state.strikes} спамблока подряд — перевожу в dead: "
+                f"sender выключен навсегда, остаётся только schedule"
+            )
 
 
 def format_digest(results: list[AccountResult]) -> str:
@@ -317,6 +397,15 @@ def format_digest(results: list[AccountResult]) -> str:
     block(
         "⚙ Настроил отправку",
         [f"{r.label}: {', '.join(r.setup_ok)}" for r in results if r.setup_ok],
+    )
+    block("🛡 Спамблок / нагрузка sender", [m for r in results for m in r.spam])
+    block(
+        "🔗 Подписался на обязательные каналы (ворота чата)",
+        [f"{r.label} → {m}" for r in results for m in r.gates],
+    )
+    block(
+        "⛔ Выключил чаты «писать нельзя»",
+        [f"{r.label}: {', '.join(r.stopped)}" for r in results if r.stopped],
     )
     block(
         "🚪 Вылетели из чата (подтверждено двумя проверками)",

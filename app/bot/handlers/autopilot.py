@@ -8,17 +8,19 @@ from aiogram import F, Router
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, Message
 
-from app.bot.kb_pairs import autopilot_kb, bans_kb, diag_kb
+from app.bot.kb_pairs import autopilot_kb, bans_kb, diag_kb, stoplist_kb
 from app.bot.keyboards import MenuCB, cancel_kb, chat_kb
 from app.bot.render import ask_input, finish_input, safe_edit
-from app.bot.states import ChatLimit
+from app.bot.states import ChatLimit, StopWords
 from app.context import ctx
 from app.jobs import runtime
 from app.jobs.autopilot import autopilot_enabled, run_autopilot
 from app.jobs.bans import ban_report_html
 from app.jobs.diagnose import diagnose_chat, diagnosis_html, live_membership
 from app.jobs.prefs import apply_chat_limit
-from app.ui.autopilot_screens import autopilot_html
+from app.jobs.stoplist import apply_stoplist_everywhere
+from app.utils.send_policy import is_no_post
+from app.ui.autopilot_screens import autopilot_html, stoplist_html
 from app.ui.screens import chat_html, prompt_html
 
 router = Router()
@@ -153,3 +155,87 @@ async def on_limit(message: Message, state: FSMContext) -> None:
     except RuntimeError:
         note = "Лимит сохранён (применение уже идёт).\n\n"
     await finish_input(message, note + chat_html(chat), chat_kb(chat))
+
+
+@router.callback_query(MenuCB.filter(F.a == "chat_nopost"))
+async def cb_nopost(query: CallbackQuery, callback_data: MenuCB) -> None:
+    from app.jobs.prefs import apply_chat_all
+
+    chat = await ctx.store.get_chat(callback_data.i)
+    if not chat:
+        await query.answer("Нет чата", show_alert=True)
+        return
+    new_val = 0 if chat.no_post else 1
+    chat = await ctx.store.update_chat(chat.id, no_post=new_val) or chat
+    bot, admin = query.bot, query.from_user.id
+
+    async def _job():
+        result = await apply_chat_all(ctx.store, chat.id, bot, admin)
+        try:
+            await bot.send_message(admin, result)
+        except Exception:
+            pass
+
+    try:
+        runtime.spawn("chat_nopost", chat.id, _job())
+        tail = " — применяю ко всем аккаунтам"
+    except RuntimeError:
+        tail = " (применение уже идёт)"
+    await query.answer(("Писать нельзя" if new_val else "Писать можно") + tail, show_alert=bool(new_val))
+    await safe_edit(query, chat_html(chat), chat_kb(chat))
+
+
+async def _stoplist_payload():
+    keywords = await ctx.store.get_stoplist()
+    flagged = [c.display_name for c in await ctx.store.list_chats() if is_no_post(c, keywords)]
+    return stoplist_html(keywords, flagged), stoplist_kb()
+
+
+@router.callback_query(MenuCB.filter(F.a == "sl"))
+async def cb_stoplist(query: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    text, markup = await _stoplist_payload()
+    await safe_edit(query, text, markup)
+
+
+@router.callback_query(MenuCB.filter(F.a == "sl_edit"))
+async def cb_stoplist_edit(query: CallbackQuery, state: FSMContext) -> None:
+    await state.set_state(StopWords.value)
+    text = prompt_html(
+        "Стоп-лист",
+        "Пришлите слова через запятую — чаты с ними в названии станут «писать нельзя».\n"
+        "Например: <code>отзыв, review, feedback</code>\n"
+        "<code>-</code> — очистить список.",
+        "block",
+    )
+    await safe_edit(query, text, cancel_kb())
+    await ask_input(query, text)
+
+
+@router.message(StopWords.value, F.text)
+async def on_stoplist_words(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    raw = (message.text or "").strip()
+    words = [] if raw in {"-", "0"} else [w for w in raw.replace("\n", ",").split(",")]
+    await ctx.store.set_stoplist(words)
+    text, markup = await _stoplist_payload()
+    await finish_input(message, "Стоп-лист сохранён. Нажмите «Применить сейчас», чтобы выключить уже активные чаты.\n\n" + text, markup)
+
+
+@router.callback_query(MenuCB.filter(F.a == "sl_apply"))
+async def cb_stoplist_apply(query: CallbackQuery) -> None:
+    bot, admin = query.bot, query.from_user.id
+
+    async def _job():
+        result = await apply_stoplist_everywhere(ctx.store, bot, admin)
+        try:
+            await bot.send_message(admin, result)
+        except Exception:
+            pass
+
+    try:
+        runtime.spawn("stoplist_apply", 0, _job())
+    except RuntimeError:
+        await query.answer("Уже применяется", show_alert=True)
+        return
+    await query.answer("Применяю ко всем аккаунтам — итог придёт сюда")

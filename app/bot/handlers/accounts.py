@@ -27,7 +27,20 @@ _cards: dict[int, tuple[int, int]] = {}
 async def _account_payload(acc):
     ru = await ctx.store.get_post(acc.id, "ru")
     en = await ctx.store.get_post(acc.id, "en")
-    return account_html(acc, ru, en), account_kb(acc, runtime.is_running("setup", acc.id))
+    from app.config import get_settings
+    from app.jobs.spam import account_load
+    from app.ui.autopilot_screens import campaign_html
+
+    state = await ctx.store.get_spam_state(acc.id)
+    load = await account_load(ctx.store, acc)
+    schedule_ids = {c.id for c in await ctx.store.list_chats(kind="schedule", enabled_only=True)}
+    ok_states = await ctx.store.list_setup_states(acc.id, statuses=["ok"])
+    schedule_n = sum(1 for st in ok_states if st.chat_pk in schedule_ids)
+    campaign = campaign_html(acc, state, load, schedule_n, get_settings().spam_dead_strikes)
+    return (
+        account_html(acc, ru, en, campaign),
+        account_kb(acc, runtime.is_running("setup", acc.id)),
+    )
 
 
 def remember_account_card(account_id: int, message: Message | None) -> None:

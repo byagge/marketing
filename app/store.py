@@ -22,6 +22,7 @@ from app.models import (
     Post,
     SenderSettings,
     SetupState,
+    SpamState,
 )
 
 SCHEMA = """
@@ -133,7 +134,23 @@ CREATE TABLE IF NOT EXISTS join_states (
     last_attempt_at TEXT NOT NULL DEFAULT '',
     last_member_at TEXT NOT NULL DEFAULT '',
     last_error TEXT NOT NULL DEFAULT '',
+    gate_at TEXT NOT NULL DEFAULT '',
+    gate_msg_id INTEGER NOT NULL DEFAULT 0,
+    gate_count INTEGER NOT NULL DEFAULT 0,
+    gate_note TEXT NOT NULL DEFAULT '',
     UNIQUE(account_id, chat_pk)
+);
+
+CREATE TABLE IF NOT EXISTS spam_states (
+    account_id INTEGER PRIMARY KEY REFERENCES accounts(id) ON DELETE CASCADE,
+    status TEXT NOT NULL DEFAULT 'clean',
+    strikes INTEGER NOT NULL DEFAULT 0,
+    limited_since TEXT NOT NULL DEFAULT '',
+    limited_until TEXT NOT NULL DEFAULT '',
+    cleared_at TEXT NOT NULL DEFAULT '',
+    last_check_at TEXT NOT NULL DEFAULT '',
+    last_text TEXT NOT NULL DEFAULT '',
+    applied_load INTEGER NOT NULL DEFAULT 100
 );
 
 CREATE TABLE IF NOT EXISTS settings (
@@ -182,6 +199,8 @@ DEFAULT_SETTINGS = {
     "autopilot_enabled": "1",
     "autopilot_last_at": "",
     "autopilot_last_summary": "",
+    # Чаты, в которые писать нельзя (ловит бан): совпадение по куску названия.
+    "stoplist_keywords": "отзыв,review",
 }
 
 
@@ -296,6 +315,8 @@ async def _migrate_accounts_premium(db: aiosqlite.Connection) -> None:
         await db.execute(
             "ALTER TABLE accounts ADD COLUMN sender_enabled INTEGER NOT NULL DEFAULT 1"
         )
+    if "dead" not in cols:
+        await db.execute("ALTER TABLE accounts ADD COLUMN dead INTEGER NOT NULL DEFAULT 0")
 
 
 async def _migrate_chats_invite(db: aiosqlite.Connection) -> None:
@@ -317,6 +338,23 @@ async def _migrate_chats_invite(db: aiosqlite.Connection) -> None:
         "max_posts_per_account": (
             "ALTER TABLE chats ADD COLUMN max_posts_per_account INTEGER NOT NULL DEFAULT 0"
         ),
+        "no_post": "ALTER TABLE chats ADD COLUMN no_post INTEGER NOT NULL DEFAULT 0",
+    }
+    for name, sql in alters.items():
+        if name not in cols:
+            await db.execute(sql)
+
+
+async def _migrate_join_states(db: aiosqlite.Connection) -> None:
+    cur = await db.execute("PRAGMA table_info(join_states)")
+    cols = {row[1] for row in await cur.fetchall()}
+    if not cols:
+        return
+    alters = {
+        "gate_at": "ALTER TABLE join_states ADD COLUMN gate_at TEXT NOT NULL DEFAULT ''",
+        "gate_msg_id": "ALTER TABLE join_states ADD COLUMN gate_msg_id INTEGER NOT NULL DEFAULT 0",
+        "gate_count": "ALTER TABLE join_states ADD COLUMN gate_count INTEGER NOT NULL DEFAULT 0",
+        "gate_note": "ALTER TABLE join_states ADD COLUMN gate_note TEXT NOT NULL DEFAULT ''",
     }
     for name, sql in alters.items():
         if name not in cols:
@@ -345,6 +383,7 @@ def _account(row: aiosqlite.Row) -> Account:
             if "sender_enabled" in keys and row["sender_enabled"] is not None
             else 1
         ),
+        dead=int(row["dead"]) if "dead" in keys and row["dead"] is not None else 0,
         status=row["status"] or "idle",
         last_error=row["last_error"] or "",
         created_at=row["created_at"] or "",
@@ -384,6 +423,7 @@ def _chat(row: aiosqlite.Row) -> Chat:
         text_kind=_s("text_kind", "full") or "full",
         allow_media=_i("allow_media", 1),
         max_posts_per_account=_i("max_posts_per_account", 0),
+        no_post=_i("no_post", 0),
         created_at=row["created_at"] or "",
     )
 
@@ -417,6 +457,7 @@ class Store:
             await _migrate_posts_columns(db)
             await _migrate_accounts_premium(db)
             await _migrate_chats_invite(db)
+            await _migrate_join_states(db)
             for key, value in DEFAULT_SETTINGS.items():
                 await db.execute(
                     "INSERT OR IGNORE INTO settings(key, value) VALUES(?, ?)",
@@ -585,6 +626,7 @@ class Store:
             await db.execute("DELETE FROM account_chat_prefs WHERE account_id=?", (account_id,))
             await db.execute("DELETE FROM chat_bans WHERE account_id=?", (account_id,))
             await db.execute("DELETE FROM join_states WHERE account_id=?", (account_id,))
+            await db.execute("DELETE FROM spam_states WHERE account_id=?", (account_id,))
             await db.execute("DELETE FROM minute_slots WHERE account_id=?", (account_id,))
             await db.execute("DELETE FROM posts WHERE account_id=?", (account_id,))
             await db.execute("DELETE FROM accounts WHERE id=?", (account_id,))
@@ -829,6 +871,7 @@ class Store:
             "text_kind",
             "allow_media",
             "max_posts_per_account",
+            "no_post",
         }
         fields = {k: v for k, v in fields.items() if k in allowed}
         if "garant_bot" in fields and fields["garant_bot"] is not None:
@@ -1403,6 +1446,10 @@ class Store:
             last_attempt_at=row["last_attempt_at"] or "",
             last_member_at=row["last_member_at"] or "",
             last_error=row["last_error"] or "",
+            gate_at=(row["gate_at"] if "gate_at" in keys else "") or "",
+            gate_msg_id=int(row["gate_msg_id"] or 0) if "gate_msg_id" in keys else 0,
+            gate_count=int(row["gate_count"] or 0) if "gate_count" in keys else 0,
+            gate_note=(row["gate_note"] if "gate_note" in keys else "") or "",
             account_label=(row["account_label"] if "account_label" in keys else "") or "",
             chat_title=(row["chat_title"] if "chat_title" in keys else "") or "",
         )
@@ -1532,3 +1579,88 @@ class Store:
             last_member_at="",
             last_error="",
         )
+
+
+    # ---- спамблок аккаунта ---------------------------------------------------
+
+    async def get_spam_state(self, account_id: int) -> SpamState:
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                "SELECT * FROM spam_states WHERE account_id=?", (account_id,)
+            )
+            row = await cur.fetchone()
+        if not row:
+            return SpamState(account_id=account_id)
+        return SpamState(
+            account_id=account_id,
+            status=row["status"] or "clean",
+            strikes=int(row["strikes"] or 0),
+            limited_since=row["limited_since"] or "",
+            limited_until=row["limited_until"] or "",
+            cleared_at=row["cleared_at"] or "",
+            last_check_at=row["last_check_at"] or "",
+            last_text=row["last_text"] or "",
+            applied_load=int(row["applied_load"] if row["applied_load"] is not None else 100),
+        )
+
+    async def save_spam_state(self, state: SpamState) -> SpamState:
+        async with self._connect() as db:
+            await db.execute(
+                "INSERT INTO spam_states(account_id, status, strikes, limited_since, "
+                "limited_until, cleared_at, last_check_at, last_text, applied_load) "
+                "VALUES(?,?,?,?,?,?,?,?,?) "
+                "ON CONFLICT(account_id) DO UPDATE SET status=excluded.status, "
+                "strikes=excluded.strikes, limited_since=excluded.limited_since, "
+                "limited_until=excluded.limited_until, cleared_at=excluded.cleared_at, "
+                "last_check_at=excluded.last_check_at, last_text=excluded.last_text, "
+                "applied_load=excluded.applied_load",
+                (
+                    state.account_id,
+                    state.status,
+                    state.strikes,
+                    state.limited_since,
+                    state.limited_until,
+                    state.cleared_at,
+                    state.last_check_at,
+                    (state.last_text or "")[:500],
+                    int(state.applied_load),
+                ),
+            )
+            await db.commit()
+        return await self.get_spam_state(state.account_id)
+
+    async def set_applied_load(self, account_id: int, load: int) -> None:
+        state = await self.get_spam_state(account_id)
+        state.applied_load = int(load)
+        await self.save_spam_state(state)
+
+    # ---- стоп-лист: чаты, куда писать нельзя --------------------------------
+
+    async def get_stoplist(self) -> tuple[str, ...]:
+        raw = await self.get_setting("stoplist_keywords", "")
+        return tuple(sorted({w.strip().casefold() for w in raw.split(",") if w.strip()}))
+
+    async def set_stoplist(self, words: list[str]) -> tuple[str, ...]:
+        clean = sorted({w.strip().casefold() for w in words if w and w.strip()})
+        await self.set_setting("stoplist_keywords", ",".join(clean))
+        return tuple(clean)
+
+    async def mark_gate(
+        self,
+        account_id: int,
+        chat_pk: int,
+        *,
+        msg_id: int | None = None,
+        note: str = "",
+        resolved: bool = False,
+    ) -> None:
+        """Зафиксировать сканирование «ворот» подписки; resolved — подписывались."""
+        state = await self.get_join_state(account_id, chat_pk)
+        fields: dict[str, Any] = {
+            "gate_at": _now(),
+            "gate_note": (note or "")[:300],
+            "gate_msg_id": int(msg_id) if msg_id else (state.gate_msg_id if state else 0),
+            "gate_count": (state.gate_count if state else 0) + (1 if resolved else 0),
+        }
+        await self._upsert_join_state(account_id, chat_pk, **fields)

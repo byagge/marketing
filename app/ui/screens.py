@@ -44,7 +44,11 @@ def info_html() -> str:
         f"{pe('robot')} Автопилот сам вступает в чаты и настраивает отправку; "
         f"баны и вылеты идут в базу «Баны» и вам в чат.\n"
         f"{pe('pin')} На аккаунте: выключатель sender, выкл. отдельных чатов (с поиском) "
-        f"и свой текст для пары аккаунт × чат."
+        f"и свой текст для пары аккаунт × чат.\n"
+        f"{pe('shield')} Спамблок (@SpamBot): sender постепенно замедляется и останавливается, "
+        f"schedule не трогаем; после повторов — dead (только schedule).\n"
+        f"{pe('block')} Стоп-лист: чаты «писать нельзя» (например «Отзывы»).\n"
+        f"{pe('link')} Ворота подписки: аккаунт сам подписывается на каналы, которые требует бот чата."
     )
 
 
@@ -59,14 +63,21 @@ def accounts_html(accounts: list[Account]) -> str:
         live = pe("check") if acc.has_telethon else pe("block")
         run = f" {pe('robot')} фон" if runtime.is_running("setup", acc.id) else ""
         uname = f"@{acc.username}" if acc.username else escape(acc.label)
+        camp = (
+            " · ☠ dead"
+            if acc.is_dead
+            else " · ⏸ sender выкл"
+            if not acc.sender_on
+            else ""
+        )
         lines.append(
             f"{live} <b>{escape(uname)}</b> <code>#{acc.id}</code>{run}\n"
-            f"   статус: <code>{escape(acc.status)}</code>"
+            f"   статус: <code>{escape(acc.status)}</code>{camp}"
         )
     return "\n".join(lines)
 
 
-def account_html(acc: Account, ru=None, en=None) -> str:
+def account_html(acc: Account, ru=None, en=None, campaign: str = "") -> str:
     uname = f"@{acc.username}" if acc.username else "—"
     run = runtime.is_running("setup", acc.id)
     err = f"\n{pe('warn')} <b>Ошибка:</b> {escape(acc.last_error)}" if acc.last_error else ""
@@ -110,6 +121,7 @@ def account_html(acc: Account, ru=None, en=None) -> str:
 
     return (
         f"{pe('user')} <b>{escape(acc.label)}</b>\n\n"
+        f"{campaign + chr(10) + chr(10) if campaign else ''}"
         f"{pe('at')} {escape(uname)}\n"
         f"{pe('term')} tg_id: <code>{acc.user_id or '—'}</code>\n"
         f"{pe('bookmark')} статус: <code>{escape(acc.status)}</code>"

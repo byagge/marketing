@@ -6,6 +6,7 @@ import pytest
 
 from app.config import Settings
 from app.jobs import autopilot
+from app.jobs.spam import SpamCheckResult
 from app.store import Store
 from app.tg.join import JoinResult, MembershipReport
 
@@ -91,6 +92,33 @@ def world(monkeypatch):
         w.sender_calls.append(account_id)
         return 1
 
+    w.spam_events = []
+    w.gate_events = []
+    w.stopped = []
+
+    async def fake_spam(store, acc, client, **kw):
+        res = SpamCheckResult(account=acc, skipped="test")
+        res.events = list(w.spam_events)
+        w.spam_events = []
+        return res
+
+    async def fake_gate(store, client, acc, chats, **kw):
+        out, w.gate_events = list(w.gate_events), []
+        return out
+
+    async def fake_sweep(store, acc, api=None):
+        return list(w.stopped)
+
+    w.sync_calls = []
+
+    async def fake_sync(store, account_id, bot=None, admin=None):
+        w.sync_calls.append(account_id)
+        return "ок"
+
+    monkeypatch.setattr(autopilot, "sync_sender_load", fake_sync)
+    monkeypatch.setattr(autopilot, "run_spam_check", fake_spam)
+    monkeypatch.setattr(autopilot, "gate_step", fake_gate)
+    monkeypatch.setattr(autopilot, "sweep_stoplist", fake_sweep)
     monkeypatch.setattr(autopilot, "_open_client", fake_open)
     monkeypatch.setattr(autopilot, "check_membership", fake_check)
     monkeypatch.setattr(autopilot, "join_one", fake_join)
@@ -348,3 +376,131 @@ async def test_one_account_error_does_not_break_others(store, world, monkeypatch
     assert ("good", chat.id) in world.joins
     text = "\n".join(t for _, t in bot.sent)
     assert "bad" in text and "session revoked" in text
+
+
+# ---- спамблок / dead / стоп-лист / ворота -----------------------------------
+
+
+from datetime import datetime, timedelta, timezone  # noqa: E402
+
+from app.jobs.gate import GateEvent  # noqa: E402
+
+
+def _limited_since(hours: float) -> str:
+    return (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat(timespec="seconds")
+
+
+async def test_spamblock_pauses_joins_lowers_load_and_reports(store, world):
+    acc = await _acc(store, "tron", sender_account_id="sid1")
+    await store.add_chat("MARKET 404", "-1001", invite_link="https://t.me/+abc")
+    st = await store.get_spam_state(acc.id)
+    st.status, st.limited_since, st.strikes = "limited", _limited_since(0.1), 1
+    await store.save_spam_state(st)
+    world.spam_events = ["limited_new"]
+    bot = FakeBot()
+
+    await autopilot.run_autopilot(store, bot, 5, force=True)
+
+    assert world.joins == []  # в спамблоке открытые чаты недоступны — не тратим попытки
+    assert world.sync_calls == [acc.id]  # нагрузка 100% → 50%: sender перенастроен
+    text = bot.sent[0][1]
+    assert "Спамблок" in text and "tron" in text and "schedule не трогаю" in text
+    assert "100% → 50%" in text
+
+
+async def test_ramp_down_step_without_new_check(store, world):
+    acc = await _acc(store, "tron", sender_account_id="sid1")
+    await store.add_chat("C", "-1001", invite_link="https://t.me/+abc")
+    st = await store.get_spam_state(acc.id)
+    st.status, st.limited_since, st.applied_load = "limited", _limited_since(8), 50
+    await store.save_spam_state(st)
+    bot = FakeBot()
+
+    await autopilot.run_autopilot(store, bot, 5, force=True)
+
+    assert world.sync_calls == [acc.id]
+    assert "50% → 25%" in bot.sent[0][1]
+    # ступень уже применена — следующий проход молчит
+    world.sync_calls.clear()
+    await store.set_applied_load(acc.id, 25)
+    bot2 = FakeBot()
+    await autopilot.run_autopilot(store, bot2, 5, force=True)
+    assert world.sync_calls == [] and bot2.sent == []
+
+
+async def test_dead_event_is_announced_and_sender_stopped_once(store, world):
+    acc = await _acc(store, "tron", sender_account_id="sid1")
+    await store.add_chat("C", "-1001", invite_link="https://t.me/+abc")
+    await store.update_account(acc.id, dead=1)
+    st = await store.get_spam_state(acc.id)
+    st.strikes = 3
+    await store.save_spam_state(st)
+    world.spam_events = ["limited_new", "dead"]
+    bot = FakeBot()
+
+    await autopilot.run_autopilot(store, bot, 5, force=True)
+
+    assert world.sync_calls == [acc.id]
+    assert "dead" in bot.sent[0][1] and "только schedule" in bot.sent[0][1]
+    await store.set_applied_load(acc.id, 0)
+    world.sync_calls.clear()
+    await autopilot.run_autopilot(store, FakeBot(), 5, force=True)
+    assert world.sync_calls == []
+
+
+async def test_dead_account_still_joins_and_keeps_schedule(store, world):
+    acc = await _acc(store, "tron", sender_account_id="sid1", dead=1)
+    await store.set_applied_load(acc.id, 0)
+    sched = await store.add_chat("Sched", "-1001", kind="schedule", invite_link="https://t.me/+a")
+    sender = await store.add_chat("Send", "-1002", kind="sender", invite_link="https://t.me/+b")
+
+    await autopilot.run_autopilot(store, FakeBot(), 5, force=True)
+
+    assert {c for _, c in world.joins} == {sched.id, sender.id}
+    assert world.setup_calls == [(acc.id, [sched.id])]  # schedule настроен
+    assert world.sender_calls == []  # sender не трогаем
+
+
+async def test_spamblock_cleared_is_reported(store, world):
+    acc = await _acc(store, "tron", sender_account_id="sid1")
+    await store.add_chat("C", "-1001", invite_link="https://t.me/+abc")
+    st = await store.get_spam_state(acc.id)
+    st.cleared_at, st.applied_load = datetime.now(timezone.utc).isoformat(), 0
+    await store.save_spam_state(st)
+    world.spam_events = ["cleared"]
+    bot = FakeBot()
+    await autopilot.run_autopilot(store, bot, 5, force=True)
+    assert "спамблок снят" in bot.sent[0][1] and "0% → 50%" in bot.sent[0][1]
+
+
+async def test_no_post_chats_are_not_joined_or_configured(store, world):
+    await _acc(store, "tron", sender_account_id="sid1")
+    ok = await store.add_chat("Услуги", "-1001", invite_link="https://t.me/+a")
+    await store.add_chat("Отзывы клиентов", "-1002", invite_link="https://t.me/+b")  # стоп-лист
+    flagged = await store.add_chat("Тихий чат", "-1003", invite_link="https://t.me/+c")
+    await store.update_chat(flagged.id, no_post=1)
+
+    await autopilot.run_autopilot(store, FakeBot(), 5, force=True)
+
+    assert [c for _, c in world.joins] == [ok.id]
+
+
+async def test_gate_and_stopped_reports(store, world):
+    await _acc(store, "tron", sender_account_id="sid1")
+    chat = await store.add_chat("Услуги", "-1001", invite_link="https://t.me/+a")
+    world.member.add(("tron", chat.id))
+    acc = (await store.list_accounts())[0]
+    await store.record_setup_ok(acc.id, chat.id)
+    world.gate_events = [
+        GateEvent("Услуги", "resolved", "@news_channel, нажал «Я подписался»"),
+        GateEvent("Упрямый", "unresolved", "бот снова требует подписку"),
+    ]
+    world.stopped = ["Отзывы клиентов"]
+    bot = FakeBot()
+
+    await autopilot.run_autopilot(store, bot, 5, force=True)
+
+    text = bot.sent[0][1]
+    assert "Подписался на обязательные каналы" in text and "@news_channel" in text
+    assert "Нужна помощь" in text and "Упрямый" in text
+    assert "Выключил чаты «писать нельзя»" in text and "Отзывы клиентов" in text
