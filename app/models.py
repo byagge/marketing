@@ -17,9 +17,10 @@ class Account:
     sender_account_id: str = ""
     is_premium: int = 0
     online_ping: int = 1
-    # 1 = «dead account»: расходник, без строгих проверок, шлёт во все доступные чаты
-    is_dead: int = 0
     sender_enabled: int = 1  # 0 = sender (Autoposter) для аккаунта выключен
+    # 1 = dead-режим: sender выключен навсегда, работает только schedule
+    # (колонка is_dead в БД — алиас той же семантики)
+    dead: int = 0
     status: str = "idle"
     last_error: str = ""
     created_at: str = ""
@@ -33,10 +34,6 @@ class Account:
     @property
     def is_spam_limited(self) -> bool:
         return self.spam_status == "limited"
-
-    @property
-    def dead(self) -> bool:
-        return bool(self.is_dead)
 
     @property
     def display(self) -> str:
@@ -58,6 +55,10 @@ class Account:
     @property
     def sender_on(self) -> bool:
         return bool(self.sender_enabled)
+
+    @property
+    def is_dead(self) -> bool:
+        return bool(self.dead)
 
     @property
     def has_sender(self) -> bool:
@@ -145,6 +146,8 @@ class Chat:
     allow_media: int = 1  # 0 = чат без фото, шлём текст / text-link
     # Жёсткий лимит чата: не более N постов на аккаунт за сутки (0 = без лимита)
     max_posts_per_account: int = 0
+    # 1 = в чат писать нельзя (например «Отзывы»): ни schedule, ни sender, ни автовступление
+    no_post: int = 0
     created_at: str = ""
 
     @property
@@ -449,5 +452,29 @@ class JoinState:
     last_attempt_at: str = ""
     last_member_at: str = ""
     last_error: str = ""
+    # «подписочные ворота»: бот удаляет сообщение и просит подписаться на каналы
+    gate_at: str = ""  # последнее сканирование чата на ворота
+    gate_msg_id: int = 0  # последнее обработанное сообщение-ворота
+    gate_count: int = 0  # сколько раз подписывались ради этого чата
+    gate_note: str = ""
     account_label: str = ""
     chat_title: str = ""
+
+
+@dataclass
+class SpamState:
+    """Состояние спамблока аккаунта (по ответам @SpamBot)."""
+
+    account_id: int
+    status: str = "clean"  # clean | limited
+    strikes: int = 0  # сколько раз аккаунт попадал в спамблок
+    limited_since: str = ""
+    limited_until: str = ""  # когда Telegram обещает снять, если сказал
+    cleared_at: str = ""
+    last_check_at: str = ""
+    last_text: str = ""
+    applied_load: int = 100  # нагрузка sender, которую реально применили в Autoposter
+
+    @property
+    def is_limited(self) -> bool:
+        return self.status == "limited"

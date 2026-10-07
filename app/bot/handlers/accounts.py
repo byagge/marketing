@@ -27,7 +27,20 @@ _cards: dict[int, tuple[int, int]] = {}
 async def _account_payload(acc):
     ru = await ctx.store.get_post(acc.id, "ru")
     en = await ctx.store.get_post(acc.id, "en")
-    return account_html(acc, ru, en), account_kb(acc, runtime.is_running("setup", acc.id))
+    from app.config import get_settings
+    from app.jobs.spam import account_load
+    from app.ui.autopilot_screens import campaign_html
+
+    state = await ctx.store.get_spam_state(acc.id)
+    load = await account_load(ctx.store, acc)
+    schedule_ids = {c.id for c in await ctx.store.list_chats(kind="schedule", enabled_only=True)}
+    ok_states = await ctx.store.list_setup_states(acc.id, statuses=["ok"])
+    schedule_n = sum(1 for st in ok_states if st.chat_pk in schedule_ids)
+    campaign = campaign_html(acc, state, load, schedule_n, get_settings().spam_dead_strikes)
+    return (
+        account_html(acc, ru, en, campaign),
+        account_kb(acc, runtime.is_running("setup", acc.id)),
+    )
 
 
 def remember_account_card(account_id: int, message: Message | None) -> None:
@@ -379,30 +392,6 @@ async def cb_acc_online(query: CallbackQuery, callback_data: MenuCB) -> None:
         return
     await show_account_card(query, acc)
     await query.answer("Online ping вкл" if new_val else "Online ping выкл")
-
-
-@router.callback_query(MenuCB.filter(F.a == "acc_dead"))
-async def cb_acc_dead(query: CallbackQuery, callback_data: MenuCB) -> None:
-    acc = await ctx.store.get_account(callback_data.i)
-    if not acc:
-        await query.answer("Нет аккаунта", show_alert=True)
-        return
-    new_val = 0 if acc.dead else 1
-    await ctx.store.update_account(acc.id, is_dead=new_val)
-    if new_val:
-        # освободить минуты в сетках чатов — для живых аккаунтов
-        await ctx.store.delete_slots_for_account(acc.id)
-    acc = await ctx.store.get_account(acc.id)
-    if not acc:
-        await query.answer("Аккаунт не найден", show_alert=True)
-        return
-    await show_account_card(query, acc)
-    await query.answer(
-        "Dead: вкл. Нажмите «Старт» — разошлю по всем доступным чатам"
-        if new_val
-        else "Dead: выкл. Нажмите «Старт» — вернётся в обычную сетку",
-        show_alert=True,
-    )
 
 
 @router.callback_query(MenuCB.filter(F.a == "acc_ren"))

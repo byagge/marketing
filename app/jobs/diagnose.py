@@ -7,8 +7,9 @@ from dataclasses import dataclass, field
 from html import escape
 
 from app.models import Account, Chat
+from app.jobs.spam import account_load
 from app.store import Store
-from app.utils.send_policy import REASON_LABEL, is_send_allowed, pick_text_override
+from app.utils.send_policy import REASON_LABEL, is_no_post, is_send_allowed, pick_text_override
 from app.utils.templates import pick_post_for_chat
 
 
@@ -52,6 +53,9 @@ async def diagnose_chat(
     }
 
     diag = ChatDiagnosis(chat=chat, accounts_total=len(accounts))
+    keywords = await store.get_stoplist()
+    if is_no_post(chat, keywords):
+        diag.notes.append("В чат писать нельзя (флаг или стоп-лист) — отправка везде выключена намеренно.")
 
     if not chat.enabled:
         diag.notes.append("Чат выключен в каталоге — отправки нет ни у кого.")
@@ -82,6 +86,8 @@ async def diagnose_chat(
             live_members.get(acc.id) if live_members is not None else None,
             live_known=live_members is not None and acc.id in live_members,
             has_text=await _has_text(store, acc, chat, prefs.get(acc.id)),
+            spam_load=await account_load(store, acc),
+            stoplist=keywords,
         )
         if why:
             diag.reasons[why].append(acc.label)
@@ -113,8 +119,12 @@ def _account_reason(
     *,
     live_known: bool,
     has_text: bool,
+    spam_load: int = 100,
+    stoplist: tuple[str, ...] = (),
 ) -> str:
-    allowed, why = is_send_allowed(acc, chat, pref, bool(ban and ban.active))
+    allowed, why = is_send_allowed(
+        acc, chat, pref, bool(ban and ban.active), spam_load=spam_load, stoplist=stoplist
+    )
     if not allowed:
         label = REASON_LABEL.get(why, why)
         if why == "banned" and ban is not None:
@@ -132,6 +142,8 @@ def _account_reason(
         return "не удалось проверить членство (ошибка Telethon)"
     if join_state is not None and join_state.status in {"manual", "abandoned"}:
         return f"не вступил: {join_state.last_error or join_state.status}"
+    if join_state is not None and join_state.gate_note.startswith("unresolved"):
+        return "бот чата требует подписку, а подписка не помогает (нужна помощь)"
     if join_state is not None and join_state.status == "requested":
         return "заявка на вступление ждёт одобрения"
     if join_state is not None and join_state.status == "pending" and join_state.miss_count:

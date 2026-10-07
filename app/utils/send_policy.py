@@ -13,13 +13,34 @@ REASON_PAIR_OFF = "pair_off"
 REASON_BANNED = "banned"
 REASON_CHAT_OFF = "chat_off"
 REASON_SENDER_OFF = "sender_off"
+REASON_DEAD = "dead"
+REASON_SPAMBLOCK = "spamblock"
+REASON_NO_POST = "no_post"
 
 REASON_LABEL = {
     REASON_PAIR_OFF: "отключено вручную для этого аккаунта",
     REASON_BANNED: "бан в чате",
     REASON_CHAT_OFF: "чат выключен в каталоге",
     REASON_SENDER_OFF: "sender у аккаунта выключен",
+    REASON_DEAD: "аккаунт в dead-режиме (sender выключен, только schedule)",
+    REASON_SPAMBLOCK: "спамблок: sender остановлен на время блока",
+    REASON_NO_POST: "в чат писать нельзя (стоп-лист)",
 }
+
+
+def matches_stoplist(title: str, keywords: tuple[str, ...] | list[str]) -> bool:
+    """Название чата содержит слово из стоп-листа (регистр не важен)."""
+    low = (title or "").casefold()
+    return bool(low) and any(k and k.casefold() in low for k in keywords)
+
+
+def is_no_post(chat: Chat, keywords: tuple[str, ...] | list[str] = ()) -> bool:
+    """Чат помечен «писать нельзя» или попал в стоп-лист по названию."""
+    if chat.no_post:
+        return True
+    return matches_stoplist(chat.title, keywords) or matches_stoplist(
+        chat.display_name, keywords
+    )
 
 
 def is_send_allowed(
@@ -27,21 +48,32 @@ def is_send_allowed(
     chat: Chat,
     pref: AccountChatPref | None,
     banned: bool,
+    *,
+    spam_load: int = 100,
+    stoplist: tuple[str, ...] | list[str] = (),
 ) -> tuple[bool, str]:
     """
     Можно ли аккаунту слать в чат. Возвращает (ok, причина-ключ или "").
 
-    - выключатель пары и бан действуют на schedule и sender;
-    - выключатель sender у аккаунта — только на sender-чаты.
+    - «писать нельзя» (флаг чата / стоп-лист), выключатель пары и бан — на schedule и sender;
+    - dead, выключатель sender и спамблок (нагрузка 0%) — только на sender-чаты:
+      schedule при спамблоке и dead остаётся как есть.
     """
     if not chat.enabled:
         return False, REASON_CHAT_OFF
+    if is_no_post(chat, stoplist):
+        return False, REASON_NO_POST
     if pref is not None and not pref.enabled:
         return False, REASON_PAIR_OFF
     if banned:
         return False, REASON_BANNED
-    if chat.kind == "sender" and not account.sender_on:
-        return False, REASON_SENDER_OFF
+    if chat.kind == "sender":
+        if account.is_dead:
+            return False, REASON_DEAD
+        if not account.sender_on:
+            return False, REASON_SENDER_OFF
+        if spam_load <= 0:
+            return False, REASON_SPAMBLOCK
     return True, ""
 
 

@@ -9,9 +9,9 @@ from app.jobs import LogSink
 from app.jobs.parallel import map_batches, setup_parallel_defaults
 from app.jobs.setup import (
     clear_scheduled_for_pair,
-    run_sender_refresh,
     run_setup_chats_only,
 )
+from app.jobs.spam import account_load, sync_sender_load
 from app.models import Account, Chat
 from app.sender_api import SenderAPI, SenderAPIError
 from app.store import Store
@@ -25,6 +25,7 @@ from app.utils.send_policy import (
     is_send_allowed,
     pick_text_override,
 )
+from app.utils.spamstate import scale_seconds
 from app.utils.templates import pick_post_for_chat, render_post
 
 
@@ -59,14 +60,22 @@ async def apply_pair(
         return "аккаунт или чат не найден"
     pref = await store.get_chat_pref(account.id, chat.id)
     ban = await store.get_ban(account.id, chat.id)
-    allowed, why = is_send_allowed(account, chat, pref, bool(ban and ban.active))
+    load = await account_load(store, account)
+    allowed, why = is_send_allowed(
+        account,
+        chat,
+        pref,
+        bool(ban and ban.active),
+        spam_load=load,
+        stoplist=await store.get_stoplist(),
+    )
     job = await store.create_job("pair_apply", account.id)
     log = LogSink(store, job.id, bot, admin_chat_id)
     try:
         if chat.is_schedule:
             result = await _apply_schedule(store, account, chat, allowed, why, bot, admin_chat_id, log)
         else:
-            result = await _apply_sender(store, account, chat, pref, allowed, why)
+            result = await _apply_sender(store, account, chat, pref, allowed, why, load)
         await store.finish_job(job.id, "done", result)
         return result
     except Exception as e:
@@ -115,6 +124,7 @@ async def _apply_sender(
     pref,
     allowed: bool,
     why: str,
+    load: int = 100,
 ) -> str:
     sid = (account.sender_account_id or "").strip()
     if not sid:
@@ -136,7 +146,9 @@ async def _apply_sender(
     ss = await store.sender_settings()
     await push_chat_text(api, sid, cid, text, ents, mentions_enabled=ss.mentions_enabled)
     if int(chat.max_posts_per_account or 0) > 0:
-        await api.patch_chat(sid, cid, interval=effective_interval_seconds(chat))
+        await api.patch_chat(
+            sid, cid, interval=scale_seconds(effective_interval_seconds(chat), load)
+        )
     try:
         info = await api.get_account(sid)
         if not info.get("spam"):
@@ -152,25 +164,38 @@ async def apply_account_sender(
     bot: Bot | None = None,
     admin_chat_id: int | None = None,
 ) -> str:
-    """Применить выключатель sender у аккаунта (стоп или полная перенастройка sender)."""
+    """Применить выключатель sender / dead / нагрузку аккаунта в Autoposter."""
     account = await store.get_account(account_id)
     if not account:
         return "аккаунт не найден"
-    sid = (account.sender_account_id or "").strip()
-    if not account.sender_on:
-        if not sid:
-            return "sender выключен (Sender ID не задан)"
-        try:
-            await _api().spam_stop(sid)
-        except SenderAPIError as e:
-            return f"sender выключен в системе, но Autoposter не остановил: {e}"
-        return "sender остановлен в Autoposter"
-    if not account.has_sender:
+    if account.sender_on and not account.is_dead and not account.has_sender:
         return "sender включён, но у аккаунта нет Sender ID / Pyrogram+token"
-    n = await run_sender_refresh(
-        store, account.id, bot, admin_chat_id, job_kind="sender_toggle"
-    )
-    return f"sender включён, чатов в рассылке: {n}"
+    return await sync_sender_load(store, account_id, bot, admin_chat_id)
+
+
+async def apply_chat_all(
+    store: Store,
+    chat_pk: int,
+    bot: Bot | None = None,
+    admin_chat_id: int | None = None,
+) -> str:
+    """Применить настройки чата (например «писать нельзя») ко всем аккаунтам."""
+    chat = await store.get_chat(chat_pk)
+    if not chat:
+        return "чат не найден"
+    accounts = [
+        a
+        for a in await store.list_accounts()
+        if a.telethon_session or (a.sender_account_id or "").strip()
+    ]
+    size, pause = setup_parallel_defaults()
+
+    async def _one(acc: Account) -> str:
+        return await apply_pair(store, acc.id, chat.id)
+
+    results = await map_batches(accounts, _one, batch_size=size, batch_pause=pause)
+    bad = sum(1 for r in results if isinstance(r, BaseException) or str(r).startswith("ошибка"))
+    return f"«{chat.display_name}»: применено к {len(results) - bad} из {len(results)} аккаунтам"
 
 
 async def apply_chat_limit(

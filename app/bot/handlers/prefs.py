@@ -314,3 +314,84 @@ async def cb_sender_toggle(query: CallbackQuery, callback_data: MenuCB) -> None:
     acc = await ctx.store.get_account(acc.id)
     if acc:
         await show_account_card(query, acc)
+
+
+@router.callback_query(MenuCB.filter(F.a == "acc_dead"))
+async def cb_dead_toggle(query: CallbackQuery, callback_data: MenuCB) -> None:
+    from app.bot.handlers.accounts import show_account_card
+
+    acc = await ctx.store.get_account(callback_data.i)
+    if not acc:
+        await query.answer("Нет аккаунта", show_alert=True)
+        return
+    if acc.is_dead:
+        # вернуть из dead: счётчик повторов обнуляем, иначе следующий спамблок сразу вернёт в dead
+        await ctx.store.update_account(acc.id, dead=0)
+        state = await ctx.store.get_spam_state(acc.id)
+        state.strikes = 0
+        await ctx.store.save_spam_state(state)
+        note = "Аккаунт возвращён из dead"
+    else:
+        await ctx.store.update_account(acc.id, dead=1)
+        # освободить минуты в сетках — для живых аккаунтов слоты больше не резервируем
+        await ctx.store.delete_slots_for_account(acc.id)
+        note = "Аккаунт в dead: sender выключен, работает только schedule"
+    bot, admin = query.bot, query.from_user.id
+
+    async def _job():
+        result = await apply_account_sender(ctx.store, acc.id, bot, admin)
+        try:
+            await bot.send_message(admin, f"{acc.label}: {result}")
+        except Exception:
+            pass
+
+    try:
+        runtime.spawn("sender_toggle", acc.id, _job())
+    except RuntimeError:
+        note += " (применение уже идёт)"
+    await query.answer(note, show_alert=True)
+    fresh = await ctx.store.get_account(acc.id)
+    if fresh:
+        await show_account_card(query, fresh)
+
+
+@router.callback_query(MenuCB.filter(F.a == "acc_spam"))
+async def cb_spam_check(query: CallbackQuery, callback_data: MenuCB) -> None:
+    from app.jobs.spam import run_spam_check, sync_sender_load
+    from app.tg.client import telethon_client
+
+    acc = await ctx.store.get_account(callback_data.i)
+    if not acc:
+        await query.answer("Нет аккаунта", show_alert=True)
+        return
+    if not acc.telethon_session:
+        await query.answer("Нужен Telethon session", show_alert=True)
+        return
+    bot, admin = query.bot, query.from_user.id
+
+    async def _job():
+        try:
+            async with telethon_client(acc.telethon_session) as client:
+                check = await run_spam_check(ctx.store, acc, client, force=True)
+        except Exception as e:
+            await bot.send_message(admin, f"{acc.label}: проверка @SpamBot не удалась — {type(e).__name__}: {e}")
+            return
+        state = await ctx.store.get_spam_state(acc.id)
+        if check.error:
+            text = f"{acc.label}: @SpamBot — {check.error}"
+        elif state.is_limited:
+            until = f", снимут до {state.limited_until[:16].replace('T', ' ')} UTC" if state.limited_until else ""
+            text = f"{acc.label}: 🛡 спамблок{until}; повторов {state.strikes}"
+        else:
+            text = f"{acc.label}: ✅ чисто"
+        fresh = await ctx.store.get_account(acc.id)
+        if fresh:
+            text += "\n" + await sync_sender_load(ctx.store, acc.id, bot, admin)
+        await bot.send_message(admin, text)
+
+    try:
+        runtime.spawn("spam_check", acc.id, _job())
+    except RuntimeError:
+        await query.answer("Проверка уже идёт", show_alert=True)
+        return
+    await query.answer("Спрашиваю @SpamBot — результат придёт сюда")

@@ -28,14 +28,17 @@ from app.utils.chat_ids import canon_chat_id, chat_id_aliases, chat_ids_match
 from app.utils.timefmt import fmt_until
 from app.utils.entities import entities_loads
 from app.utils.minutes import period_for_interval, suggest_minute
+from app.jobs.spam import account_load
 from app.utils.schedule import dead_interval, phase_offset_minutes, resolve_repeat_period
 from app.utils.send_policy import (
     classify_failure,
     effective_interval_minutes,
     effective_interval_seconds,
     is_send_allowed,
+    matches_stoplist,
     pick_text_override,
 )
+from app.utils.spamstate import scale_parallel, scale_seconds
 from app.utils.templates import pick_post_for_chat, render_post
 from app.tg.sender_push import (
     apply_mentions_everywhere,
@@ -391,6 +394,20 @@ async def schedule_one_chat(
             )
             return "abandoned"
 
+    if not dead:
+        pref = await store.get_chat_pref(account.id, chat.id)
+        ban = await store.get_ban(account.id, chat.id)
+        allowed, why = is_send_allowed(
+            account,
+            chat,
+            pref,
+            bool(ban and ban.active),
+            stoplist=await store.get_stoplist(),
+        )
+        if not allowed:
+            await clear_scheduled_for_pair(client, chat, account, why, log)
+            return "disabled"
+
     post = pick_post_for_chat(posts, chat)
     custom = await store.get_chat_post(account.id, chat.chat_id)
     if custom is not None:
@@ -726,20 +743,30 @@ async def _configure_sender(
     """Configure Autoposter for this account only (не трогаем другие аккаунты)."""
     settings = get_settings()
     api = SenderAPI(settings.sender_api_url, settings.sender_api_key)
-    if not account.sender_on:
+    load = await account_load(store, account)
+    stop_reason = (
+        "dead-режим (sender выключен навсегда, работает только schedule)"
+        if account.is_dead
+        else "sender выключен вручную"
+        if not account.sender_on
+        else f"спамблок: нагрузка {load}% — sender остановлен"
+        if load <= 0
+        else ""
+    )
+    if stop_reason:
         sid = (account.sender_account_id or "").strip()
         if sid:
             try:
                 await api.spam_stop(sid)
             except SenderAPIError as e:
                 await log.emit(
-                    f"{account.label}: sender выключен, но стоп не прошёл: {e}",
+                    f"{account.label}: sender остановлен ({stop_reason}), но стоп не прошёл: {e}",
                     "error",
                 )
-        await log.emit(
-            f"{account.label}: sender выключен вручную — настройку пропускаю"
-        )
+        await store.set_applied_load(account.id, load)
+        await log.emit(f"{account.label}: {stop_reason} — настройку sender пропускаю")
         return 0
+    keywords = await store.get_stoplist()
     sender_id = await ensure_sender_account(store, account, api, log)
     ss = await store.sender_settings()
 
@@ -768,16 +795,21 @@ async def _configure_sender(
         f"переносов={ru_text.count(chr(10))})"
     )
 
-    await api.put_interval(sender_id, "between", ss.between_min, ss.between_max)
-    await api.put_interval(sender_id, "cycle", ss.cycle_min, ss.cycle_max)
-    await api.put_interval(sender_id, "per_chat", ss.per_chat_min, ss.per_chat_max)
-    await api.put_parallel(sender_id, ss.parallel)
+    # Спамблок/восстановление: интервалы растягиваются (50% → вдвое реже), параллель режется.
+    between = (scale_seconds(ss.between_min, load), scale_seconds(ss.between_max, load))
+    cycle = (scale_seconds(ss.cycle_min, load), scale_seconds(ss.cycle_max, load))
+    per_chat = (scale_seconds(ss.per_chat_min, load), scale_seconds(ss.per_chat_max, load))
+    parallel = scale_parallel(ss.parallel, load)
+    await api.put_interval(sender_id, "between", *between)
+    await api.put_interval(sender_id, "cycle", *cycle)
+    await api.put_interval(sender_id, "per_chat", *per_chat)
+    await api.put_parallel(sender_id, parallel)
     await log.emit(
-        f"{account.label}: настроил интервалы "
-        f"between {ss.between_min}-{ss.between_max}s | "
-        f"cycle {ss.cycle_min}-{ss.cycle_max}s | "
-        f"per-chat {ss.per_chat_min}-{ss.per_chat_max}s | "
-        f"parallel={ss.parallel}"
+        f"{account.label}: настроил интервалы (нагрузка {load}%) "
+        f"between {between[0]}-{between[1]}s | "
+        f"cycle {cycle[0]}-{cycle[1]}s | "
+        f"per-chat {per_chat[0]}-{per_chat[1]}s | "
+        f"parallel={parallel}"
     )
 
     # Упоминания / «глобальная отметка» — по настройке Sender (по умолчанию выкл).
@@ -832,25 +864,65 @@ async def _configure_sender(
             )
 
     sender_count = 0
+    disabled_n = 0
     for live in targets:
         if runtime.cancelled("setup", account.id):
             raise SetupError("Остановлено")
         cid = str(live.get("chat_id"))
         key = canon_chat_id(cid)
-        pref = prefs.get(key)
-        if (pref is not None and not pref.is_enabled) or key in blocked_keys:
+        mention_pref = prefs.get(key)  # account_chat_prefs (упоминания / выкл по ключу)
+        catalog = match_catalog_chat(cid, sender_chats)
+        pair_pref = await store.get_chat_pref(account.id, catalog.id) if catalog else None
+        if (mention_pref is not None and not mention_pref.is_enabled) or key in blocked_keys:
             # выключено вручную / бан / мут: в Autoposter чат не включаем
             try:
                 await api.patch_chat(sender_id, cid, active=False)
             except SenderAPIError:
                 pass
+            disabled_n += 1
             await log.emit(
                 f"Sender: «{live.get('title') or cid}» выключен "
-                f"({'вручную' if pref is not None and not pref.is_enabled else 'бан/мут'})",
+                f"({'вручную' if mention_pref is not None and not mention_pref.is_enabled else 'бан/мут'})",
                 notify=False,
             )
             continue
-        catalog = match_catalog_chat(cid, sender_chats)
+        if catalog:
+            ban = await store.get_ban(account.id, catalog.id)
+            allowed, why = is_send_allowed(
+                account,
+                catalog,
+                pair_pref,
+                bool(ban and ban.active),
+                spam_load=load,
+                stoplist=keywords,
+            )
+            if not allowed:
+                try:
+                    await api.patch_chat(sender_id, cid, active=False)
+                except SenderAPIError as e:
+                    await log.emit(
+                        f"Sender: не удалось выключить «{catalog.title}»: {e}", "error"
+                    )
+                disabled_n += 1
+                await log.emit(
+                    f"Sender: «{catalog.title}» выключен для {account.label} ({why})",
+                    notify=False,
+                )
+                continue
+        if matches_stoplist(str(live.get("title") or ""), keywords):
+            # чат не в каталоге (или в каталоге с другим названием), но писать туда нельзя
+            try:
+                await api.patch_chat(sender_id, cid, active=False)
+            except SenderAPIError as e:
+                await log.emit(
+                    f"Sender: не удалось выключить «{live.get('title')}»: {e}", "error"
+                )
+            disabled_n += 1
+            await log.emit(
+                f"Sender: «{live.get('title')}» в стоп-листе — писать нельзя, выключил",
+                notify=False,
+            )
+            continue
         if catalog:
             post = pick_post_for_chat(posts, catalog)
             tag = catalog.tag
@@ -865,22 +937,6 @@ async def _configure_sender(
         if custom is not None:
             post = custom
             kind_note = "свой"
-        pair_pref = await store.get_chat_pref(account.id, catalog.id) if catalog else None
-        if catalog:
-            ban = await store.get_ban(account.id, catalog.id)
-            allowed, why = is_send_allowed(
-                account, catalog, pair_pref, bool(ban and ban.active)
-            )
-            if not allowed:
-                try:
-                    await api.patch_chat(sender_id, cid, active=False)
-                except SenderAPIError:
-                    pass
-                await log.emit(
-                    f"Sender: «{title}» выключен ({why})",
-                    notify=False,
-                )
-                continue
         override = pick_text_override(pair_pref)
         if override is not None:
             text, ents = render_post(
@@ -894,7 +950,9 @@ async def _configure_sender(
                 tag,
             )
         chat_mentions = (
-            mentions_on if pref is None or pref.mention < 0 else bool(pref.mention)
+            mentions_on
+            if mention_pref is None or mention_pref.mention < 0
+            else bool(mention_pref.mention)
         )
         await push_chat_text(
             api, sender_id, cid, text, ents, mentions_enabled=chat_mentions
@@ -902,7 +960,9 @@ async def _configure_sender(
         if catalog and int(catalog.max_posts_per_account or 0) > 0:
             try:
                 await api.patch_chat(
-                    sender_id, cid, interval=effective_interval_seconds(catalog)
+                    sender_id,
+                    cid,
+                    interval=scale_seconds(effective_interval_seconds(catalog), load),
                 )
                 kind_note += f", лимит {catalog.max_posts_per_account}/сут"
             except SenderAPIError as e:
@@ -939,6 +999,7 @@ async def _configure_sender(
         await log.emit(
             f"{account.label}: sender — нет чатов кроме schedule, spam/start не вызываю"
         )
+    await store.set_applied_load(account.id, load)
     return sender_count
 
 
