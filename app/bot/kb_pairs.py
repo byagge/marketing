@@ -128,6 +128,22 @@ def stoplist_kb() -> InlineKeyboardMarkup:
     )
 
 
+def redesign_kb(items: list[tuple[int, str, bool]]) -> InlineKeyboardMarkup:
+    """items: (account_id, подпись, не_оцениваем) — только те, кто в списке «переоформить»."""
+    rows: list[list[InlineKeyboardButton]] = []
+    for account_id, label, _skip in items[:10]:
+        rows.append(
+            [
+                ib(f"Переоформил: {label[:18]}", "rd_done", account_id, icon="check"),
+                ib("Не оценивать", "rd_skip", account_id, icon="block"),
+            ]
+        )
+    rows.append([ib("Проверить сейчас", "rd_now", icon="search")])
+    rows.append([ib("Автопилот", "ap", icon="robot")])
+    rows.append(home_row())
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
 def bans_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
@@ -156,5 +172,6 @@ __all__ = [
     "diag_kb",
     "pair_card_kb",
     "pair_list_kb",
+    "redesign_kb",
     "stoplist_kb",
 ]

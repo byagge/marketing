@@ -24,6 +24,7 @@ from app.jobs import runtime
 from app.jobs.bans import admin_target, format_ban_notice, register_ban
 from app.jobs.gate import gate_step
 from app.jobs.parallel import map_batches, setup_parallel_defaults
+from app.jobs.perf import describe_stats, perf_step
 from app.jobs.setup import run_sender_refresh, run_setup_chats_only
 from app.jobs.spam import account_load, run_spam_check, sync_sender_load
 from app.jobs.stoplist import sweep_stoplist
@@ -52,6 +53,9 @@ class AccountResult:
     spam: list[str] = field(default_factory=list)
     gates: list[str] = field(default_factory=list)
     stopped: list[str] = field(default_factory=list)
+    redesign: list[str] = field(default_factory=list)  # не приносят клиентов → переоформить
+    redesign_new: bool = False  # есть свежие/напоминания — нужен mention в сводке
+    notes: list[str] = field(default_factory=list)
     sender_refreshed: bool = False
     skipped: str = ""
     error: str = ""
@@ -68,6 +72,8 @@ class AccountResult:
             or self.spam
             or self.gates
             or self.stopped
+            or self.redesign
+            or self.notes
             or self.sender_refreshed
             or self.error
         )
@@ -269,6 +275,20 @@ async def process_account(
                         tail = " — сдался, нужна помощь" if st.status == "abandoned" else ""
                         res.failed.append(f"{title}: {result.detail}{tail}")
 
+            # Результативность: кто пишет аккаунту в личку, сколько раз ответил клоакинг.
+            if not is_cancelled():
+                try:
+                    ev = await perf_step(store, client, acc)
+                except Exception as e:
+                    ev = None
+                    res.failed.append(f"оценка результативности: {type(e).__name__}: {e}")
+                if ev is not None:
+                    if ev.kind == "recovered":
+                        res.notes.append(f"{acc.label}: снова приносит клиентов — из списка убран")
+                    else:
+                        res.redesign.append(f"{acc.label}: {describe_stats(ev.perf)}")
+                        res.redesign_new = True
+
             # «Ворота подписки»: бот удаляет сообщение и просит подписаться на каналы.
             if not is_cancelled():
                 members = [c for c in eligible if c.id in (member_pks | new_pks)]
@@ -395,8 +415,14 @@ async def _spam_step(store: Store, acc: Account, client, res: AccountResult) -> 
             )
 
 
-def format_digest(results: list[AccountResult]) -> str:
+def format_digest(results: list[AccountResult], mention: str = "") -> str:
     lines = ["🤖 Автопилот"]
+    if mention and any(r.redesign_new for r in results):
+        n = sum(len(r.redesign) for r in results if r.redesign_new)
+        lines.insert(
+            0,
+            f"{mention} аккаунты не приносят клиентов — нужно переоформить: {n}",
+        )
 
     def block(title: str, rows: list[str]) -> None:
         if rows:
@@ -414,6 +440,11 @@ def format_digest(results: list[AccountResult]) -> str:
         "⚙ Настроил отправку",
         [f"{r.label}: {', '.join(r.setup_ok)}" for r in results if r.setup_ok],
     )
+    block(
+        "🎨 Аккаунты для переоформления (мало пишут / не пишут)",
+        [m for r in results for m in r.redesign],
+    )
+    block("✅ Хорошие новости", [m for r in results for m in r.notes])
     block("🛡 Спамблок / нагрузка sender", [m for r in results for m in r.spam])
     block(
         "🔗 Подписался на обязательные каналы (ворота чата)",
@@ -493,7 +524,7 @@ async def run_autopilot(
         await store.set_setting("autopilot_last_summary", summary)
         return summary
 
-    text = format_digest(happened)
+    text = format_digest(happened, cfg.notify_mention)
     target = admin_chat_id or admin_target()
     messages = [text] if happened else []
     if unnotified:

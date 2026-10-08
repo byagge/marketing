@@ -76,3 +76,27 @@ async def test_menus_expose_new_features(store: Store):
     assert "acp_list" in acts and "acc_sender" in acts
     acts = " ".join(_all_callbacks(chat_kb(chat)))
     assert "chat_lim" in acts and "chat_diag" in acts
+
+
+async def test_main_menu_has_redesign_button_and_reports_section(store: Store, monkeypatch):
+    assert "m:rd:0:0" in _all_callbacks(main_menu())
+
+    from types import SimpleNamespace
+
+    from app.bot.handlers import ops
+    from app.context import ctx
+
+    ctx.store = store
+    shown = []
+
+    async def fake_edit(event, text, markup=None, **kw):
+        shown.append(text)
+
+    monkeypatch.setattr(ops, "safe_edit", fake_edit)
+
+    class Q:
+        async def answer(self, *a, **k):
+            return None
+
+    await ops.cb_reports(Q())
+    assert "Аккаунты для переоформления" in shown[0]

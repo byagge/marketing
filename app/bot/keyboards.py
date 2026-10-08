@@ -93,6 +93,7 @@ def main_menu() -> InlineKeyboardMarkup:
             [ib("Session", "mk_session", icon="inbox")],
             [ib("Отчёты", "reports", icon="chart"), ib("Проверка", "health", icon="search")],
             [ib("Автопилот", "ap", icon="robot"), ib("Баны", "bans", icon="warn")],
+            [ib("Для переоформления", "rd", icon="hammer")],
             [ib("Инфо", "info", icon="info")],
         ]
     )

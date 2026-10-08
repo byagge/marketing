@@ -144,7 +144,13 @@ async def cb_reports(query: CallbackQuery) -> None:
     jobs = await ctx.store.recent_jobs(15)
     from app.bot.keyboards import main_menu
 
-    await safe_edit(query, reports_html(jobs), main_menu())
+    from app.jobs.perf import redesign_report_html
+
+    await safe_edit(
+        query,
+        (await redesign_report_html(ctx.store)) + "\n\n" + reports_html(jobs[:6]),
+        main_menu(),
+    )
 
 
 @router.callback_query(MenuCB.filter(F.a == "leave_go"))
