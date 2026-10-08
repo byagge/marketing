@@ -119,6 +119,14 @@ def chat_join_target(chat: Chat) -> dict[str, str]:
     return {"method": "manual", "value": "", "reason": "нет ссылки вступления"}
 
 
+def is_closed_chat(chat: Chat) -> bool:
+    """
+    Закрытый чат: вход по инвайт-ссылке / через гарант-бота / папкой.
+    Открытые (публичный @username, голый id) в спамблоке недоступны, закрытые — работают.
+    """
+    return chat_join_target(chat)["method"] in {"invite", "garant", "folder"}
+
+
 async def is_member(
     client: TelegramClient,
     chat: Chat,

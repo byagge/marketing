@@ -271,3 +271,20 @@ async def test_legacy_db_gets_outreach_column(tmp_path: Path):
     assert acc.outreach == 0
     await s2.update_account(acc.id, outreach=1)
     assert (await s2.get_account(acc.id)).is_outreach
+
+
+def test_closed_vs_open_chat_detection():
+    from app.tg.join import is_closed_chat
+
+    def mk(**kw):
+        base = dict(id=1, title="C", chat_id="-100", kind="schedule")
+        base.update(kw)
+        return Chat(**base)
+
+    assert is_closed_chat(mk(invite_link="https://t.me/+AbC123"))
+    assert is_closed_chat(mk(invite_link="https://t.me/joinchat/AbC123"))
+    assert is_closed_chat(mk(invite_link="https://t.me/addlist/xyz"))
+    assert is_closed_chat(mk(join_mode="garant", garant_bot="GuardBot"))
+    assert not is_closed_chat(mk(username="open_chat"))
+    assert not is_closed_chat(mk(invite_link="https://t.me/open_chat"))
+    assert not is_closed_chat(mk())  # только id — считаем открытым

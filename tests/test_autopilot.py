@@ -390,9 +390,10 @@ def _limited_since(hours: float) -> str:
     return (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat(timespec="seconds")
 
 
-async def test_spamblock_pauses_joins_lowers_load_and_reports(store, world):
+async def test_spamblock_lowers_load_and_only_open_chats_wait(store, world):
     acc = await _acc(store, "tron", sender_account_id="sid1")
-    await store.add_chat("MARKET 404", "-1001", invite_link="https://t.me/+abc")
+    closed = await store.add_chat("MARKET 404", "-1001", invite_link="https://t.me/+abc")
+    opened = await store.add_chat("Открытый", "-1002", username="open_chat")
     st = await store.get_spam_state(acc.id)
     st.status, st.limited_since, st.strikes = "limited", _limited_since(0.1), 1
     await store.save_spam_state(st)
@@ -401,11 +402,19 @@ async def test_spamblock_pauses_joins_lowers_load_and_reports(store, world):
 
     await autopilot.run_autopilot(store, bot, 5, force=True)
 
-    assert world.joins == []  # в спамблоке открытые чаты недоступны — не тратим попытки
-    assert world.sync_calls == [acc.id]  # нагрузка 100% → 50%: sender перенастроен
+    # закрытый чат (инвайт) в спамблоке доступен — вступаем; открытый ждёт снятия блока
+    assert [c for _, c in world.joins] == [closed.id]
+    assert world.sync_calls == [acc.id]  # нагрузка sender 100% → 50%
     text = bot.sent[0][1]
     assert "Спамблок" in text and "tron" in text and "schedule не трогаю" in text
     assert "100% → 50%" in text
+
+    # блок снят — открытый чат вступается
+    st.status = "clean"
+    await store.save_spam_state(st)
+    world.joins.clear()
+    await autopilot.run_autopilot(store, FakeBot(), 5, force=True)
+    assert [c for _, c in world.joins] == [opened.id]
 
 
 async def test_ramp_down_step_without_new_check(store, world):
@@ -553,23 +562,40 @@ async def test_outreach_spamblock_events_do_not_make_noise(store, world):
     assert not (await store.get_account(acc.id)).is_dead
 
 
-async def test_limited_account_does_not_burn_schedule_setup_attempts(store, world):
-    """В спамблоке настройка schedule только сожжёт попытки — ждём снятия блока."""
+async def test_spamblock_does_not_stop_schedule_in_closed_chats(store, world):
+    """Закрытые чаты спамблок не ограничивает — schedule настраивается как обычно."""
     acc = await _acc(store, "tron")
-    chat = await store.add_chat("Sched", "-1001", kind="schedule", invite_link="https://t.me/+a")
-    world.member.add(("tron", chat.id))
+    closed = await store.add_chat("Closed", "-1001", kind="schedule", invite_link="https://t.me/+a")
+    opened = await store.add_chat("Open", "-1002", kind="schedule", username="open_chat")
+    world.member.update({("tron", closed.id), ("tron", opened.id)})
     st = await store.get_spam_state(acc.id)
     st.status, st.limited_since, st.applied_load = "limited", _limited_since(1), 50
     await store.save_spam_state(st)
 
     await autopilot.run_autopilot(store, FakeBot(), 5, force=True)
-    assert world.setup_calls == []
+    assert world.setup_calls == [(acc.id, [closed.id])]  # открытый ждёт, закрытый — работает
 
     st.status = "clean"
     await store.save_spam_state(st)
     await store.set_applied_load(acc.id, 100)
     await autopilot.run_autopilot(store, FakeBot(), 5, force=True)
-    assert world.setup_calls == [(acc.id, [chat.id])]
+    assert world.setup_calls[-1] == (acc.id, [opened.id])
+
+
+async def test_outreach_in_spamblock_keeps_working_in_closed_schedule_chats(store, world):
+    acc = await _acc(store, "out", outreach=1)
+    await store.set_applied_load(acc.id, 0)
+    chat = await store.add_chat("Closed", "-1001", kind="schedule", invite_link="https://t.me/+a")
+    st = await store.get_spam_state(acc.id)
+    st.status, st.limited_since, st.strikes = "limited", _limited_since(30), 9
+    await store.save_spam_state(st)
+    bot = FakeBot()
+
+    await autopilot.run_autopilot(store, bot, 5, force=True)
+
+    assert [c for _, c in world.joins] == [chat.id]  # вступил, несмотря на спамблок
+    assert world.setup_calls == [(acc.id, [chat.id])]  # и schedule настроен
+    assert not (await store.get_account(acc.id)).is_dead
 
 
 async def test_regular_and_outreach_accounts_together(store, world):
