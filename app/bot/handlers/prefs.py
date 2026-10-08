@@ -11,7 +11,7 @@ from aiogram.types import CallbackQuery, Message
 from app.bot.kb_pairs import bulk_confirm_kb, pair_card_kb, pair_list_kb
 from app.bot.keyboards import MenuCB, cancel_kb
 from app.bot.render import ask_input, finish_input, safe_edit
-from app.bot.states import PairSearch, PairText
+from app.bot.states import OutreachBulk, PairSearch, PairText
 from app.context import ctx
 from app.jobs import runtime
 from app.jobs.prefs import apply_account_sender, apply_pair
@@ -393,3 +393,92 @@ async def cb_spam_check(query: CallbackQuery, callback_data: MenuCB) -> None:
         await query.answer("Проверка уже идёт", show_alert=True)
         return
     await query.answer("Спрашиваю @SpamBot — результат придёт сюда")
+
+
+@router.callback_query(MenuCB.filter(F.a == "acc_outreach"))
+async def cb_outreach_toggle(query: CallbackQuery, callback_data: MenuCB) -> None:
+    from app.bot.handlers.accounts import show_account_card
+
+    acc = await ctx.store.get_account(callback_data.i)
+    if not acc:
+        await query.answer("Нет аккаунта", show_alert=True)
+        return
+    new_val = 0 if acc.is_outreach else 1
+    await ctx.store.update_account(acc.id, outreach=new_val)
+    bot, admin = query.bot, query.from_user.id
+
+    async def _job():
+        result = await apply_account_sender(ctx.store, acc.id, bot, admin)
+        try:
+            await bot.send_message(admin, f"{acc.label}: {result}")
+        except Exception:
+            pass
+
+    try:
+        runtime.spawn("sender_toggle", acc.id, _job())
+    except RuntimeError:
+        pass
+    await query.answer(
+        "Аутрич: sender не используется, только schedule" if new_val else "Аутрич снят",
+        show_alert=bool(new_val),
+    )
+    fresh = await ctx.store.get_account(acc.id)
+    if fresh:
+        await show_account_card(query, fresh)
+
+
+@router.callback_query(MenuCB.filter(F.a == "acc_out_bulk"))
+async def cb_outreach_bulk(query: CallbackQuery, state: FSMContext) -> None:
+
+    await state.set_state(OutreachBulk.names)
+    text = prompt_html(
+        "Аутрич списком",
+        "Пришлите имена аккаунтов (метка, @username, телефон или <code>#id</code>) через запятую "
+        "или с новой строки — все станут аутрич-аккаунтами: sender не используется, "
+        "только schedule, спамблоки не ведут в dead.\n"
+        "Чтобы <b>снять</b> пометку, начните сообщение с <code>-</code>: "
+        "<code>- tron, alex</code>",
+        "user",
+    )
+    await safe_edit(query, text, cancel_kb())
+    await ask_input(query, text)
+
+
+@router.message(OutreachBulk.names, F.text)
+async def on_outreach_bulk(message: Message, state: FSMContext) -> None:
+    from app.utils.outreach import match_accounts
+
+    await state.clear()
+    raw = (message.text or "").strip()
+    remove = raw.startswith("-")
+    if remove:
+        raw = raw[1:]
+    found, missing = match_accounts(raw, await ctx.store.list_accounts())
+    for acc in found:
+        await ctx.store.update_account(acc.id, outreach=0 if remove else 1)
+    bot, admin = message.bot, message.chat.id
+
+    async def _job():
+        for acc in found:
+            await apply_account_sender(ctx.store, acc.id, None, None)
+        try:
+            await bot.send_message(admin, f"Аутрич: sender остановлен у {len(found)} аккаунтов.")
+        except Exception:
+            pass
+
+    if found and not remove:
+        try:
+            runtime.spawn("outreach_bulk", 0, _job())
+        except RuntimeError:
+            pass
+    lines = [
+        f"{'Снята пометка' if remove else 'Помечено аутрич'}: <b>{len(found)}</b>"
+        + (f" ({escape(', '.join(a.label for a in found[:20]))})" if found else "")
+    ]
+    if missing:
+        lines.append(f"Не нашёл: {escape(', '.join(missing))}")
+    accounts = await ctx.store.list_accounts()
+    from app.bot.keyboards import accounts_kb
+    from app.ui.screens import accounts_html
+
+    await finish_input(message, "\n".join(lines) + "\n\n" + accounts_html(accounts), accounts_kb(accounts))

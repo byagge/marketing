@@ -504,3 +504,83 @@ async def test_gate_and_stopped_reports(store, world):
     assert "Подписался на обязательные каналы" in text and "@news_channel" in text
     assert "Нужна помощь" in text and "Упрямый" in text
     assert "Выключил чаты «писать нельзя»" in text and "Отзывы клиентов" in text
+
+
+# ---- аутрич-аккаунты: мягкий режим ------------------------------------------
+
+
+async def test_outreach_joins_only_schedule_chats_and_never_touches_sender(store, world):
+    acc = await _acc(store, "out1", sender_account_id="sid1", outreach=1)
+    sched = await store.add_chat("Sched", "-1001", kind="schedule", invite_link="https://t.me/+a")
+    await store.add_chat("Sender-чат", "-1002", kind="sender", invite_link="https://t.me/+b")
+    await store.set_applied_load(acc.id, 0)  # sender уже остановлен
+    bot = FakeBot()
+
+    await autopilot.run_autopilot(store, bot, 5, force=True)
+
+    assert [c for _, c in world.joins] == [sched.id]  # sender-чат не трогаем
+    assert world.setup_calls == [(acc.id, [sched.id])]
+    assert world.sender_calls == [] and world.sync_calls == []
+
+
+async def test_outreach_first_pass_stops_sender_quietly(store, world):
+    acc = await _acc(store, "out1", sender_account_id="sid1", outreach=1)
+    await store.add_chat("Sched", "-1001", kind="schedule", invite_link="https://t.me/+a")
+    bot = FakeBot()
+
+    await autopilot.run_autopilot(store, bot, 5, force=True)
+
+    assert world.sync_calls == [acc.id]  # один раз выключили sender в Autoposter
+    assert "нагрузка sender" not in bot.sent[0][1]  # и не шумим про это
+
+
+async def test_outreach_spamblock_events_do_not_make_noise(store, world):
+    from app.jobs import autopilot as ap
+
+    acc = await _acc(store, "out1", outreach=1)
+    await store.add_chat("Sched", "-1001", kind="schedule", invite_link="https://t.me/+a")
+    world.member.add(("out1", 1))
+    await store.record_setup_ok(acc.id, 1)
+    st = await store.get_spam_state(acc.id)
+    st.status, st.limited_since, st.strikes = "limited", _limited_since(1), 5
+    await store.save_spam_state(st)
+    world.spam_events = ["limited_new"]  # даже если бы событие пришло — для аутрича спам-шума нет
+    bot = FakeBot()
+
+    summary = await ap.run_autopilot(store, bot, 5, force=True)
+
+    assert bot.sent == [] and "всё в порядке" in summary
+    assert not (await store.get_account(acc.id)).is_dead
+
+
+async def test_limited_account_does_not_burn_schedule_setup_attempts(store, world):
+    """В спамблоке настройка schedule только сожжёт попытки — ждём снятия блока."""
+    acc = await _acc(store, "tron")
+    chat = await store.add_chat("Sched", "-1001", kind="schedule", invite_link="https://t.me/+a")
+    world.member.add(("tron", chat.id))
+    st = await store.get_spam_state(acc.id)
+    st.status, st.limited_since, st.applied_load = "limited", _limited_since(1), 50
+    await store.save_spam_state(st)
+
+    await autopilot.run_autopilot(store, FakeBot(), 5, force=True)
+    assert world.setup_calls == []
+
+    st.status = "clean"
+    await store.save_spam_state(st)
+    await store.set_applied_load(acc.id, 100)
+    await autopilot.run_autopilot(store, FakeBot(), 5, force=True)
+    assert world.setup_calls == [(acc.id, [chat.id])]
+
+
+async def test_regular_and_outreach_accounts_together(store, world):
+    reg = await _acc(store, "reg", sender_account_id="sid1")
+    await _acc(store, "out", outreach=1)
+    sched = await store.add_chat("Sched", "-1001", kind="schedule", invite_link="https://t.me/+a")
+    sender = await store.add_chat("Send", "-1002", kind="sender", invite_link="https://t.me/+b")
+
+    await autopilot.run_autopilot(store, FakeBot(), 5, force=True)
+
+    assert set(world.joins) == {
+        ("reg", sched.id), ("reg", sender.id), ("out", sched.id),
+    }
+    assert world.sender_calls == [reg.id]

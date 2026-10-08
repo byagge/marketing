@@ -168,7 +168,7 @@ async def apply_account_sender(
     account = await store.get_account(account_id)
     if not account:
         return "аккаунт не найден"
-    if account.sender_on and not account.is_dead and not account.has_sender:
+    if account.sender_on and not account.sender_forbidden and not account.has_sender:
         return "sender включён, но у аккаунта нет Sender ID / Pyrogram+token"
     return await sync_sender_load(store, account_id, bot, admin_chat_id)
 

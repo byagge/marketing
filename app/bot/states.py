@@ -84,5 +84,9 @@ class ChatLimit(StatesGroup):
     value = State()
 
 
+class OutreachBulk(StatesGroup):
+    names = State()
+
+
 class StopWords(StatesGroup):
     value = State()

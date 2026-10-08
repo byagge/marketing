@@ -37,7 +37,7 @@ async def account_load(
     state = await store.get_spam_state(account.id)
     return compute_load(
         state,
-        dead=account.is_dead,
+        dead=account.sender_forbidden,
         now=now,
         ramp_1=cfg.spam_ramp_hours_1,
         ramp_2=cfg.spam_ramp_hours_2,
@@ -59,6 +59,7 @@ async def run_spam_check(
     if account.is_dead and not force:
         res.skipped = "dead"
         return res
+    # аутрич: проверяем (для статистики), но dead по повторам не бывает
     state = await store.get_spam_state(account.id)
     if not force and not check_due(state, now=now, every_hours=cfg.spam_check_hours):
         res.skipped = "рано"
@@ -83,6 +84,12 @@ async def run_spam_check(
         res.outcome = outcome
         return res
     await store.save_spam_state(outcome.state)
+    if account.is_outreach:
+        # аутрич живёт в спамблоках — dead не нужен (sender и так выключен), сводки не шумим
+        outcome.make_dead = False
+        res.outcome = outcome
+        res.events = []
+        return res
     if outcome.make_dead and not account.is_dead:
         await store.update_account(account.id, dead=1)
     res.outcome = outcome
@@ -107,9 +114,10 @@ async def sync_sender_load(
         return "аккаунт не найден"
     load = await account_load(store, account)
     sid = (account.sender_account_id or "").strip()
-    if account.is_dead or not account.sender_on or load <= 0:
+    if account.sender_forbidden or not account.sender_on or load <= 0:
         why = (
-            "dead-режим" if account.is_dead
+            "аутрич (sender не используется)" if account.is_outreach
+            else "dead-режим" if account.is_dead
             else "sender отключён вручную" if not account.sender_on
             else "спамблок"
         )

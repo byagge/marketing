@@ -507,7 +507,9 @@ async def _configure_sender(
     api = SenderAPI(settings.sender_api_url, settings.sender_api_key)
     load = await account_load(store, account)
     stop_reason = (
-        "dead-режим (sender выключен навсегда, работает только schedule)"
+        "аутрич: sender не используется, только schedule"
+        if account.is_outreach
+        else "dead-режим (sender выключен навсегда, работает только schedule)"
         if account.is_dead
         else "sender выключен вручную"
         if not account.sender_on

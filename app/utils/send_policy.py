@@ -14,6 +14,7 @@ REASON_BANNED = "banned"
 REASON_CHAT_OFF = "chat_off"
 REASON_SENDER_OFF = "sender_off"
 REASON_DEAD = "dead"
+REASON_OUTREACH = "outreach"
 REASON_SPAMBLOCK = "spamblock"
 REASON_NO_POST = "no_post"
 
@@ -23,6 +24,7 @@ REASON_LABEL = {
     REASON_CHAT_OFF: "чат выключен в каталоге",
     REASON_SENDER_OFF: "sender у аккаунта выключен",
     REASON_DEAD: "аккаунт в dead-режиме (sender выключен, только schedule)",
+    REASON_OUTREACH: "аутрич-аккаунт: sender не используется, только schedule",
     REASON_SPAMBLOCK: "спамблок: sender остановлен на время блока",
     REASON_NO_POST: "в чат писать нельзя (стоп-лист)",
 }
@@ -68,6 +70,8 @@ def is_send_allowed(
     if banned:
         return False, REASON_BANNED
     if chat.kind == "sender":
+        if account.is_outreach:
+            return False, REASON_OUTREACH
         if account.is_dead:
             return False, REASON_DEAD
         if not account.sender_on:

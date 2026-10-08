@@ -112,7 +112,10 @@ def session_kind_kb() -> InlineKeyboardMarkup:
 
 
 def accounts_kb(accounts: list[Account], page: int = 0) -> InlineKeyboardMarkup:
-    rows: list[list[InlineKeyboardButton]] = [[ib("Добавить session", "acc_add", icon="inbox")]]
+    rows: list[list[InlineKeyboardButton]] = [
+        [ib("Добавить session", "acc_add", icon="inbox")],
+        [ib("Пометить аутрич списком", "acc_out_bulk", icon="user")],
+    ]
     chunk = accounts[page * 8 : page * 8 + 8]
     for acc in chunk:
         icon = {"running": "up", "done": "check", "error": "warn"}.get(acc.status, "user")
@@ -136,6 +139,8 @@ def account_kb(acc: Account, running: bool = False) -> InlineKeyboardMarkup:
     sender_icon = "block" if acc.sender_on else "check"
     dead_label = "Вернуть из dead" if acc.is_dead else "Перевести в dead (только schedule)"
     dead_icon = "check" if acc.is_dead else "warn"
+    outreach_label = "Аутрич: ВКЛ (убрать)" if acc.is_outreach else "Пометить как аутрич"
+    outreach_icon = "check" if acc.is_outreach else "user"
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [start],
@@ -145,6 +150,7 @@ def account_kb(acc: Account, running: bool = False) -> InlineKeyboardMarkup:
             ],
             [ib("Чаты аккаунта: выкл / тексты", "acp_list", acc.id, icon="pin")],
             [ib(sender_label, "acc_sender", acc.id, icon=sender_icon)],
+            [ib(outreach_label, "acc_outreach", acc.id, icon=outreach_icon)],
             [
                 ib("Проверить спамблок", "acc_spam", acc.id, icon="shield"),
                 ib(dead_label, "acc_dead", acc.id, icon=dead_icon),

@@ -85,7 +85,15 @@ def pair_card_html(
     return "\n".join(lines)
 
 
-def autopilot_html(enabled: bool, last_at: str, last_summary: str, open_bans: int, running: bool) -> str:
+def autopilot_html(
+    enabled: bool,
+    last_at: str,
+    last_summary: str,
+    open_bans: int,
+    running: bool,
+    outreach_total: int = 0,
+    outreach_limited: int = 0,
+) -> str:
     state = f"{pe('check')} <b>включён</b>" if enabled else f"{pe('block')} <b>выключен</b>"
     run = f"\n{pe('robot')} Сейчас идёт проход…" if running else ""
     when = escape((last_at or "—")[:16].replace("T", " ")) + (" UTC" if last_at else "")
@@ -95,6 +103,13 @@ def autopilot_html(enabled: bool, last_at: str, last_summary: str, open_bans: in
         f"Сам вступает в чаты, где аккаунта нет, настраивает отправку и пишет вам про баны "
         f"и всё, где нужна ваша помощь.\n"
         f"{pe('warn')} Активных банов в базе: <b>{open_bans}</b>\n"
+        + (
+            f"🧲 Аутрич-аккаунтов: <b>{outreach_total}</b>, в спамблоке сейчас: "
+            f"<b>{outreach_limited}</b> (в сводки не шумят)\n"
+            if outreach_total
+            else ""
+        )
+        +
         f"{pe('clock')} Последний проход: {when}\n\n"
         f"<b>Последняя сводка:</b>\n{summary}"
     )
@@ -111,6 +126,16 @@ def campaign_html(
     sched = f"schedule: {schedule_n} чатов" if schedule_n else "schedule: нет настроенных чатов"
     strikes = f" · спамблоков было: {state.strikes}/{dead_strikes}" if state.strikes else ""
     head = f"{pe('mega')} <b>Кампания:</b> "
+    if acc.is_outreach:
+        block = ""
+        if state.is_limited:
+            since = escape((state.limited_since or "")[:16].replace("T", " "))
+            block = f"; сейчас спамблок с {since} UTC — это нормально для аутрича"
+        counted = f", спамблоков было: {state.strikes}" if state.strikes else ""
+        return (
+            f"{head}🧲 <b>АУТРИЧ</b> (мягкий режим) — sender не используется, только "
+            f"{escape(sched)}{escape(block)}{escape(counted)}"
+        )
     if acc.is_dead:
         return (
             f"{head}☠ <b>DEAD</b> — sender выключен навсегда, работает только "

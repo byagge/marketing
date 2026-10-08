@@ -148,6 +148,7 @@ async def process_account(
         if (prefs.get(c.id) is None or prefs[c.id].enabled)
         and c.id not in banned
         and not is_no_post(c, stoplist)  # «Отзывы» и т. п.: ни вступать, ни писать
+        and not (acc.is_outreach and c.kind == "sender")  # аутрич: только schedule-чаты
     ]
 
     new_pks: set[int] = set()
@@ -294,11 +295,13 @@ async def process_account(
     acc = await store.get_account(acc.id) or acc
     load = await account_load(store, acc)
     refreshed = False
-    if load != prev_state.applied_load or (acc.is_dead and prev_state.applied_load != 0):
+    if load != prev_state.applied_load or (
+        acc.sender_forbidden and prev_state.applied_load != 0
+    ):
         msg = await sync_sender_load(store, acc.id, None, None)
         refreshed = bool(acc.has_sender)
         res.sender_refreshed = refreshed
-        if acc.has_sender:  # без sender менять нечего — не шумим
+        if acc.has_sender and not acc.is_outreach:  # без sender / аутрич — не шумим
             res.spam.append(
                 f"{acc.label}: нагрузка sender {prev_state.applied_load}% → {load}% ({msg})"
             )
@@ -315,7 +318,10 @@ async def process_account(
         and c.id in in_chat
         and (c.id in new_pks or (c.id not in known_setup and c.id not in ok_setup))
     ]
-    if schedule_need and not is_cancelled():
+    # В спамблоке get_entity у открытых чатов недоступен — настройка только сожжёт попытки;
+    # подождём снятия блока (уже запланированные сообщения остаются).
+    limited_now = (await store.get_spam_state(acc.id)).is_limited
+    if schedule_need and not is_cancelled() and not limited_now:
         try:
             buckets = await run_setup_chats_only(
                 store,
@@ -336,7 +342,7 @@ async def process_account(
     if (
         sender_chats
         and not refreshed
-        and not acc.is_dead
+        and not acc.sender_forbidden
         and load > 0
         and not is_cancelled()
         and await _sender_needs_refresh(store, acc, sender_chats, new_pks)
@@ -351,7 +357,12 @@ async def process_account(
             res.setup_ok.append(f"sender×{n}")
 
     # Чаты «писать нельзя» не должны оставаться активными в Autoposter ни у кого.
-    if (acc.sender_account_id or "").strip() and acc.sender_on and not acc.is_dead and load > 0:
+    if (
+        (acc.sender_account_id or "").strip()
+        and acc.sender_on
+        and not acc.sender_forbidden
+        and load > 0
+    ):
         res.stopped.extend(await sweep_stoplist(store, acc))
     return res
 
@@ -359,6 +370,8 @@ async def process_account(
 async def _spam_step(store: Store, acc: Account, client, res: AccountResult) -> None:
     """Проверка @SpamBot по расписанию; события → в сводку."""
     check = await run_spam_check(store, acc, client)
+    if acc.is_outreach:
+        return  # аутрич: статус пишем в базу, в сводки не шумим
     if check.error and not check.skipped:
         res.failed.append(f"@SpamBot: {check.error}")
     state = await store.get_spam_state(acc.id)

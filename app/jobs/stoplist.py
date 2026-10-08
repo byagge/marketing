@@ -68,7 +68,7 @@ async def apply_stoplist_everywhere(store: Store, bot=None, admin_chat_id=None) 
     accounts = [
         a
         for a in await store.list_accounts()
-        if (a.sender_account_id or "").strip() and a.sender_on and not a.is_dead
+        if (a.sender_account_id or "").strip() and a.sender_on and not a.sender_forbidden
     ]
     size, pause = setup_parallel_defaults()
 
