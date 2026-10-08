@@ -21,6 +21,9 @@ class Account:
     # 1 = dead-режим: sender выключен навсегда, работает только schedule
     # (колонка is_dead в БД — алиас той же семантики)
     dead: int = 0
+    # 1 = аутрич-аккаунт, мягкий режим: sender не используется никогда, только schedule;
+    # спамблоки ожидаемы — не ведут в dead и не шумят в сводках
+    outreach: int = 0
     status: str = "idle"
     last_error: str = ""
     created_at: str = ""
@@ -59,6 +62,15 @@ class Account:
     @property
     def is_dead(self) -> bool:
         return bool(self.dead)
+
+    @property
+    def is_outreach(self) -> bool:
+        return bool(self.outreach)
+
+    @property
+    def sender_forbidden(self) -> bool:
+        """Sender не используется вообще: dead или аутрич."""
+        return bool(self.dead or self.outreach)
 
     @property
     def has_sender(self) -> bool:

@@ -31,7 +31,7 @@ from app.models import Account, Chat, JoinState
 from app.sender_api import SenderAPI, SenderAPIError
 from app.store import Store
 from app.tg.client import telethon_client
-from app.tg.join import check_membership, join_one, sort_chats_for_join
+from app.tg.join import check_membership, is_closed_chat, join_one, sort_chats_for_join
 from app.utils.chat_ids import chat_ids_match
 from app.utils.send_policy import classify_failure, is_no_post, join_due, removal_confirmed
 
@@ -148,6 +148,7 @@ async def process_account(
         if (prefs.get(c.id) is None or prefs[c.id].enabled)
         and c.id not in banned
         and not is_no_post(c, stoplist)  # «Отзывы» и т. п.: ни вступать, ни писать
+        and not (acc.is_outreach and c.kind == "sender")  # аутрич: только schedule-чаты
     ]
 
     new_pks: set[int] = set()
@@ -158,9 +159,9 @@ async def process_account(
     try:
         async with _open_client(acc) as client:
             await _spam_step(store, acc, client, res)
-            # В спамблоке открытые чаты недоступны — вступления не тратим впустую.
-            if (await store.get_spam_state(acc.id)).is_limited:
-                joined_budget = 0
+            # В спамблоке открытые чаты недоступны, а закрытые (инвайт/гарант) работают:
+            # открытые откладываем до снятия блока, закрытые вступаем как обычно.
+            spam_limited = (await store.get_spam_state(acc.id)).is_limited
             report = await check_membership(client, eligible)
             member_pks = {c.id for c in report.joined}
             for chat in report.joined:
@@ -199,7 +200,8 @@ async def process_account(
             due = [
                 c
                 for c in sort_chats_for_join(candidates)
-                if join_due(
+                if (not spam_limited or is_closed_chat(c))
+                and join_due(
                     fresh.get(c.id),
                     retry_hours=cfg.autopilot_retry_hours,
                     max_attempts=cfg.autopilot_max_join_attempts,
@@ -294,11 +296,13 @@ async def process_account(
     acc = await store.get_account(acc.id) or acc
     load = await account_load(store, acc)
     refreshed = False
-    if load != prev_state.applied_load or (acc.is_dead and prev_state.applied_load != 0):
+    if load != prev_state.applied_load or (
+        acc.sender_forbidden and prev_state.applied_load != 0
+    ):
         msg = await sync_sender_load(store, acc.id, None, None)
         refreshed = bool(acc.has_sender)
         res.sender_refreshed = refreshed
-        if acc.has_sender:  # без sender менять нечего — не шумим
+        if acc.has_sender and not acc.is_outreach:  # без sender / аутрич — не шумим
             res.spam.append(
                 f"{acc.label}: нагрузка sender {prev_state.applied_load}% → {load}% ({msg})"
             )
@@ -315,6 +319,11 @@ async def process_account(
         and c.id in in_chat
         and (c.id in new_pks or (c.id not in known_setup and c.id not in ok_setup))
     ]
+    # Спамблок не мешает закрытым чатам — schedule настраиваем как обычно. Открытые
+    # (публичные) чаты в блоке недоступны: их откладываем, чтобы не жечь попытки.
+    if (await store.get_spam_state(acc.id)).is_limited:
+        by_pk = {c.id: c for c in eligible}
+        schedule_need = [pk for pk in schedule_need if is_closed_chat(by_pk[pk])]
     if schedule_need and not is_cancelled():
         try:
             buckets = await run_setup_chats_only(
@@ -336,7 +345,7 @@ async def process_account(
     if (
         sender_chats
         and not refreshed
-        and not acc.is_dead
+        and not acc.sender_forbidden
         and load > 0
         and not is_cancelled()
         and await _sender_needs_refresh(store, acc, sender_chats, new_pks)
@@ -351,7 +360,12 @@ async def process_account(
             res.setup_ok.append(f"sender×{n}")
 
     # Чаты «писать нельзя» не должны оставаться активными в Autoposter ни у кого.
-    if (acc.sender_account_id or "").strip() and acc.sender_on and not acc.is_dead and load > 0:
+    if (
+        (acc.sender_account_id or "").strip()
+        and acc.sender_on
+        and not acc.sender_forbidden
+        and load > 0
+    ):
         res.stopped.extend(await sweep_stoplist(store, acc))
     return res
 
@@ -359,6 +373,8 @@ async def process_account(
 async def _spam_step(store: Store, acc: Account, client, res: AccountResult) -> None:
     """Проверка @SpamBot по расписанию; события → в сводку."""
     check = await run_spam_check(store, acc, client)
+    if acc.is_outreach:
+        return  # аутрич: статус пишем в базу, в сводки не шумим
     if check.error and not check.skipped:
         res.failed.append(f"@SpamBot: {check.error}")
     state = await store.get_spam_state(acc.id)

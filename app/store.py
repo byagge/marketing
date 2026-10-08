@@ -500,6 +500,8 @@ async def _migrate_accounts_premium(db: aiosqlite.Connection) -> None:
         )
     if "dead" not in cols:
         await db.execute("ALTER TABLE accounts ADD COLUMN dead INTEGER NOT NULL DEFAULT 0")
+    if "outreach" not in cols:
+        await db.execute("ALTER TABLE accounts ADD COLUMN outreach INTEGER NOT NULL DEFAULT 0")
 
 
 async def _migrate_chat_facts(db: aiosqlite.Connection) -> None:
@@ -607,6 +609,9 @@ def _account(row: aiosqlite.Row) -> Account:
             else 1
         ),
         dead=_account_dead_flag(row, keys),
+        outreach=(
+            int(row["outreach"]) if "outreach" in keys and row["outreach"] is not None else 0
+        ),
         status=row["status"] or "idle",
         last_error=row["last_error"] or "",
         created_at=row["created_at"] or "",

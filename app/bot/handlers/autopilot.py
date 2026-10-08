@@ -32,7 +32,17 @@ async def _ap_payload():
     summary = await ctx.store.get_setting("autopilot_last_summary", "")
     bans = await ctx.store.list_bans(active_only=True)
     running = runtime.is_running("autopilot", 0)
-    return autopilot_html(enabled, last_at, summary, len(bans), running), autopilot_kb(enabled, running)
+    outreach = [a for a in await ctx.store.list_accounts() if a.is_outreach]
+    limited = 0
+    for a in outreach:
+        if (await ctx.store.get_spam_state(a.id)).is_limited:
+            limited += 1
+    return (
+        autopilot_html(
+            enabled, last_at, summary, len(bans), running, len(outreach), limited
+        ),
+        autopilot_kb(enabled, running),
+    )
 
 
 @router.callback_query(MenuCB.filter(F.a == "ap"))

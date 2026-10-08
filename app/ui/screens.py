@@ -64,7 +64,9 @@ def accounts_html(accounts: list[Account]) -> str:
         run = f" {pe('robot')} фон" if runtime.is_running("setup", acc.id) else ""
         uname = f"@{acc.username}" if acc.username else escape(acc.label)
         camp = (
-            " · \U0001F480 dead"
+            " · 🧲 аутрич"
+            if acc.is_outreach
+            else " · \U0001F480 dead"
             if acc.is_dead
             else " · sender выкл"
             if not acc.sender_on
