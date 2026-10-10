@@ -121,6 +121,11 @@ class Settings(BaseSettings):
     autopilot_interval_min: int = 60
     # Не более N вступлений на аккаунт за один проход (анти-Flood).
     autopilot_join_per_tick: int = 3
+    # Сколько аккаунтов автопилот ведёт одновременно (раньше жёстко 4: проход по 32 акк.
+    # занимал больше часа и накладывался на следующий) и сколько минут даём одному аккаунту:
+    # зависший аккаунт не должен держать весь проход.
+    autopilot_parallel: int = 6
+    autopilot_account_timeout_min: float = 30.0
     autopilot_join_pause_min_sec: float = 20.0
     autopilot_join_pause_max_sec: float = 45.0
     autopilot_retry_hours: float = 6.0

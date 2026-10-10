@@ -156,6 +156,31 @@ async def test_joins_missing_chat_then_configures_schedule(store, world):
     assert summary
 
 
+async def test_hung_account_is_cut_off_and_does_not_block_others(store, world, monkeypatch):
+    import asyncio
+
+    await _acc(store, "hung")
+    await _acc(store, "fine")
+    await store.add_chat("C", "-1001", kind="schedule", invite_link="https://t.me/+abc")
+    cfg = Settings(_env_file=None, autopilot_account_timeout_min=0.01, autopilot_parallel=2)
+    monkeypatch.setattr(autopilot, "get_settings", lambda: cfg)
+
+    async def fake_process(store_, acc, chats, bot, **kw):
+        if acc.label == "hung":
+            await asyncio.sleep(3600)
+        res = autopilot.AccountResult(label=acc.label)
+        res.joined.append("C")
+        return res
+
+    monkeypatch.setattr(autopilot, "process_account", fake_process)
+    bot = FakeBot()
+    summary = await asyncio.wait_for(
+        autopilot.run_autopilot(store, bot, 777, force=True), timeout=30
+    )
+    assert "hung" in summary and "завис" in summary
+    assert "fine" in summary
+
+
 async def test_nothing_to_do_is_silent(store, world):
     await _acc(store, "tron")
     chat = await store.add_chat("C", "-1001", kind="schedule", invite_link="https://t.me/+abc")

@@ -559,19 +559,34 @@ async def run_autopilot(
 
     size, pause = setup_parallel_defaults()
 
+    limit_sec = max(1.0, float(cfg.autopilot_account_timeout_min) * 60)
+
     async def _one(acc: Account) -> AccountResult:
-        return await process_account(
-            store,
-            acc,
-            chats,
-            bot,
-            is_cancelled=lambda: runtime.cancelled("autopilot", 0),
-        )
+        try:
+            return await asyncio.wait_for(
+                process_account(
+                    store,
+                    acc,
+                    chats,
+                    bot,
+                    is_cancelled=lambda: runtime.cancelled("autopilot", 0),
+                ),
+                timeout=limit_sec,
+            )
+        except asyncio.TimeoutError:
+            log.warning("autopilot: %s не уложился в %.0f мин — пропущен", acc.label, limit_sec / 60)
+            return AccountResult(
+                label=acc.label,
+                error=(
+                    f"завис дольше {limit_sec / 60:.0f} мин — прервал, продолжу на "
+                    "следующем проходе (остальные аккаунты не задеты)"
+                ),
+            )
 
     raw = await map_batches(
         accounts,
         _one,
-        batch_size=min(size, 4),
+        batch_size=max(1, min(size, int(cfg.autopilot_parallel))),
         batch_pause=pause,
         is_cancelled=lambda: runtime.cancelled("autopilot", 0),
     )
