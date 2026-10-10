@@ -105,6 +105,13 @@ def test_why_bot_message_without_mention_is_probable():
     assert why.summary.startswith("Похоже")
 
 
+def test_why_generic_bot_header_is_not_a_reason():
+    header = "Rules - https://telegra.ph/Rules-GSC Protection @WsGuardBot, запрещена реклама"
+    g = Gathered(messages=[_msg(header, to_me=False)])
+    # бот-шапка про запреты вообще, но не про наказание → не объяснение мута
+    assert build_why("mute", gathered=g, detected=NOW).cause == "not_found"
+
+
 def test_why_human_chat_talk_is_not_a_reason():
     g = Gathered(messages=[_msg("реклама достала", to_me=False, bot=False, sender="vasya")])
     why = build_why("mute", gathered=g, detected=NOW)
@@ -411,7 +418,12 @@ async def test_gather_finds_bot_notice_and_skips_noise():
         _FakeMsg(1, "Продам гараж, реклама не нужна", human),  # болтовня: не нам и не бот
         _FakeMsg(2, "мой пост", me, out=True),
         _FakeMsg(3, "@acc_user автоматическая рассылка запрещена, мут 24ч", bot, reply_to=2),
-        _FakeMsg(4, "Спам-бот удалил сообщение", bot),  # бот про спам, без отметки
+        _FakeMsg(4, "Спам-бот: пользователь ограничен за спам", bot),  # про наказание, без отметки
+        _FakeMsg(
+            5,
+            "GLOBAL SERVICE CHAT Protection - @WsGuardBot Rules - https://telegra.ph/Rules-GSC",
+            bot,
+        ),  # шапка чата: ни к кому не относится
     ]
     got = await gather(
         _FakeTg(msgs, mentions={3}),

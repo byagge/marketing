@@ -72,7 +72,9 @@ _RULES: list[tuple[str, re.Pattern[str]]] = [
             re.I,
         ),
     ),
-    ("rules", re.compile(r"правил|нарушен|\brules?\b|violat|запрещ|forbidden|not allowed", re.I)),
+    # слова «правила / rules» сами по себе (шапка чата со ссылкой на правила) причиной не считаем —
+    # нужно, чтобы речь шла о нарушении или запрете
+    ("rules", re.compile(r"нарушен|violat|запрещ|forbidden|not allowed", re.I)),
     (
         "admin",
         re.compile(
@@ -88,6 +90,15 @@ _RULE_CAUSES = {"antispam", "duplicate", "frequency", "links", "ads", "rules"}
 KNOWN_GUARD_BOTS = ("wsguardbot", "guard_lsa_bot", "lustifygarant_bot", "combot", "shieldy")
 WINDOW_BEFORE = timedelta(hours=72)
 WINDOW_AFTER = timedelta(minutes=20)
+
+
+# сообщение бота, не адресованное аккаунту, считается объяснением только если оно про наказание
+PUNISH_RX = re.compile(
+    r"\bмут\b|в\s+мут|замьют|замьюч|ограничен|забанен|\bбан\b|кикнут|исключен|"
+    r"\bmuted?\b|\bbanned\b|restricted|\bkicked\b",
+    re.I,
+)
+_URL_RX = re.compile(r"https?://\S+|t\.me/\S+|telegra\.ph/\S+", re.I)
 
 
 def classify_message(text: str) -> tuple[str, str] | None:
@@ -226,7 +237,7 @@ def build_why(
             continue
         cls = classify_message(m.text)
         cause = cls[0] if cls else None
-        if not (m.to_me or (m.is_bot and cause)):
+        if not (m.to_me or (m.is_bot and cause and PUNISH_RX.search(m.text))):
             continue
         ranked.append((_score(m, cause, detected), m, cause))
     ranked.sort(key=lambda t: t[0], reverse=True)
@@ -270,8 +281,8 @@ def build_why(
         cause, frag, src = gathered.rules[0]
         return Why(
             cause,
-            f"Прямого сообщения о {word}е в чате не нашёл. В правилах чата ({src}) есть "
-            f"подходящий запрет: «{_snip(frag, 220)}» — вероятно, {word} за это.",
+            f"Прямого сообщения о {word}е в чате не нашёл. В правилах чата ({src}) сказано: "
+            f"«{_snip(frag, 220)}» — возможно, {word} связан с этим (это предположение).",
             evidence,
         )
 
@@ -440,6 +451,8 @@ async def _consider(
     is_bot = _is_guard(sender, bots)
     if not (to_me or is_bot):
         return
+    if not to_me and not PUNISH_RX.search(text):
+        return  # шапка чата, приветствие и т.п. — не про наказание
     out.messages.append(
         Msg(
             id=int(m.id),
@@ -475,7 +488,10 @@ async def _read_rules(client: TelegramClient, entity: Any, out: Gathered) -> Non
         log.debug("pinned failed: %s", e)
     for src, text in texts:
         for line in re.split(r"[\n\r]+|(?<=[.!?])\s+", text):
-            cls = classify_message(line)
-            if cls and cls[0] in _RULE_CAUSES and len(line.strip()) >= 8:
-                out.rules.append((cls[0], line.strip(), src))
+            bare = _URL_RX.sub("", line).strip()
+            if len(bare) < 20:  # «Rules - ссылка» и т.п. — самих правил здесь нет
+                continue
+            cls = classify_message(bare)
+            if cls and cls[0] in _RULE_CAUSES:
+                out.rules.append((cls[0], bare, src))
                 break  # по одному найденному правилу с источника достаточно
