@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from shutil import copy2
 from typing import Any
@@ -27,6 +27,7 @@ from app.models import (
     OnlinePingSettings,
     Post,
     Restriction,
+    RestrEvent,
     SenderSettings,
     SendStatDay,
     SetupState,
@@ -252,6 +253,24 @@ CREATE TABLE IF NOT EXISTS chat_restrictions (
     UNIQUE(account_id, chat_pk)
 );
 
+CREATE TABLE IF NOT EXISTS restr_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    account_id INTEGER NOT NULL,
+    chat_pk INTEGER NOT NULL,
+    kind TEXT NOT NULL,
+    source TEXT NOT NULL DEFAULT '',
+    detected_at TEXT NOT NULL,
+    until_at TEXT NOT NULL DEFAULT '',
+    cause TEXT NOT NULL DEFAULT '',
+    summary TEXT NOT NULL DEFAULT '',
+    evidence TEXT NOT NULL DEFAULT '',
+    link TEXT NOT NULL DEFAULT '',
+    analyzed INTEGER NOT NULL DEFAULT 0,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    notified INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_restr_events_pair ON restr_events(account_id, chat_pk);
+
 CREATE TABLE IF NOT EXISTS account_chat_prefs (
     account_id INTEGER NOT NULL,
     chat_key TEXT NOT NULL,
@@ -402,6 +421,30 @@ DEFAULT_SETTINGS = {
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _restr_class(kind: str) -> str:
+    """ban / spamblock / mute (mute и nowrite — один класс «нельзя писать»)."""
+    if kind == "ban":
+        return "ban"
+    if kind == "spamblock":
+        return "spamblock"
+    return "mute"
+
+
+# Для этих видов причина известна заранее — клиент Telegram не нужен, админа не дёргаем.
+_PRESET_EVENT = {
+    "nowrite": (
+        "chat_closed",
+        "В чате писать нельзя никому (канал или закрытая группа) — это не мут аккаунта.",
+    ),
+    "spamblock": (
+        "account_spam",
+        "Ограничение самого аккаунта (@SpamBot): Telegram не пускает его писать в чаты. "
+        "Пара закрыта до конца срока ограничения.",
+    ),
+}
+EVENT_DEDUPE_HOURS = 6
 
 
 def _post(row: aiosqlite.Row | None, *, account_id: int, lang: str) -> Post:
@@ -952,6 +995,7 @@ class Store:
                 "send_events",
                 "send_scans",
                 "chat_restrictions",
+                "restr_events",
                 "account_chat_prefs",
                 "account_chat_posts",
             ):
@@ -1228,6 +1272,7 @@ class Store:
             await db.execute("DELETE FROM send_events WHERE chat_pk=?", (chat_pk,))
             await db.execute("DELETE FROM send_scans WHERE chat_pk=?", (chat_pk,))
             await db.execute("DELETE FROM chat_restrictions WHERE chat_pk=?", (chat_pk,))
+            await db.execute("DELETE FROM restr_events WHERE chat_pk=?", (chat_pk,))
             await db.execute("DELETE FROM chat_facts WHERE chat_pk=?", (chat_pk,))
             await db.execute("DELETE FROM chats WHERE id=?", (chat_pk,))
             await db.commit()
@@ -1733,6 +1778,11 @@ class Store:
     ) -> Restriction:
         now = _now()
         existing = await self.get_restriction(account_id, chat_pk, active_only=False)
+        is_new_event = (
+            existing is None
+            or not existing.active
+            or _restr_class(existing.kind) != _restr_class(kind)
+        )
         keep_since = (
             existing.detected_at
             if existing and existing.active and existing.kind == kind
@@ -1763,6 +1813,10 @@ class Store:
                 ),
             )
             await db.commit()
+        if is_new_event:
+            await self.add_restr_event(
+                account_id, chat_pk, kind, source="restriction", until_at=until_at
+            )
         got = await self.get_restriction(account_id, chat_pk, active_only=False)
         assert got is not None
         return got
@@ -1826,6 +1880,208 @@ class Store:
             db.row_factory = aiosqlite.Row
             cur = await db.execute(sql, args)
             return [_restriction(r) for r in await cur.fetchall()]
+
+    # ---- журнал мутов / банов (restr_events) --------------------------------
+
+    @staticmethod
+    def _restr_event(row: aiosqlite.Row) -> RestrEvent:
+        keys = row.keys()
+        return RestrEvent(
+            id=int(row["id"]),
+            account_id=int(row["account_id"]),
+            chat_pk=int(row["chat_pk"]),
+            kind=row["kind"] or "",
+            source=row["source"] or "",
+            detected_at=row["detected_at"] or "",
+            until_at=row["until_at"] or "",
+            cause=row["cause"] or "",
+            summary=row["summary"] or "",
+            evidence=row["evidence"] or "",
+            link=row["link"] or "",
+            analyzed=int(row["analyzed"] or 0),
+            attempts=int(row["attempts"] or 0),
+            notified=int(row["notified"] or 0),
+            account_label=(row["account_label"] if "account_label" in keys else "") or "",
+            chat_title=(row["chat_title"] if "chat_title" in keys else "") or "",
+        )
+
+    _EVENT_SELECT = (
+        "SELECT e.*, COALESCE(a.label,'') AS account_label, "
+        "COALESCE(c.title,'') AS chat_title FROM restr_events e "
+        "LEFT JOIN accounts a ON a.id=e.account_id "
+        "LEFT JOIN chats c ON c.id=e.chat_pk "
+    )
+
+    async def add_restr_event(
+        self,
+        account_id: int,
+        chat_pk: int,
+        kind: str,
+        *,
+        source: str = "restriction",
+        until_at: str = "",
+        silent: bool = False,
+    ) -> int | None:
+        """Новая запись журнала. Повтор того же класса по паре за 6 ч — не дублируем
+        (бан пишется и в chat_restrictions, и в chat_bans)."""
+        cls = _restr_class(kind)
+        cutoff = (
+            datetime.now(timezone.utc) - timedelta(hours=EVENT_DEDUPE_HOURS)
+        ).isoformat(timespec="seconds")
+        cause, summary = _PRESET_EVENT.get(kind, ("", ""))
+        preset = bool(cause)
+        async with self._connect() as db:
+            cur = await db.execute(
+                "SELECT kind FROM restr_events WHERE account_id=? AND chat_pk=? "
+                "AND detected_at>=?",
+                (account_id, chat_pk, cutoff),
+            )
+            if any(_restr_class(r[0]) == cls for r in await cur.fetchall()):
+                return None
+            cur = await db.execute(
+                "INSERT INTO restr_events(account_id, chat_pk, kind, source, detected_at, "
+                "until_at, cause, summary, analyzed, notified) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (
+                    account_id,
+                    chat_pk,
+                    kind,
+                    source,
+                    _now(),
+                    until_at,
+                    cause,
+                    summary,
+                    1 if preset else 0,
+                    1 if (preset or silent) else 0,
+                ),
+            )
+            await db.commit()
+            return int(cur.lastrowid)
+
+    async def pending_restr_events(
+        self, *, limit: int = 30, max_attempts: int = 3
+    ) -> list[RestrEvent]:
+        """Записи, у которых причина ещё не разобрана."""
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                self._EVENT_SELECT
+                + "WHERE e.analyzed=0 AND e.attempts<? ORDER BY e.id LIMIT ?",
+                (max_attempts, limit),
+            )
+            return [self._restr_event(r) for r in await cur.fetchall()]
+
+    async def unnotified_restr_events(self) -> list[RestrEvent]:
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                self._EVENT_SELECT + "WHERE e.analyzed=1 AND e.notified=0 ORDER BY e.id"
+            )
+            return [self._restr_event(r) for r in await cur.fetchall()]
+
+    async def save_restr_analysis(
+        self,
+        event_id: int,
+        *,
+        cause: str,
+        summary: str,
+        evidence: str = "",
+        link: str = "",
+    ) -> None:
+        async with self._connect() as db:
+            await db.execute(
+                "UPDATE restr_events SET cause=?, summary=?, evidence=?, link=?, analyzed=1 "
+                "WHERE id=?",
+                (cause, summary[:1200], evidence[:2500], link, event_id),
+            )
+            await db.commit()
+
+    async def bump_restr_attempt(self, event_id: int) -> int:
+        async with self._connect() as db:
+            await db.execute(
+                "UPDATE restr_events SET attempts=attempts+1 WHERE id=?", (event_id,)
+            )
+            await db.commit()
+            cur = await db.execute("SELECT attempts FROM restr_events WHERE id=?", (event_id,))
+            row = await cur.fetchone()
+        return int(row[0]) if row else 0
+
+    async def mark_restr_notified(self, event_ids: list[int]) -> None:
+        if not event_ids:
+            return
+        async with self._connect() as db:
+            await db.executemany(
+                "UPDATE restr_events SET notified=1 WHERE id=?", [(i,) for i in event_ids]
+            )
+            await db.commit()
+
+    async def latest_restr_events(self) -> dict[tuple[int, int, str], RestrEvent]:
+        """Последняя запись журнала по (аккаунт, чат, класс: ban/mute/spamblock)."""
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(self._EVENT_SELECT + "ORDER BY e.id")
+            rows = [self._restr_event(r) for r in await cur.fetchall()]
+        return {(e.account_id, e.chat_pk, _restr_class(e.kind)): e for e in rows}
+
+    async def get_restr_event(self, event_id: int) -> RestrEvent | None:
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(self._EVENT_SELECT + "WHERE e.id=?", (event_id,))
+            row = await cur.fetchone()
+        return self._restr_event(row) if row else None
+
+    async def list_restr_events(self, *, limit: int = 200) -> list[RestrEvent]:
+        """История (новые сверху)."""
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(self._EVENT_SELECT + "ORDER BY e.id DESC LIMIT ?", (limit,))
+            return [self._restr_event(r) for r in await cur.fetchall()]
+
+    async def adopt_restr_events(self, *, limit: int = 60) -> int:
+        """Завести записи журнала для уже активных ограничений без записи
+        (тихо: без уведомления, но с разбором причины)."""
+        have = await self.latest_restr_events()
+        added = 0
+        for r in await self.list_restrictions():
+            if added >= limit:
+                break
+            if (r.account_id, r.chat_pk, _restr_class(r.kind)) in have:
+                continue
+            if await self._adopt(r.account_id, r.chat_pk, r.kind, "restriction", r.until_at, r.detected_at):
+                added += 1
+        for b in await self.list_bans(active_only=True):
+            if added >= limit:
+                break
+            if (b.account_id, b.chat_pk, "ban") in have:
+                continue
+            if await self._adopt(b.account_id, b.chat_pk, "ban", b.reason or "ban", "", b.detected_at):
+                added += 1
+        return added
+
+    async def _adopt(
+        self, account_id: int, chat_pk: int, kind: str, source: str, until_at: str, detected_at: str
+    ) -> bool:
+        eid = await self.add_restr_event(
+            account_id, chat_pk, kind, source=source, until_at=until_at, silent=True
+        )
+        if eid is None:
+            return False
+        if detected_at:
+            async with self._connect() as db:
+                await db.execute(
+                    "UPDATE restr_events SET detected_at=? WHERE id=?", (detected_at, eid)
+                )
+                await db.commit()
+        return True
+
+    async def send_times(self, account_id: int, chat_pk: int, since_utc: str) -> list[str]:
+        """Время отправок аккаунта в чат с момента since (UTC iso), по возрастанию."""
+        async with self._connect() as db:
+            cur = await db.execute(
+                "SELECT sent_at FROM send_events WHERE account_id=? AND chat_pk=? "
+                "AND sent_at>=? ORDER BY sent_at",
+                (account_id, chat_pk, since_utc),
+            )
+            return [r[0] for r in await cur.fetchall()]
 
     async def banned_pairs(self) -> set[tuple[int, int]]:
         rows = await self.list_restrictions(kinds=("ban",))
@@ -2869,6 +3125,8 @@ class Store:
                     (reason, (detail or "")[:500], now, account_id, chat_pk),
                 )
             await db.commit()
+        if is_new:
+            await self.add_restr_event(account_id, chat_pk, "ban", source=reason or "ban")
         ban = await self.get_ban(account_id, chat_pk)
         assert ban is not None
         return ban, is_new

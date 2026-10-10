@@ -90,6 +90,7 @@ def main_menu() -> InlineKeyboardMarkup:
             [ib("Настройка", "setup", icon="robot"), ib("Чаты", "chats", icon="users")],
             [ib("Таблица", "table", icon="clock"), ib("Sender", "sender", icon="link")],
             [ib("Факты отправки", "fact", icon="chart"), ib("Баны / муты", "restr", icon="shield")],
+            [ib("Муты сейчас", "restr_mutes", icon="clock"), ib("Баны сейчас", "restr_bans", icon="block")],
             [ib("Аккаунты", "accounts", icon="user"), ib("Online", "online", icon="star")],
             [ib("Session", "mk_session", icon="inbox"), ib("Экспорт", "export", icon="chart")],
             [ib("Отчёты", "reports", icon="chart"), ib("Проверка", "health", icon="search")],

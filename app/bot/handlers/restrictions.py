@@ -15,6 +15,9 @@ from app.jobs import runtime
 from app.jobs.advisor import build_advice, run_advisor
 from app.jobs.coverage import coverage_report
 from app.jobs.join import run_join_missing_all
+from app.jobs.restr_events import KIND_ICON, event_html, event_kb, run_restr_events
+from app.tg.mutewhy import CAUSE_LABEL
+from app.ui.restr_view import ban_entries, entry_html, mute_entries
 from app.jobs.spam import STATUS_LABEL, check_account_spam, run_spam_check
 from app.notify import safe_send
 from app.ui.emoji import pe
@@ -23,8 +26,8 @@ from app.utils.timefmt import fmt_local, fmt_until
 
 router = Router()
 
-BANS_PER_PAGE = 18
-MUTES_PER_PAGE = 7
+ENTRIES_PER_PAGE = 5
+HIST_PER_PAGE = 12
 
 
 def _kb(rows: list[list]) -> InlineKeyboardMarkup:
@@ -32,8 +35,9 @@ def _kb(rows: list[list]) -> InlineKeyboardMarkup:
 
 
 async def restr_home_html() -> str:
-    bans = await ctx.store.list_restrictions(kinds=("ban",))
-    mutes = await ctx.store.list_restrictions(kinds=("mute", "nowrite", "spamblock"))
+    bans = await ban_entries(ctx.store)
+    mutes = await mute_entries(ctx.store)
+    unexplained = sum(1 for e in bans + mutes if not e.why)
     accounts = [a for a in await ctx.store.list_accounts() if a.telethon_session]
     limited = sum(1 for a in accounts if a.is_spam_limited)
     unchecked = sum(1 for a in accounts if not a.spam_status)
@@ -43,8 +47,10 @@ async def restr_home_html() -> str:
         f"{pe('clock')} Муты / SpamBlock / запрет писать: <b>{len(mutes)}</b> — "
         f"срок и причина сохраняются, после окончания пара снова включается\n"
         f"{pe('warn')} С ограничением @SpamBot: <b>{limited}</b> "
-        f"(не проверено: {unchecked})\n\n"
-        f"Скан (баны/муты + факты отправки) идёт каждый час сам."
+        f"(не проверено: {unchecked})\n"
+        f"{pe('search')} Без найденной причины: <b>{unexplained}</b>\n\n"
+        f"Скан (баны/муты + факты отправки) идёт каждый час сам. О каждом новом муте/бане "
+        f"бот сам напишет с причиной (чат, отметки аккаунта, боты-гаранты)."
     )
 
 
@@ -54,6 +60,10 @@ def restr_home_kb() -> InlineKeyboardMarkup:
             [
                 ib("Баны", "restr_bans", icon="block"),
                 ib("Муты", "restr_mutes", icon="clock"),
+            ],
+            [
+                ib("Разобрать причины", "mb_run", icon="search"),
+                ib("История", "mb_hist", icon="stack"),
             ],
             [ib("По аккаунтам", "restr_acc", icon="user")],
             [
@@ -82,57 +92,126 @@ def _page(items: list, page: int, per: int) -> tuple[list, int, int]:
     return items[page * per : page * per + per], page, total
 
 
+async def _entries_screen(
+    query: CallbackQuery, callback_data: MenuCB, *, bans: bool
+) -> None:
+    action = "restr_bans" if bans else "restr_mutes"
+    items = await (ban_entries(ctx.store) if bans else mute_entries(ctx.store))
+    chunk, page, total = _page(items, callback_data.p, ENTRIES_PER_PAGE)
+    title = "Баны" if bans else "Муты / запрет писать"
+    icon = "block" if bans else "clock"
+    lines = [
+        f"{pe(icon)} <b>{title}</b> — сейчас активно: <b>{len(items)}</b> "
+        f"(новые сверху)",
+        "",
+    ]
+    if not items:
+        lines.append(f"<i>{'Банов' if bans else 'Мутов'} нет.</i>")
+    num_buttons = []
+    for idx, e in enumerate(chunk, start=page * ENTRIES_PER_PAGE + 1):
+        lines.append(entry_html(idx, e))
+        lines.append("")
+        if e.event is not None:
+            num_buttons.append(ib(str(idx), "ev_open", e.event.id, icon="info"))
+    rows = []
+    if num_buttons:
+        rows.append(num_buttons)
+    if total > 1:
+        rows.append(nav_row(action, page, total))
+    rows.append(
+        [
+            ib("Разобрать причины", "mb_run", icon="search"),
+            ib("История", "mb_hist", icon="stack"),
+        ]
+    )
+    other = ("Муты", "restr_mutes", "clock") if bans else ("Баны", "restr_bans", "block")
+    rows.append([ib(other[0], other[1], icon=other[2]), ib("Баны/муты", "restr", icon="shield")])
+    rows.append(home_row())
+    text = "\n".join(lines).rstrip()
+    if len(text) > 3900:
+        text = text[:3890] + "…"
+    await safe_edit(query, text, _kb(rows))
+
+
 @router.callback_query(MenuCB.filter(F.a == "restr_bans"))
 async def cb_bans(query: CallbackQuery, callback_data: MenuCB) -> None:
-    bans = await ctx.store.list_restrictions(kinds=("ban",))
-    chunk, page, total = _page(bans, callback_data.p, BANS_PER_PAGE)
-    lines = [f"{pe('block')} <b>Баны</b> ({len(bans)})", ""]
-    if not bans:
-        lines.append("<i>Банов нет.</i>")
-    last_acc = None
-    for r in chunk:
-        if r.account_label != last_acc:
-            lines.append(f"\n{pe('user')} <b>{escape(r.account_label)}</b>")
-            last_acc = r.account_label
-        until = f" до {fmt_until(r.until_at)}" if r.until_at else ""
-        lines.append(
-            f"· {escape(r.chat_title)} — с {fmt_local(r.detected_at)}{until}"
-        )
-    rows = []
-    if total > 1:
-        rows.append(nav_row("restr_bans", page, total))
-    rows.append([ib("Баны/муты", "restr", icon="shield")])
-    rows.append(home_row())
-    await safe_edit(query, "\n".join(lines)[:3900], _kb(rows))
+    await _entries_screen(query, callback_data, bans=True)
 
 
 @router.callback_query(MenuCB.filter(F.a == "restr_mutes"))
 async def cb_mutes(query: CallbackQuery, callback_data: MenuCB) -> None:
-    mutes = await ctx.store.list_restrictions(kinds=("mute", "nowrite", "spamblock"))
-    # скоро заканчивающиеся — выше
-    mutes.sort(key=lambda r: (r.until_at or "9999", r.account_label.casefold()))
-    chunk, page, total = _page(mutes, callback_data.p, MUTES_PER_PAGE)
-    lines = [f"{pe('clock')} <b>Муты / запрет писать</b> ({len(mutes)})", ""]
-    if not mutes:
-        lines.append("<i>Мутов нет.</i>")
-    for r in chunk:
-        kind = {"mute": "мут", "spamblock": "SpamBlock аккаунта"}.get(
-            r.kind, "чат закрыт для записи"
+    await _entries_screen(query, callback_data, bans=False)
+
+
+@router.callback_query(MenuCB.filter(F.a == "ev_open"))
+async def cb_ev_open(query: CallbackQuery, callback_data: MenuCB) -> None:
+    ev = await ctx.store.get_restr_event(callback_data.i)
+    if ev is None:
+        await query.answer("Запись не найдена", show_alert=True)
+        return
+    await safe_edit(query, event_html(ev), event_kb(ev))
+
+
+@router.callback_query(MenuCB.filter(F.a == "ev_nopost"))
+async def cb_ev_nopost(query: CallbackQuery, callback_data: MenuCB) -> None:
+    ev = await ctx.store.get_restr_event(callback_data.i)
+    if ev is None:
+        await query.answer("Запись не найдена", show_alert=True)
+        return
+    chat = await ctx.store.update_chat(ev.chat_pk, no_post=1)
+    if chat is None:
+        await query.answer("Чат уже удалён", show_alert=True)
+        return
+    await query.answer("Чат выключен для рассылки", show_alert=True)
+
+
+@router.callback_query(MenuCB.filter(F.a == "mb_run"))
+async def cb_mb_run(query: CallbackQuery) -> None:
+    if runtime.is_running("restr_events", 0):
+        await query.answer("Разбор уже идёт", show_alert=True)
+        return
+    await query.answer("Разбираю причины…")
+    bot, admin_id = query.bot, query.from_user.id
+
+    async def _job() -> None:
+        summary = await run_restr_events(
+            ctx.store, bot, admin_id, adopt=True, notify=False
         )
-        reason = escape((r.reason or "причина не найдена")[:220])
-        link = f' <a href="{escape(r.reason_link)}">сообщение</a>' if r.reason_link else ""
+        await safe_send(
+            bot,
+            admin_id,
+            f"{summary}\nОткройте «Баны / муты» → Муты или Баны — причины подставлены.",
+        )
+
+    runtime.spawn("restr_events", 0, _job())
+    await query.message.answer(
+        "Читаю чаты и отметки аккаунтов, ищу причины мутов и банов — пришлю итог."
+    )
+
+
+@router.callback_query(MenuCB.filter(F.a == "mb_hist"))
+async def cb_mb_hist(query: CallbackQuery, callback_data: MenuCB) -> None:
+    events = await ctx.store.list_restr_events(limit=300)
+    chunk, page, total = _page(events, callback_data.p, HIST_PER_PAGE)
+    lines = [f"{pe('stack')} <b>История мутов и банов</b> ({len(events)})", ""]
+    if not events:
+        lines.append("<i>Пока пусто — запись появится при первом новом муте/бане.</i>")
+    for ev in chunk:
+        icon = KIND_ICON.get(ev.kind, "⚠")
+        why = CAUSE_LABEL.get(ev.cause, "разбираю…" if not ev.analyzed else "—")
         lines.append(
-            f"{pe('user')} <b>{escape(r.account_label)}</b> · {escape(r.chat_title)}\n"
-            f"   {kind}, до <b>{escape(fmt_until(r.until_at))}</b> "
-            f"(с {fmt_local(r.detected_at)})\n"
-            f"   {reason}{link}"
+            f"{icon} {fmt_local(ev.detected_at)} · <b>{escape(ev.account_label)}</b> → "
+            f"«{escape(ev.chat_title)}»\n   {escape(why)}"
         )
     rows = []
     if total > 1:
-        rows.append(nav_row("restr_mutes", page, total))
-    rows.append([ib("Баны/муты", "restr", icon="shield")])
+        rows.append(nav_row("mb_hist", page, total))
+    rows.append(
+        [ib("Муты", "restr_mutes", icon="clock"), ib("Баны", "restr_bans", icon="block")]
+    )
     rows.append(home_row())
-    await safe_edit(query, "\n".join(lines)[:3900], _kb(rows))
+    text = "\n".join(lines)
+    await safe_edit(query, text[:3900], _kb(rows))
 
 
 @router.callback_query(MenuCB.filter(F.a == "restr_acc"))

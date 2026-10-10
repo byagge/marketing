@@ -135,6 +135,25 @@ async def main() -> None:
         admin_id = next(iter(settings.admins), None)
         await run_advisor(store, bot, admin_id)
 
+    async def restr_events_tick():
+        # новые муты/баны: найти причину в чате и один раз написать админу
+        from app.jobs.restr_events import run_restr_events
+
+        if runtime.is_running("restr_events", 0):
+            return
+        admin_id = next(iter(sorted(settings.admins)), None)
+
+        async def _job():
+            summary = await run_restr_events(store, bot, admin_id)
+            if "заведено в журнал 0, причин разобрано 0, уведомлений 0" not in summary:
+                log.info("%s", summary)
+
+        try:
+            task = runtime.spawn("restr_events", 0, _job())
+        except RuntimeError:
+            return
+        await task
+
     async def marketer_tick():
         if not settings.marketer_enabled:
             return
@@ -215,6 +234,16 @@ async def main() -> None:
         minutes=30,
         coalesce=True,
         max_instances=1,
+    )
+    scheduler.add_job(
+        restr_events_tick,
+        "interval",
+        id="restr_events",
+        replace_existing=True,
+        minutes=10,
+        coalesce=True,
+        max_instances=1,
+        next_run_time=datetime.now(scheduler.timezone) + timedelta(minutes=2),
     )
     scheduler.add_job(
         bans_weekly,

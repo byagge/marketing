@@ -452,6 +452,32 @@ class ChatBan:
 
 
 @dataclass
+class RestrEvent:
+    """Журнал: когда и где аккаунт получил мут / бан и почему (разбор причины)."""
+
+    id: int
+    account_id: int
+    chat_pk: int
+    kind: str  # mute | nowrite | ban | spamblock
+    source: str = ""  # restriction | join_ban | removed | send_ban
+    detected_at: str = ""
+    until_at: str = ""
+    cause: str = ""  # код причины (см. app/tg/mutewhy.py)
+    summary: str = ""  # человеческое объяснение
+    evidence: str = ""  # найденные сообщения/факты, по строке на пункт
+    link: str = ""  # ссылка на сообщение-причину
+    analyzed: int = 0
+    attempts: int = 0
+    notified: int = 0
+    account_label: str = ""
+    chat_title: str = ""
+
+    @property
+    def is_ban(self) -> bool:
+        return self.kind == "ban"
+
+
+@dataclass
 class JoinState:
     """Прогресс автовступления аккаунта в чат."""
 
