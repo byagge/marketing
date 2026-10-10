@@ -46,6 +46,7 @@ from app.operator.needs import (
 )
 from app.store import Store
 from app.utils.chat_ids import canon_chat_id
+from app.utils.coverage import NEED_INTERVAL_CAP
 from app.utils.timefmt import parse_utc, to_iso
 from app.utils.errfmt import short_error
 
@@ -407,7 +408,8 @@ def _need_line(n: ChatNeed) -> str:
         extra.append(f"не могут вступить {n.stuck}")
     tail = f" ({', '.join(extra)})" if extra else ""
     # у чатов бывают одинаковые названия — различаем интервалом
-    return f"{n.title} [раз в {n.interval} мин]: есть {n.eligible} из {n.needed}{tail}"
+    slow = f", цель как для {NEED_INTERVAL_CAP} мин" if n.interval > NEED_INTERVAL_CAP else ""
+    return f"{n.title} [раз в {n.interval} мин{slow}]: есть {n.eligible} из {n.needed}{tail}"
 
 
 def _need_escalation(needs: list[ChatNeed]) -> Escalation | None:

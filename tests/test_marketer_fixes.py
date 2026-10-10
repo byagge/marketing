@@ -208,8 +208,11 @@ def test_need_is_max_deficit_not_sum_and_counts_returning_mutes():
                     chat_title=f"chat{chat_pk}", restriction="mute", restriction_until="2026-10-10 18:00")
             diag.append((f, diagnose_pair(f)))
     needs = compute_needs(diag, [])
-    assert accounts_to_buy(needs) == 73 - 6  # максимум, а не 67 + 6
-    assert accounts_to_buy_if_returning(needs) == 73 - 6 - 4
+    # interval 365 is capped to 60 min: both chats need 12, not 73 (the 5-min target is
+    # unreachable for a slow chat and must not inflate the purchase number)
+    assert {n.title: n.needed for n in needs} == {"chat1": 12, "chat2": 12}
+    assert accounts_to_buy(needs) == 12 - 6
+    assert accounts_to_buy_if_returning(needs) == 12 - 6 - 4
     assert {n.title: n.returning for n in needs} == {"chat1": 4, "chat2": 4}
 
 

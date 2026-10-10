@@ -16,6 +16,8 @@ import math
 from collections import defaultdict
 from dataclasses import dataclass
 
+from app.utils.coverage import NEED_INTERVAL_CAP
+
 from app.operator.diagnose import (
     MUTED,
     NO_DATA,
@@ -89,7 +91,8 @@ def compute_needs(
             returning[f.chat_pk] += 1
     out: list[ChatNeed] = []
     for pk, f in meta.items():
-        needed = max(1, math.ceil(max(1, f.interval) / max(0.5, target_gap)))
+        capped_interval = min(max(1, f.interval), NEED_INTERVAL_CAP)
+        needed = max(1, math.ceil(capped_interval / max(0.5, target_gap)))
         title = f.chat_title
         out.append(
             ChatNeed(

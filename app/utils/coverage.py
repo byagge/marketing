@@ -20,12 +20,20 @@ def max_gap(minutes: list[int], period: int = 60) -> int:
     return max(gaps)
 
 
+# Цель «раз в 5 минут» имеет смысл для обычных чатов. Если у чата огромный интервал на
+# аккаунт (6 ч и т.п. — обычно из-за slowmode), 5-минутная частота недостижима и требование
+# «73 аккаунта» только пугает: считаем как для чата с интервалом не больше этого значения.
+NEED_INTERVAL_CAP = 60
+
+
 def accounts_needed(interval_minutes: int, target_gap: int = TARGET_GAP_MIN) -> int:
     """Сколько аккаунтов нужно, чтобы чат получал сообщение не реже раза в target_gap мин.
 
-    Каждый аккаунт пишет раз в interval минут → нужно ceil(interval / gap).
+    Каждый аккаунт пишет раз в interval минут → нужно ceil(interval / gap),
+    но интервал берётся не больше NEED_INTERVAL_CAP.
     """
-    return max(1, math.ceil(max(1, int(interval_minutes)) / max(1, target_gap)))
+    interval = min(max(1, int(interval_minutes)), NEED_INTERVAL_CAP)
+    return max(1, math.ceil(interval / max(1, target_gap)))
 
 
 @dataclass
