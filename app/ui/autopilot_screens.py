@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from html import escape
 
-from app.models import Account, AccountChatPref, Chat, ChatBan, JoinState, SpamState
+from app.models import Account, AccountChatPref, AccountPerf, Chat, ChatBan, JoinState, SpamState
 from app.ui.emoji import pe
 from app.utils.send_policy import effective_interval_minutes
 
@@ -177,4 +177,16 @@ def stoplist_html(keywords: tuple[str, ...], flagged: list[str]) -> str:
         f"{pe('search')} <b>Слова в названии:</b> {words}\n"
         f"{pe('pin')} <b>Сейчас под запретом (каталог):</b>\n{chats}{more}\n\n"
         f"Отдельный чат можно пометить на его карточке: «Писать нельзя»."
+    )
+
+
+def perf_line_html(perf: AccountPerf) -> str:
+    """Строка карточки аккаунта: сколько людей пишут и сколько раз ответил клоакинг."""
+    if not perf.measured:
+        return ""
+    cloak = "—" if perf.cloak_n < 0 else str(perf.cloak_n)
+    flag = " · 🎨 <b>для переоформления</b>" if perf.flagged else ""
+    return (
+        f"\n{pe('chart')} Клиенты за {perf.window_days} дн.: написали <b>{perf.wrote_n}</b> "
+        f"(первыми {perf.new_n}), клоакинг сработал <b>{escape(cloak)}</b>{flag}"
     )

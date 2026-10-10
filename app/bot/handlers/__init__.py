@@ -11,6 +11,7 @@ from app.bot.handlers.ops import router as ops_router
 from app.bot.handlers.posts import router as posts_router
 from app.bot.handlers.prefs import router as prefs_router
 from app.bot.handlers.restrictions import router as restrictions_router
+from app.bot.handlers.redesign import router as redesign_router
 from app.bot.handlers.sender import router as sender_router
 from app.bot.handlers.session_maker import router as session_maker_router
 from app.bot.handlers.table import router as table_router
@@ -29,6 +30,7 @@ __all__ = [
     "posts_router",
     "prefs_router",
     "restrictions_router",
+    "redesign_router",
     "sender_router",
     "session_maker_router",
     "table_router",

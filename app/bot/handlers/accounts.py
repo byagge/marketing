@@ -37,6 +37,9 @@ async def _account_payload(acc):
     ok_states = await ctx.store.list_setup_states(acc.id, statuses=["ok"])
     schedule_n = sum(1 for st in ok_states if st.chat_pk in schedule_ids)
     campaign = campaign_html(acc, state, load, schedule_n, get_settings().spam_dead_strikes)
+    from app.ui.autopilot_screens import perf_line_html
+
+    campaign += perf_line_html(await ctx.store.get_perf(acc.id))
     return (
         account_html(acc, ru, en, campaign),
         account_kb(acc, runtime.is_running("setup", acc.id)),

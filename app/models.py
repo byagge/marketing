@@ -490,3 +490,30 @@ class SpamState:
     @property
     def is_limited(self) -> bool:
         return self.status == "limited"
+
+
+@dataclass
+class AccountPerf:
+    """Результативность аккаунта: сколько людей пишут ему в личку, как часто работает клоакинг."""
+
+    account_id: int
+    checked_at: str = ""
+    window_days: int = 7
+    new_n: int = 0  # люди, написавшие первыми за окно
+    wrote_n: int = 0  # люди, приславшие хотя бы одно сообщение за окно
+    cloak_n: int = -1  # сколько раз ответил клоакинг; -1 — не считали (нет текста клоакинга)
+    scanned: int = 0
+    truncated: int = 0
+    verdict: str = ""  # ok | low | none | grace
+    flagged_at: str = ""  # когда попал в «аккаунты для переоформления»
+    notified_at: str = ""
+    redesigned_at: str = ""
+    skip: int = 0  # 1 — не оценивать
+
+    @property
+    def flagged(self) -> bool:
+        return bool(self.flagged_at)
+
+    @property
+    def measured(self) -> bool:
+        return bool(self.checked_at)

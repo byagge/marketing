@@ -109,6 +109,12 @@ def world(monkeypatch):
     async def fake_sweep(store, acc, api=None):
         return list(w.stopped)
 
+    w.perf_events = []
+
+    async def fake_perf(store, client, acc, **kw):
+        return w.perf_events.pop(0) if w.perf_events else None
+
+    monkeypatch.setattr(autopilot, "perf_step", fake_perf)
     w.sync_calls = []
 
     async def fake_sync(store, account_id, bot=None, admin=None):
@@ -610,3 +616,74 @@ async def test_regular_and_outreach_accounts_together(store, world):
         ("reg", sched.id), ("reg", sender.id), ("out", sched.id),
     }
     assert world.sender_calls == [reg.id]
+
+
+# ---- результативность: «аккаунты для переоформления» -------------------------
+
+from app.jobs.perf import PerfEvent  # noqa: E402
+from app.models import AccountPerf  # noqa: E402
+
+
+def _perf_event(acc, kind, wrote=0, new=0, cloak=0):
+    perf = AccountPerf(account_id=acc.id, checked_at="x", wrote_n=wrote, new_n=new, cloak_n=cloak,
+                       window_days=7, flagged_at="x")
+    return PerfEvent(acc, perf, kind)
+
+
+async def test_unproductive_account_is_announced_with_mention(store, world):
+    acc = await _acc(store, "tron")
+    chat = await store.add_chat("C", "-1001", invite_link="https://t.me/+a")
+    world.member.add(("tron", chat.id))
+    await store.record_setup_ok(acc.id, chat.id)
+    world.perf_events = [_perf_event(acc, "flagged", wrote=1, new=0, cloak=0)]
+    bot = FakeBot()
+
+    await autopilot.run_autopilot(store, bot, 5, force=True)
+
+    text = bot.sent[0][1]
+    assert text.startswith("@arxixx аккаунты не приносят клиентов — нужно переоформить: 1")
+    assert "Аккаунты для переоформления" in text
+    assert "tron: написали 1 чел. за 7 дн." in text and "клоакинг сработал: 0" in text
+
+
+async def test_recovered_account_is_good_news_without_mention(store, world):
+    acc = await _acc(store, "tron")
+    chat = await store.add_chat("C", "-1001", invite_link="https://t.me/+a")
+    world.member.add(("tron", chat.id))
+    await store.record_setup_ok(acc.id, chat.id)
+    world.perf_events = [_perf_event(acc, "recovered", wrote=9)]
+    bot = FakeBot()
+
+    await autopilot.run_autopilot(store, bot, 5, force=True)
+
+    text = bot.sent[0][1]
+    assert "Хорошие новости" in text and "снова приносит клиентов" in text
+    assert "@arxixx" not in text and "Аккаунты для переоформления" not in text
+
+
+async def test_perf_failure_does_not_break_account_pass(store, world, monkeypatch):
+    await _acc(store, "tron")
+    chat = await store.add_chat("C", "-1001", invite_link="https://t.me/+a")
+
+    async def boom(store, client, acc, **kw):
+        raise RuntimeError("history unavailable")
+
+    monkeypatch.setattr(autopilot, "perf_step", boom)
+    bot = FakeBot()
+    await autopilot.run_autopilot(store, bot, 5, force=True)
+
+    assert [c for _, c in world.joins] == [chat.id]  # вступление отработало
+    assert "оценка результативности" in bot.sent[0][1]
+
+
+async def test_several_unproductive_accounts_counted_in_one_mention(store, world):
+    a = await _acc(store, "a1")
+    b = await _acc(store, "a2")
+    chat = await store.add_chat("C", "-1001", invite_link="https://t.me/+a")
+    for acc in (a, b):
+        world.member.add((acc.label, chat.id))
+        await store.record_setup_ok(acc.id, chat.id)
+    world.perf_events = [_perf_event(a, "flagged"), _perf_event(b, "reminder")]
+    bot = FakeBot()
+    await autopilot.run_autopilot(store, bot, 5, force=True)
+    assert bot.sent[0][1].startswith("@arxixx аккаунты не приносят клиентов — нужно переоформить: 2")

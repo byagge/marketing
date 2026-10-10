@@ -14,6 +14,7 @@ from app.bot.handlers import (
     posts_router,
     prefs_router,
     restrictions_router,
+    redesign_router,
     sender_router,
     session_maker_router,
     table_router,
@@ -25,6 +26,7 @@ def setup_routers(dp: Dispatcher) -> None:
     dp.include_router(accounts_router)
     dp.include_router(prefs_router)
     dp.include_router(autopilot_router)
+    dp.include_router(redesign_router)
     dp.include_router(membership_router)
     dp.include_router(acc_chats_router)
     dp.include_router(facts_router)

@@ -31,6 +31,7 @@ from app.models import (
     SendStatDay,
     SetupState,
     SpamState,
+    AccountPerf,
 )
 from app.utils.chat_ids import canon_chat_id
 
@@ -177,6 +178,22 @@ CREATE TABLE IF NOT EXISTS spam_states (
     last_check_at TEXT NOT NULL DEFAULT '',
     last_text TEXT NOT NULL DEFAULT '',
     applied_load INTEGER NOT NULL DEFAULT 100
+);
+
+CREATE TABLE IF NOT EXISTS account_perf (
+    account_id INTEGER PRIMARY KEY REFERENCES accounts(id) ON DELETE CASCADE,
+    checked_at TEXT NOT NULL DEFAULT '',
+    window_days INTEGER NOT NULL DEFAULT 7,
+    new_n INTEGER NOT NULL DEFAULT 0,
+    wrote_n INTEGER NOT NULL DEFAULT 0,
+    cloak_n INTEGER NOT NULL DEFAULT -1,
+    scanned INTEGER NOT NULL DEFAULT 0,
+    truncated INTEGER NOT NULL DEFAULT 0,
+    verdict TEXT NOT NULL DEFAULT '',
+    flagged_at TEXT NOT NULL DEFAULT '',
+    notified_at TEXT NOT NULL DEFAULT '',
+    redesigned_at TEXT NOT NULL DEFAULT '',
+    skip INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS settings (
@@ -927,6 +944,7 @@ class Store:
             await db.execute("DELETE FROM chat_bans WHERE account_id=?", (account_id,))
             await db.execute("DELETE FROM join_states WHERE account_id=?", (account_id,))
             await db.execute("DELETE FROM spam_states WHERE account_id=?", (account_id,))
+            await db.execute("DELETE FROM account_perf WHERE account_id=?", (account_id,))
             await db.execute("DELETE FROM minute_slots WHERE account_id=?", (account_id,))
             await db.execute("DELETE FROM chat_facts WHERE account_id=?", (account_id,))
             await db.execute("DELETE FROM posts WHERE account_id=?", (account_id,))
@@ -3129,3 +3147,62 @@ class Store:
             "gate_count": (state.gate_count if state else 0) + (1 if resolved else 0),
         }
         await self._upsert_join_state(account_id, chat_pk, **fields)
+
+
+    # ---- результативность аккаунта (кто пишет в личку) -----------------------
+
+    @staticmethod
+    def _perf(row: aiosqlite.Row | None, account_id: int) -> AccountPerf:
+        if not row:
+            return AccountPerf(account_id=account_id)
+        return AccountPerf(
+            account_id=account_id,
+            checked_at=row["checked_at"] or "",
+            window_days=int(row["window_days"] or 7),
+            new_n=int(row["new_n"] or 0),
+            wrote_n=int(row["wrote_n"] or 0),
+            cloak_n=int(row["cloak_n"] if row["cloak_n"] is not None else -1),
+            scanned=int(row["scanned"] or 0),
+            truncated=int(row["truncated"] or 0),
+            verdict=row["verdict"] or "",
+            flagged_at=row["flagged_at"] or "",
+            notified_at=row["notified_at"] or "",
+            redesigned_at=row["redesigned_at"] or "",
+            skip=int(row["skip"] or 0),
+        )
+
+    async def get_perf(self, account_id: int) -> AccountPerf:
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                "SELECT * FROM account_perf WHERE account_id=?", (account_id,)
+            )
+            return self._perf(await cur.fetchone(), account_id)
+
+    async def list_perf(self) -> list[AccountPerf]:
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute("SELECT * FROM account_perf")
+            rows = await cur.fetchall()
+        return [self._perf(r, int(r["account_id"])) for r in rows]
+
+    async def save_perf(self, perf: AccountPerf) -> AccountPerf:
+        async with self._connect() as db:
+            await db.execute(
+                "INSERT INTO account_perf(account_id, checked_at, window_days, new_n, wrote_n, "
+                "cloak_n, scanned, truncated, verdict, flagged_at, notified_at, redesigned_at, skip) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?) "
+                "ON CONFLICT(account_id) DO UPDATE SET checked_at=excluded.checked_at, "
+                "window_days=excluded.window_days, new_n=excluded.new_n, wrote_n=excluded.wrote_n, "
+                "cloak_n=excluded.cloak_n, scanned=excluded.scanned, truncated=excluded.truncated, "
+                "verdict=excluded.verdict, flagged_at=excluded.flagged_at, "
+                "notified_at=excluded.notified_at, redesigned_at=excluded.redesigned_at, "
+                "skip=excluded.skip",
+                (
+                    perf.account_id, perf.checked_at, perf.window_days, perf.new_n,
+                    perf.wrote_n, perf.cloak_n, perf.scanned, perf.truncated, perf.verdict,
+                    perf.flagged_at, perf.notified_at, perf.redesigned_at, perf.skip,
+                ),
+            )
+            await db.commit()
+        return await self.get_perf(perf.account_id)

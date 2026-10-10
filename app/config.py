@@ -130,6 +130,17 @@ class Settings(BaseSettings):
     spam_dead_strikes: int = 3
     spam_strike_decay_days: int = 30
 
+    # Результативность аккаунтов: сколько людей пишут в личку за окно. Мало/ноль — в список
+    # «аккаунты для переоформления» и сообщение админу с mention.
+    perf_window_days: int = 7
+    perf_min_age_days: int = 7  # новые аккаунты не оцениваем
+    perf_low_threshold: int = 3  # меньше стольких людей за окно = «пишут мало»
+    perf_check_hours: float = 12.0
+    perf_grace_days: int = 7  # после «переоформил» не оцениваем столько дней
+    perf_renotify_days: int = 7  # напоминание, если аккаунт всё ещё в списке
+    perf_max_dialogs: int = 400
+    notify_mention: str = "@arxixx"
+
     # «Ворота подписки»: сканируем чат на сообщение бота с кнопками-ссылками.
     gate_checks_per_tick: int = 6
     gate_recheck_hours: float = 12.0
