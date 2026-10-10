@@ -18,6 +18,7 @@ from app.context import ctx
 from app.jobs import runtime
 from app.tg.client import inspect_session
 from app.utils.sessions import detect_session_kind
+from app.utils.errfmt import short_error
 
 router = Router()
 
@@ -365,7 +366,7 @@ async def on_sid(message: Message, state: FSMContext) -> None:
         except Exception as e:
             note = (
                 f"ID сохранён (<code>{_esc(value)}</code>). "
-                f"Проверка API не удалась: {_esc(f'{type(e).__name__}: {e}')}"
+                f"Проверка API не удалась: {_esc(f'{short_error(e)}')}"
             )
     else:
         note = "Sender ID очищен."

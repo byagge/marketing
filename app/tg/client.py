@@ -12,6 +12,26 @@ from app.config import get_settings
 
 _session_locks: dict[str, asyncio.Lock] = {}
 
+# Telegram периодически меняет схему (напр. новый конструктор User). Старый Telethon
+# падает на чтении ответа с TypeNotFoundError — аккаунты «ломаются» целиком.
+MIN_TELETHON_LAYER = 229  # Telethon 1.45.0
+
+
+def telethon_version_warning() -> str:
+    """Пустая строка, если Telethon достаточно свежий; иначе — что делать."""
+    try:
+        import telethon
+        from telethon.tl.alltlobjects import LAYER
+
+        if int(LAYER) < MIN_TELETHON_LAYER:
+            return (
+                f"Telethon {telethon.__version__} (layer {LAYER}) устарел: нужен layer "
+                f"≥ {MIN_TELETHON_LAYER}. Выполните: pip install -U telethon"
+            )
+    except Exception as e:  # noqa: BLE001
+        return f"не удалось определить версию Telethon: {type(e).__name__}"
+    return ""
+
 
 def session_stem(path: str | Path) -> str:
     p = Path(path)

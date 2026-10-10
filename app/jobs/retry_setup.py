@@ -39,10 +39,13 @@ async def run_setup_retries(store: Store, bot: Bot | None, admin_chat_id: int | 
     blocked = {(r.account_id, r.chat_pk) for r in await store.list_restrictions()}
     disabled = await store.disabled_pairs()
     chat_keys = {c.id: canon_chat_id(c.chat_id) for c in await store.list_chats()}
+    # аккаунт не в чате — это забота автопилота (вступит и сам настроит), а не повтора
+    not_member = {(a, c) for a, c, _t, st, _d in await store.list_scans() if st == "not_member"}
     due = [
         st
         for st in due
         if (st.account_id, st.chat_pk) not in blocked
+        and (st.account_id, st.chat_pk) not in not_member
         and (st.account_id, chat_keys.get(st.chat_pk, "")) not in disabled
     ]
     if not due:

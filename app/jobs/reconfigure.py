@@ -10,6 +10,7 @@ from app.jobs import LogSink, runtime
 from app.jobs.parallel import map_batches, setup_parallel_defaults
 from app.store import Store
 from app.utils.minutes import TABLE_PERIOD, plan_chat_minutes, suggest_minute
+from app.utils.errfmt import short_error
 
 
 async def rebalance_minute_table(
@@ -172,7 +173,7 @@ async def run_fix_assigned_minutes(
             except Exception as e:
                 acc = await store.get_account(aid)
                 label = acc.label if acc else f"acc#{aid}"
-                await log.emit(f"✗ {label}: {type(e).__name__}: {e}", "error")
+                await log.emit(f"✗ {label}: {short_error(e)}", "error")
                 return False
 
         async def _on_batch(n: int, batch):
@@ -205,7 +206,7 @@ async def run_fix_assigned_minutes(
         )
         return report
     except Exception as e:
-        err = f"{type(e).__name__}: {e}"
+        err = f"{short_error(e)}"
         await store.finish_job(job.id, "error", err)
         await log.emit(f"Ошибка выравнивания: {err}", "error")
         return err
@@ -267,7 +268,7 @@ async def run_reconfigure_all(
                     await done
                 except Exception as e:
                     await log.emit(
-                        f"✗ {acc.label}: {type(e).__name__}: {e}",
+                        f"✗ {acc.label}: {short_error(e)}",
                         "error",
                     )
                     return False
@@ -307,7 +308,7 @@ async def run_reconfigure_all(
         )
         return report
     except Exception as e:
-        err = f"{type(e).__name__}: {e}"
+        err = f"{short_error(e)}"
         await store.finish_job(job.id, "error", err)
         await log.emit(f"Ошибка перенастройки всех: {err}", "error")
         return err

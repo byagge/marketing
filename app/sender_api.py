@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 import httpx
+from app.utils.errfmt import short_error
 
 
 class SenderAPIError(Exception):
@@ -35,7 +36,7 @@ class SenderAPI:
         except httpx.HTTPError as e:
             # Autoposter не запущен / сеть — для вызывающего это обычная ошибка API
             raise SenderAPIError(
-                f"Autoposter недоступен: {type(e).__name__}: {e}".rstrip(": ")
+                f"Autoposter недоступен: {short_error(e)}".rstrip(": ")
             ) from e
         if response.status_code == 401:
             raise SenderAPIError("Неверный API-ключ sender", 401)

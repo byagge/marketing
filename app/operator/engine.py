@@ -37,10 +37,17 @@ from app.operator.diagnose import (
     PairFacts,
     diagnose_pair,
 )
-from app.operator.needs import ChatNeed, accounts_to_buy, compute_needs
+from app.operator.joinwhy import explain_not_member
+from app.operator.needs import (
+    ChatNeed,
+    accounts_to_buy,
+    accounts_to_buy_if_returning,
+    compute_needs,
+)
 from app.store import Store
 from app.utils.chat_ids import canon_chat_id
 from app.utils.timefmt import parse_utc, to_iso
+from app.utils.errfmt import short_error
 
 log = logging.getLogger("marketing.operator")
 
@@ -107,6 +114,10 @@ async def gather_pairs(store: Store, now: datetime | None = None) -> list[PairFa
     restr = {(r.account_id, r.chat_pk): r for r in await store.list_restrictions()}
     disabled = await store.disabled_pairs()
     scans = {(a, c): (parse_utc(t), st) for a, c, t, st, _d in await store.list_scans()}
+    join_states = {(j.account_id, j.chat_pk): j for j in await store.list_join_states()}
+    chat_bans = {(b.account_id, b.chat_pk): b for b in await store.list_bans(active_only=True)}
+    chat_by_pk = {c.id: c for c in chats}
+    cfg = get_settings()
     events = await store.send_events_between(
         to_iso(now - timedelta(hours=24)), to_iso(now + timedelta(minutes=1))
     )
@@ -144,6 +155,23 @@ async def gather_pairs(store: Store, now: datetime | None = None) -> list[PairFa
                 at = parse_utc(st.last_attempt_at)
                 if at is not None:
                     setup_age = (now - at).total_seconds() / 60
+            join_code = join_text = ""
+            if scan is not None and scan[1] == "not_member":
+                ban = chat_bans.get(key)
+                why = explain_not_member(
+                    chat_by_pk[chat.id],
+                    join_states.get(key),
+                    banned=ban is not None,
+                    ban_detail=(ban.detail if ban else ""),
+                    spam_limited=acc.is_spam_limited,
+                    spam_until=acc.spam_until,
+                    retry_hours=cfg.autopilot_retry_hours,
+                    max_attempts=cfg.autopilot_max_join_attempts,
+                    abandoned_retry_hours=cfg.autopilot_abandoned_retry_hours,
+                    now=now,
+                )
+                join_code, join_text = why.code, why.text
+            restriction = r.kind if r else ("ban" if key in chat_bans else None)
             out.append(
                 PairFacts(
                     account_id=acc.id,
@@ -153,7 +181,9 @@ async def gather_pairs(store: Store, now: datetime | None = None) -> list[PairFa
                     chat_kind=chat.kind,
                     interval=chat.interval_minutes,
                     pref_enabled=(acc.id, canon_chat_id(chat.chat_id)) not in disabled,
-                    restriction=r.kind if r else None,
+                    join_code=join_code,
+                    join_text=join_text,
+                    restriction=restriction,
                     restriction_until=(r.until_at[:16].replace("T", " ") if r and r.until_at else ""),
                     restriction_expired=bool(r and r.until_at and r.until_at <= now_iso),
                     is_private=not (chat.username or "").strip(),
@@ -295,7 +325,8 @@ def _escalations(
                     key=f"{cause}:{chat_pk}",
                     severity="high",
                     title=f"«{title}»: {len(items)} акк. не в чате, способа вступить нет ({names}{more})",
-                    todo="добавьте invite-ссылку или @username в карточке чата — вступят сами",
+                    todo="добавьте invite-ссылку или @username в карточке чата — вступят сами "
+                    "(если один из аккаунтов в чате может приглашать — ссылку возьму у него сама)",
                 )
             )
         elif cause.startswith(SILENT):
@@ -324,7 +355,8 @@ def _escalations(
                 Escalation(
                     key=f"{cause}:{chat_pk}",
                     severity="high",
-                    title=f"«{title}»: автовступление не удалось у {len(items)} акк. ({names}{more})",
+                    title=f"«{title}»: автовступление не удалось у {len(items)} акк. ({names}{more}) — "
+                    f"{_join_breakdown(items)}",
                     todo="нужна капча/заявка вручную или другая ссылка вступления",
                 )
             )
@@ -367,24 +399,57 @@ def _spam_escalations(diagnoses: list[tuple[PairFacts, Diagnosis]]) -> list[Esca
     return out
 
 
+def _need_line(n: ChatNeed) -> str:
+    extra = []
+    if n.returning:
+        extra.append(f"вернутся после мута {n.returning}")
+    if n.stuck:
+        extra.append(f"не могут вступить {n.stuck}")
+    tail = f" ({', '.join(extra)})" if extra else ""
+    # у чатов бывают одинаковые названия — различаем интервалом
+    return f"{n.title} [раз в {n.interval} мин]: есть {n.eligible} из {n.needed}{tail}"
+
+
 def _need_escalation(needs: list[ChatNeed]) -> Escalation | None:
     buy = accounts_to_buy(needs)
     short = [n for n in needs if n.deficit > 0]
     if not buy or not short:
         return None
-    lines = ", ".join(
-        f"{n.title}: есть {n.eligible} из {n.needed}" for n in short[:6]
-    )
+    lines = "; ".join(_need_line(n) for n in short[:6])
     more = f" и ещё {len(short) - 6} чатов" if len(short) > 6 else ""
     prio = any(n.priority for n in short)
+    soft = accounts_to_buy_if_returning(needs)
+    soft_note = (
+        f" Если замьюченные вернутся сами — хватит ≈{soft}." if soft < buy else ""
+    )
     return Escalation(
         key="need_accounts",
         severity="high" if prio else "medium",
-        title=f"Нужно ещё ≈{buy} новых аккаунтов, чтобы в чатах писали не реже раза в 5 минут. "
-        f"Сейчас с учётом всего, что починю сама: {lines}{more}",
+        title=f"Нужно ещё ≈{buy} новых аккаунтов, чтобы в чатах писали не реже раза в 5 минут."
+        f"{soft_note} Сейчас с учётом всего, что починю сама: {lines}{more}",
         todo=f"добавьте ≈{buy} чистых аккаунтов (кнопка «Session», пост задать) — "
-        f"сама вступлю во все чаты и настрою",
+        f"сама вступлю во все чаты и настрою. Один аккаунт работает во всех чатах сразу, "
+        f"поэтому число = дефицит самого «голодного» чата, а не сумма по чатам",
     )
+
+
+def _join_breakdown(items: list[PairFacts]) -> str:
+    """«спамблок 12, бан 2, заявка 1» — почему аккаунты не в чате."""
+    label = {
+        "ban": "бан",
+        "request": "заявка ждёт одобрения",
+        "no_link": "нет ссылки",
+        "manual": "нужно вручную",
+        "spamblock": "спамблок (публичный чат)",
+        "gave_up": "сдался, повторю позже",
+        "wait": "пауза после неудачи",
+        "ready": "вступит на ближайшем проходе",
+        "": "не определено",
+    }
+    cnt: dict[str, int] = defaultdict(int)
+    for i in items:
+        cnt[i.join_code] += 1
+    return ", ".join(f"{label.get(k, k)} {v}" for k, v in sorted(cnt.items(), key=lambda kv: -kv[1]))
 
 
 async def _remember(store: Store, results: list[ActionResult], now: datetime) -> None:
@@ -518,7 +583,7 @@ async def run_cycle(
                         ok, text = await EXECUTORS[action](store, acc_id, pks)
                     except Exception as e:  # noqa: BLE001
                         log.exception("operator action %s failed", action)
-                        ok, text = False, f"{type(e).__name__}: {e}"
+                        ok, text = False, f"{short_error(e)}"
                     verb = {JOIN: "вступление", SETUP: "настройка", RESETUP: "пересоздание очереди"}[action]
                     result.actions.append(
                         ActionResult(action, acc_id, labels.get(acc_id, str(acc_id)), pks, ok, f"{verb}: {text}")
@@ -527,7 +592,7 @@ async def run_cycle(
                 try:
                     ok, text = await EXECUTORS[COLLECT](store, acc_id, [])
                 except Exception as e:  # noqa: BLE001
-                    ok, text = False, f"{type(e).__name__}: {e}"
+                    ok, text = False, f"{short_error(e)}"
                 result.actions.append(
                     ActionResult(COLLECT, acc_id, labels.get(acc_id, str(acc_id)), [], ok, f"пересбор данных: {text}")
                 )

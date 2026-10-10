@@ -27,6 +27,7 @@ from app.utils.send_policy import (
 )
 from app.utils.spamstate import scale_seconds
 from app.utils.templates import pick_post_for_chat, render_post
+from app.utils.errfmt import short_error
 
 
 def _api() -> SenderAPI:
@@ -79,7 +80,7 @@ async def apply_pair(
         await store.finish_job(job.id, "done", result)
         return result
     except Exception as e:
-        err = f"{type(e).__name__}: {e}"
+        err = f"{short_error(e)}"
         await store.finish_job(job.id, "error", err)
         return f"ошибка: {err}"
 

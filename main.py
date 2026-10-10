@@ -53,6 +53,12 @@ async def main() -> None:
     if not settings.admins:
         log.warning("ADMIN_IDS пуст — бот отвечает всем. Заполните .env")
 
+    from app.tg.client import telethon_version_warning
+
+    outdated = telethon_version_warning()
+    if outdated:
+        log.error("%s", outdated)
+
     store = Store()
     await store.init()
     ctx.store = store

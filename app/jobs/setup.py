@@ -48,6 +48,7 @@ from app.tg.sender_push import (
     push_cloak,
     push_sender_post,
 )
+from app.utils.errfmt import short_error
 
 
 class SetupError(Exception):
@@ -328,7 +329,7 @@ async def clear_scheduled_for_pair(
     except Exception as e:
         await log.emit(
             f"{account.label}: «{chat.title}» отключён ({reason}), но очистка "
-            f"schedule не удалась: {type(e).__name__}: {e}",
+            f"schedule не удалась: {short_error(e)}",
             "error",
             notify=False,
         )
@@ -483,15 +484,15 @@ async def schedule_one_chat(
         if entity is None:
             if dead:
                 return "skipped"
-            return await _fail_unavailable(
-                store,
-                account,
-                chat,
-                "чат не найден в аккаунте",
-                log,
-                max_attempts=max_attempts,
-                client=client,
+            # Аккаунта нет в чате: настраивать нечего, а штрафовать пару «попытками»
+            # нельзя — она уходила в «стоп до недели», хотя нужно просто вступить.
+            # Вступлением занимается автопилот и сразу после него настраивает отправку.
+            await log.emit(
+                f"{account.label}: «{chat.title}» — аккаунта нет в чате, настройка "
+                f"отложена: вступит автопилот и сам настроит",
+                notify=False,
             )
+            return "skipped"
         # заранее: если в чат нельзя фото — сразу без медиа (caption/текст)
         want_media = chat.media_allowed
         if want_media and (
@@ -604,7 +605,7 @@ async def schedule_one_chat(
         if dead:
             await log.emit(
                 f"{account.label}: dead: «{chat.title}» пропущен "
-                f"({type(e).__name__}: {e})",
+                f"({short_error(e)})",
                 notify=False,
             )
             return "skipped"
@@ -621,11 +622,11 @@ async def schedule_one_chat(
             )
         await log.emit(
             f"{account.label}: Ошибка schedule «{chat.title}»: "
-            f"{type(e).__name__}: {e}",
+            f"{short_error(e)}",
             "error",
         )
         await store.record_setup_fail(
-            account.id, chat.id, f"{type(e).__name__}: {e}", max_attempts=max_attempts
+            account.id, chat.id, f"{short_error(e)}", max_attempts=max_attempts
         )
         return "skipped"
 
@@ -1103,7 +1104,7 @@ async def run_setup(store: Store, account_id: int, bot: Bot, admin_chat_id: int)
                 except Exception as e:
                     schedule_failed = True
                     await log.emit(
-                        f"Schedule оборвался ({type(e).__name__}: {e}) — "
+                        f"Schedule оборвался ({short_error(e)}) — "
                         f"sender всё равно настрою, если готов",
                         "error",
                     )
@@ -1121,7 +1122,7 @@ async def run_setup(store: Store, account_id: int, bot: Bot, admin_chat_id: int)
             except SetupError:
                 raise
             except Exception as e:
-                err = f"{type(e).__name__}: {e}"
+                err = f"{short_error(e)}"
                 await log.emit(f"Ошибка sender {account.label}: {err}", "error")
                 if not scheduled_ok and schedule_failed:
                     raise SetupError(f"Schedule и sender не настроены: {err}") from e
@@ -1173,7 +1174,7 @@ async def run_setup(store: Store, account_id: int, bot: Bot, admin_chat_id: int)
             await store.update_account(account.id, status="error", last_error=err)
             await log.emit(f"Ошибка настройки {account.label}: {err}", "error")
     except Exception as e:
-        err = f"{type(e).__name__}: {e}"
+        err = f"{short_error(e)}"
         await store.finish_job(job.id, "error", err)
         await store.update_account(account.id, status="error", last_error=err)
         await log.emit(f"Ошибка настройки {account.label}: {err}", "error")
@@ -1259,7 +1260,7 @@ async def run_setup_chats_only(
         await store.finish_job(job.id, "cancelled" if str(e) == "Остановлено" else "error", str(e))
         return empty
     except Exception as e:
-        await store.finish_job(job.id, "error", f"{type(e).__name__}: {e}")
+        await store.finish_job(job.id, "error", f"{short_error(e)}")
         return empty
 
 
@@ -1375,7 +1376,7 @@ async def run_dead_schedule(
         )
         return empty
     except Exception as e:
-        await store.finish_job(job.id, "error", f"{type(e).__name__}: {e}")
+        await store.finish_job(job.id, "error", f"{short_error(e)}")
         return empty
 
 
@@ -1418,7 +1419,7 @@ async def run_dead_setup(
                 await store.finish_job(job.id, "done", sender_note)
             except Exception as e:
                 sender_note = " | sender: не вышло (игнор)"
-                await store.finish_job(job.id, "error", f"{type(e).__name__}: {e}")
+                await store.finish_job(job.id, "error", f"{short_error(e)}")
         await store.update_account(account.id, status="done", last_error="")
         if bot and admin_chat_id:
             try:
@@ -1473,7 +1474,7 @@ async def run_sender_refresh(
         await store.finish_job(job.id, "done", f"sender: {count} чатов")
         return count
     except Exception as e:
-        err = f"{type(e).__name__}: {e}"
+        err = f"{short_error(e)}"
         await store.finish_job(job.id, "error", err)
         await log.emit(f"{account.label}: sender не настроен — {err}", "error")
         return 0

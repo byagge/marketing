@@ -57,6 +57,9 @@ class PairFacts:
     account_spam: str = ""  # clean | limited | unknown | ""
     has_join_method: bool = True
     session_error: str = ""
+    # почему аккаунта нет в чате (код и фраза из joinwhy; пусто — не считали)
+    join_code: str = ""
+    join_text: str = ""
 
 
 @dataclass
@@ -123,11 +126,15 @@ def diagnose_pair(f: PairFacts) -> Diagnosis:
 
     if f.scan_status == "not_member":
         if f.has_join_method:
+            why = f" — {f.join_text}" if f.join_text else ""
+            # спамблок / заявка / пауза после неудачи: вступлением по расписанию занят
+            # автопилот, оператор не дублирует попытки (иначе только жжём лимиты)
+            waiting = f.join_code not in {"", "ready"}
             return Diagnosis(
                 NOT_MEMBER,
                 "medium",
-                action=JOIN,
-                text="аккаунт не состоит в чате — вступаю",
+                action=None if waiting else JOIN,
+                text=f"аккаунт не состоит в чате{why or ' — вступаю'}",
             )
         return Diagnosis(
             NOT_MEMBER_NO_LINK,

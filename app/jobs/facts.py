@@ -30,6 +30,7 @@ from app.tg.scheduler import fetch_scheduled
 from app.utils.balance import PairFact
 from app.utils.chat_ids import canon_chat_id
 from app.utils.timefmt import to_iso
+from app.utils.errfmt import short_error
 
 log = logging.getLogger("marketing.facts")
 
@@ -81,7 +82,7 @@ async def collect_chat_sends(
                 break
             rows.append((account.id, chat.id, to_iso(when), int(msg.id)))
     except Exception as e:  # noqa: BLE001
-        await store.mark_scan(account.id, chat.id, "error", f"{type(e).__name__}: {e}")
+        await store.mark_scan(account.id, chat.id, "error", f"{short_error(e)}")
         return 0
     await store.mark_scan(account.id, chat.id, "ok", "")
     return await store.add_send_events(rows)
@@ -201,7 +202,7 @@ async def run_facts_collection(
         except Exception as e:  # noqa: BLE001
             await store.set_setting(
                 f"facts_status:{acc.id}",
-                f"err|{to_iso(datetime.now(timezone.utc))}|{type(e).__name__}: {e}"[:300],
+                f"err|{to_iso(datetime.now(timezone.utc))}|{short_error(e)}"[:300],
             )
             raise
         await store.set_setting(
@@ -319,7 +320,7 @@ async def probe_can_send(client: TelegramClient, entity: Any) -> tuple[int | Non
     try:
         perms = await client.get_permissions(entity, "me")
     except Exception as e:
-        return None, "", f"{type(e).__name__}: {e}"
+        return None, "", f"{short_error(e)}"
     if perms is None:
         return None, "", ""
     if getattr(perms, "has_left", False):
@@ -356,7 +357,7 @@ async def probe_sent(
             if last is None:
                 last = date
     except Exception as e:
-        return None, "", f"{type(e).__name__}: {e}"
+        return None, "", f"{short_error(e)}"
     return count, _iso(last), ""
 
 
@@ -397,7 +398,7 @@ async def collect_account_facts(
             try:
                 sched = len(await fetch_scheduled(client, ent))
             except Exception as e:
-                sched, err3 = None, f"{type(e).__name__}: {e}"
+                sched, err3 = None, f"{short_error(e)}"
             else:
                 err3 = ""
             await asyncio.sleep(pause)
@@ -447,7 +448,7 @@ async def run_collect_facts(
             facts = await collect_account_facts(store, acc, chats)
         except Exception as e:
             # сессия не читается и т.п.: старые факты не трогаем (станут UNKNOWN по возрасту)
-            await sink.emit(f"✗ {acc.label}: {type(e).__name__}: {e}", "error", notify=False)
+            await sink.emit(f"✗ {acc.label}: {short_error(e)}", "error", notify=False)
             return False
         for f in facts:
             await store.upsert_fact(f)

@@ -19,6 +19,7 @@ from app.config import get_settings
 from app.models import Account
 from app.store import Store
 from app.utils.timefmt import to_iso
+from app.utils.errfmt import short_error
 
 log = logging.getLogger("marketing.dms")
 
@@ -139,7 +140,7 @@ async def collect_dms(
             if prev is None and started_by == "them":
                 stats.new_people += 1
     except Exception as e:  # noqa: BLE001
-        stats.error = f"{type(e).__name__}: {e}"
+        stats.error = f"{short_error(e)}"
         log.warning("dm scan failed for %s: %s", account.label, stats.error)
     await store.set_setting(f"dm_pending:{account.id}", str(stats.pending))
     await store.set_setting(f"dm_scanned_at:{account.id}", to_iso(datetime.now(timezone.utc)))

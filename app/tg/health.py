@@ -6,6 +6,7 @@ from app.models import Chat
 from app.tg.resolve import lookup_entity
 from app.tg.scheduler import fetch_scheduled
 from app.utils.schedule import posts_count_for_interval
+from app.utils.errfmt import short_error
 
 
 async def check_schedule_chats(
@@ -37,7 +38,7 @@ async def check_schedule_chats(
             status = "error"
             title = chat.title
             peer = chat.chat_id
-            error = f"{type(e).__name__}: {e}"
+            error = f"{short_error(e)}"
         rows.append(
             {
                 "chat_pk": chat.id,

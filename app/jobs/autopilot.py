@@ -21,6 +21,7 @@ from aiogram import Bot
 
 from app.config import get_settings
 from app.jobs import runtime
+from app.jobs.advisor import demote_sender_on_spam
 from app.jobs.bans import admin_target, format_ban_notice, register_ban
 from app.jobs.gate import gate_step
 from app.jobs.parallel import map_batches, setup_parallel_defaults
@@ -33,8 +34,11 @@ from app.sender_api import SenderAPI, SenderAPIError
 from app.store import Store
 from app.tg.client import telethon_client
 from app.tg.join import check_membership, is_closed_chat, join_one, sort_chats_for_join
+from app.tg.linkharvest import harvest_join_link, is_no_link_error
+from app.tg.resolve import lookup_entity
 from app.utils.chat_ids import chat_ids_match
 from app.utils.send_policy import classify_failure, is_no_post, join_due, removal_confirmed
+from app.utils.errfmt import short_error
 
 log = logging.getLogger("marketing.autopilot")
 
@@ -172,12 +176,23 @@ async def process_account(
             member_pks = {c.id for c in report.joined}
             for chat in report.joined:
                 await store.mark_member(acc.id, chat.id)
+            if not is_cancelled():
+                await _harvest_links(store, client, report.joined, res)
 
             candidates: list[Chat] = []
             no_link_ids = {c.id for c in report.no_link}
             fresh: dict[int, JoinState] = {}
             for chat in report.missing + report.no_link:
                 state = await store.mark_not_member(acc.id, chat.id)
+                if (
+                    state.status == "manual"
+                    and chat.id not in no_link_ids
+                    and is_no_link_error(state.last_error)
+                ):
+                    # раньше способа вступить не было, теперь есть (ссылку нашли/добавили)
+                    state = await store.record_join_result(
+                        acc.id, chat.id, status="pending", error=""
+                    )
                 fresh[chat.id] = state
                 if removal_confirmed(state):
                     await register_ban(
@@ -211,6 +226,7 @@ async def process_account(
                     fresh.get(c.id),
                     retry_hours=cfg.autopilot_retry_hours,
                     max_attempts=cfg.autopilot_max_join_attempts,
+                    abandoned_retry_hours=cfg.autopilot_abandoned_retry_hours,
                 )
             ]
             attempts = 0
@@ -281,7 +297,7 @@ async def process_account(
                     ev = await perf_step(store, client, acc)
                 except Exception as e:
                     ev = None
-                    res.failed.append(f"оценка результативности: {type(e).__name__}: {e}")
+                    res.failed.append(f"оценка результативности: {short_error(e)}")
                 if ev is not None:
                     if ev.kind == "recovered":
                         res.notes.append(f"{acc.label}: снова приносит клиентов — из списка убран")
@@ -306,14 +322,20 @@ async def process_account(
                         else:
                             res.manual.append(f"{ev.chat}: {ev.detail}")
                 except Exception as e:
-                    res.failed.append(f"ворота подписки: {type(e).__name__}: {e}")
+                    res.failed.append(f"ворота подписки: {short_error(e)}")
     except Exception as e:
-        res.error = f"{type(e).__name__}: {e}"
+        res.error = f"{short_error(e)}"
         log.exception("autopilot: %s", acc.label)
         return res
 
     # --- спамблок / dead: привести sender к нужной нагрузке -----------------------
     acc = await store.get_account(acc.id) or acc
+    if await demote_sender_on_spam(store, acc):
+        res.spam.append(
+            f"{acc.label}: спамблок при включённом sender → перевёл в dead: sender выключен, "
+            f"schedule продолжает работать"
+        )
+        acc = await store.get_account(acc.id) or acc
     load = await account_load(store, acc)
     refreshed = False
     if load != prev_state.applied_load or (
@@ -359,7 +381,7 @@ async def process_account(
             for title in buckets.get("skipped", []) + buckets.get("config_error", []):
                 res.failed.append(f"{title}: schedule не настроился (см. логи)")
         except Exception as e:
-            res.failed.append(f"schedule: {type(e).__name__}: {e}")
+            res.failed.append(f"schedule: {short_error(e)}")
 
     sender_chats = [c for c in eligible if c.kind == "sender" and c.id in in_chat]
     if (
@@ -388,6 +410,52 @@ async def process_account(
     ):
         res.stopped.extend(await sweep_stoplist(store, acc))
     return res
+
+
+HARVEST_COOLDOWN_HOURS = 24.0
+HARVEST_PER_TICK = 2
+
+
+async def _harvest_links(store: Store, client, joined: list[Chat], res: AccountResult) -> None:
+    """Чат без @username и invite-ссылки, а аккаунт в нём: берём ссылку у него для остальных."""
+    now = datetime.now(timezone.utc)
+    tried = 0
+    for chat in joined:
+        if tried >= HARVEST_PER_TICK:
+            break
+        if (chat.username or "").strip() or (chat.invite_link or "").strip():
+            continue
+        if (chat.garant_bot or "").strip() or chat.join_mode == "garant":
+            continue
+        key = f"harvest:{chat.id}"
+        last = await store.get_setting(key, "")
+        if last:
+            try:
+                age = (now - datetime.fromisoformat(last)).total_seconds() / 3600
+            except ValueError:
+                age = HARVEST_COOLDOWN_HOURS
+            if age < HARVEST_COOLDOWN_HOURS:
+                continue
+        tried += 1
+        await store.set_setting(key, now.isoformat(timespec="seconds"))
+        try:
+            entity = await lookup_entity(client, chat)
+            if entity is None:
+                continue
+            link = await harvest_join_link(client, entity)
+        except Exception:  # noqa: BLE001
+            log.exception("autopilot: не удалось взять ссылку чата %s", chat.display_name)
+            continue
+        if not link.found:
+            continue
+        fields = {"username": link.username} if link.username else {"invite_link": link.invite}
+        await store.update_chat(chat.id, **fields)
+        revived = await store.revive_chat_joins(chat.id)
+        extra = f", разбудил {revived} аккаунтов" if revived else ""
+        res.notes.append(
+            f"«{chat.display_name}»: взял {link.describe()} у аккаунта в чате — "
+            f"остальные вступят сами{extra}"
+        )
 
 
 async def _spam_step(store: Store, acc: Account, client, res: AccountResult) -> None:

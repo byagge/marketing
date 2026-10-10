@@ -28,6 +28,7 @@ from app.utils.captcha import (
     pick_verify_button,
     solve_math_captcha,
 )
+from app.utils.errfmt import short_error
 
 _URL_IN_TEXT = re.compile(r"(https?://t\.me/[^\s\]\)\"']+)", re.I)
 _ADDLIST_RE = re.compile(
@@ -401,7 +402,7 @@ async def join_folder(
     try:
         info = await client(CheckChatlistInviteRequest(slug=slug))
     except Exception as e:
-        return {"ok": False, "error": f"check: {type(e).__name__}: {e}", "joined": 0, "captchas": []}
+        return {"ok": False, "error": f"check: {short_error(e)}", "joined": 0, "captchas": []}
 
     peers = []
     for attr in ("peers", "already_peers", "missing_peers"):

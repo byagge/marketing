@@ -23,6 +23,7 @@ from app.utils.spamstate import (
     compute_load,
     evaluate_check,
 )
+from app.utils.errfmt import short_error
 
 log = logging.getLogger("marketing.spam")
 
@@ -74,7 +75,7 @@ async def check_account_spam(store: Store, account: Account) -> str:
             account.id,
             spam_status="unknown",
             spam_checked_at=now,
-            spam_detail=f"{type(e).__name__}: {e}"[:300],
+            spam_detail=f"{short_error(e)}"[:300],
         )
         return "unknown"
     status, until, detail = _status_from_spambot(res)
@@ -156,7 +157,7 @@ async def _run_spam_check_one(
     try:
         status = await check_spambot(client)
     except Exception as e:
-        res.error = f"{type(e).__name__}: {e}"
+        res.error = f"{short_error(e)}"
         # не долбим @SpamBot каждый проход: следующая попытка через spam_check_hours
         state.last_check_at = (now or utcnow()).isoformat(timespec="seconds")
         await store.save_spam_state(state)

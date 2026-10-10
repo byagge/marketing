@@ -25,6 +25,7 @@ from app.models import Account, Chat
 from app.store import Store
 from app.utils.timefmt import to_iso
 from app.utils.tg_links import format_message_link
+from app.utils.errfmt import short_error
 
 log = logging.getLogger("marketing.restrictions")
 
@@ -83,7 +84,7 @@ async def probe_restriction(client: TelegramClient, entity: Any) -> Probe:
         except ChannelPrivateError:
             return Probe("left", detail="чат недоступен (приватный / нет в аккаунте)")
         except Exception as e:  # noqa: BLE001
-            return Probe("unknown", detail=f"{type(e).__name__}: {e}")
+            return Probe("unknown", detail=f"{short_error(e)}")
         part = res.participant
         if isinstance(part, types.ChannelParticipantBanned):
             rights = part.banned_rights

@@ -3051,6 +3051,19 @@ class Store:
             await db.commit()
             return int(cur.rowcount or 0)
 
+    async def revive_chat_joins(
+        self, chat_pk: int, statuses: tuple[str, ...] = ("manual", "abandoned")
+    ) -> int:
+        """У чата появилась ссылка вступления: снять «вручную/сдался» у всех аккаунтов."""
+        async with self._connect() as db:
+            cur = await db.execute(
+                f"UPDATE join_states SET status='pending', fail_count=0, last_error='' "
+                f"WHERE chat_pk=? AND status IN ({','.join('?' for _ in statuses)})",
+                [chat_pk, *statuses],
+            )
+            await db.commit()
+            return int(cur.rowcount or 0)
+
     async def reset_pair_join(self, account_id: int, chat_pk: int) -> None:
         """Забыть историю вступления пары (после снятия бана вручную)."""
         await self._upsert_join_state(

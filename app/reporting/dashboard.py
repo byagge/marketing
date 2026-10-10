@@ -24,12 +24,22 @@ class Dashboard:
     marketer_enabled: bool = True
     auto_fix: bool = True
     marketer_last_run: str = ""
+    # аккаунты для переоформления (label, вердикт, сколько людей писало за окно)
+    redesign: list[tuple[str, str, int]] = field(default_factory=list)
 
 
 async def build_dashboard(store: Store, *, day: str | None = None) -> Dashboard:
+    from app.jobs.perf import redesign_candidates
+    from app.utils.perf import VERDICT_TEXT
+
     report = await build_fact_report(store, day)
     incidents = await store.list_incidents(statuses=["open", "fixing"], limit=60)
+    redesign = [
+        (acc.label, VERDICT_TEXT.get(p.verdict, p.verdict), p.wrote_n)
+        for acc, p in await redesign_candidates(store)
+    ]
     return Dashboard(
+        redesign=redesign,
         day=report.day,
         report=report,
         open_incidents=incidents if report.is_today else [],
@@ -107,6 +117,15 @@ def format_dashboard_html(dash: Dashboard) -> str:
             lines.append(f"… ещё {len(inc) - 6}")
     elif r.is_today:
         lines.append(f"\n{pe('check')} Открытых проблем нет.")
+
+    if dash.redesign:
+        lines.append(f"\n🎨 <b>Аккаунты для переоформления</b> — {len(dash.redesign)}:")
+        for label, verdict, wrote in dash.redesign[:6]:
+            lines.append(f"· <b>{escape(label)[:20]}</b>: {escape(verdict)} (написали {wrote} чел. за 7 дн.)")
+        if len(dash.redesign) > 6:
+            lines.append(f"… ещё {len(dash.redesign) - 6} — меню «Для переоформления»")
+    elif dash.report.is_today:
+        lines.append("\n🎨 Аккаунты для переоформления: нет — все измеренные приносят клиентов.")
 
     status = "вкл" if dash.marketer_enabled else "выкл"
     last = fmt_local(dash.marketer_last_run) if dash.marketer_last_run else "—"

@@ -159,22 +159,29 @@ def join_due(
     retry_hours: float = 6.0,
     max_attempts: int = 5,
     request_wait_hours: float = 72.0,
+    abandoned_retry_hours: float | None = None,
 ) -> bool:
     """
     Пора ли пробовать вступать снова.
 
     - нет состояния → пора;
-    - manual / abandoned → нет (до ручного сброса);
+    - manual → нет (до ручного сброса / появления ссылки);
+    - abandoned → нет, а если задан abandoned_retry_hours — раз в столько часов (бан или
+      недоступность могли смениться: «сдался» не должно значить «навсегда»);
     - member → нет;
     - requested → через request_wait_hours;
     - pending → экспоненциальная пауза retry_hours · 2^(fails-1), максимум 48 ч.
     """
     if state is None:
         return True
-    if state.status in {"manual", "abandoned", "member"}:
-        return False
     moment = now or datetime.now(timezone.utc)
     last = _parse(state.last_attempt_at)
+    if state.status == "abandoned":
+        if abandoned_retry_hours is None:
+            return False
+        return last is None or moment - last >= timedelta(hours=abandoned_retry_hours)
+    if state.status in {"manual", "member"}:
+        return False
     if state.status == "requested":
         return last is None or moment - last >= timedelta(hours=request_wait_hours)
     if state.fail_count >= max_attempts:

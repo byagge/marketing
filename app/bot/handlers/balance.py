@@ -17,6 +17,7 @@ from app.jobs.balance import run_smart_rebalance
 from app.jobs.export import send_report
 from app.jobs.facts import run_collect_facts
 from app.ui.screens import prompt_html
+from app.utils.errfmt import short_error
 
 router = Router()
 log = logging.getLogger("marketing.balance.ui")
@@ -103,7 +104,7 @@ async def cb_facts(query: CallbackQuery) -> None:
                 f"пар {stats['pairs']}, ошибок {stats['failed']}"
             )
         except Exception as e:
-            text = f"Сбор фактов не удался: {type(e).__name__}: {e}"
+            text = f"Сбор фактов не удался: {short_error(e)}"
         try:
             await query.bot.send_message(admin_id, text)
         except Exception:
@@ -149,7 +150,7 @@ async def _export_job(bot, chat_id: int, fresh: bool) -> None:
     except Exception as e:
         log.exception("export failed")
         try:
-            await bot.send_message(chat_id, f"Экспорт не удался: {type(e).__name__}: {e}")
+            await bot.send_message(chat_id, f"Экспорт не удался: {short_error(e)}")
         except Exception:
             pass
 

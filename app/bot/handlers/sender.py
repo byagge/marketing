@@ -14,6 +14,7 @@ from app.sender_api import SenderAPI, SenderAPIError
 from app.tg.sender_push import apply_mentions_everywhere, normalize_multiline, push_cloak
 from app.ui.screens import prompt_html, sender_html
 from app.utils.entities import entities_dumps, from_aiogram_message
+from app.utils.errfmt import short_error
 
 router = Router()
 
@@ -182,7 +183,7 @@ async def cb_cloak_all(query: CallbackQuery) -> None:
                 await log.emit(f"✗ {acc.label}: {e}", "error")
             except Exception as e:
                 err += 1
-                await log.emit(f"✗ {acc.label}: {type(e).__name__}: {e}", "error")
+                await log.emit(f"✗ {acc.label}: {short_error(e)}", "error")
         report = f"ok={ok}, ошибок={err}, пропуск={skip}"
         await ctx.store.finish_job(job.id, "done", report)
         await log.emit("Клоакинг обновлён. " + report)
@@ -253,7 +254,7 @@ async def _spawn_mentions_all(
                 await log.emit(f"✗ {acc.label}: {e}", "error")
             except Exception as e:
                 err += 1
-                await log.emit(f"✗ {acc.label}: {type(e).__name__}: {e}", "error")
+                await log.emit(f"✗ {acc.label}: {short_error(e)}", "error")
         report = f"ok={ok}, ошибок={err}, пропуск={skip}"
         await ctx.store.finish_job(job.id, "done", report)
         await log.emit("Упоминания применены. " + report)

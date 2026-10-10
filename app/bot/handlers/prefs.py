@@ -19,6 +19,7 @@ from app.ui.autopilot_screens import pair_card_html, pair_list_html
 from app.ui.screens import prompt_html
 from app.utils.chat_search import clamp_page, filter_chats
 from app.utils.entities import from_aiogram_message
+from app.utils.errfmt import short_error
 
 router = Router()
 
@@ -374,7 +375,7 @@ async def cb_spam_check(query: CallbackQuery, callback_data: MenuCB) -> None:
             async with telethon_client(acc.telethon_session) as client:
                 check = await run_spam_check(ctx.store, acc, client, force=True)
         except Exception as e:
-            await bot.send_message(admin, f"{acc.label}: проверка @SpamBot не удалась — {type(e).__name__}: {e}")
+            await bot.send_message(admin, f"{acc.label}: проверка @SpamBot не удалась — {short_error(e)}")
             return
         state = await ctx.store.get_spam_state(acc.id)
         if check.error:

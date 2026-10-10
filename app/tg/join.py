@@ -36,6 +36,7 @@ from app.utils.captcha import (
     solve_math_captcha,
     solve_poll_captcha,
 )
+from app.utils.errfmt import short_error
 
 _INVITE_RE = re.compile(
     r"(?:https?://)?(?:t\.me|telegram\.me)/(?:\+|joinchat/)([A-Za-z0-9_-]+)",
@@ -185,8 +186,9 @@ async def check_membership(client: TelegramClient, chats: list[Chat]) -> Members
             continue
         target = chat_join_target(chat)
         cfg = effective_join_config(chat)
+        # Голый числовой id (chat_id) — не способ вступить: у аккаунта вне чата сущности нет.
         has_way = (
-            target["method"] not in {"manual"}
+            target["method"] not in {"manual", "chat_id"}
             or bool(cfg["garant_bot"])
             or bool((chat.invite_link or "").strip())
             or bool((chat.username or "").strip())
@@ -531,9 +533,21 @@ async def join_one(
         elif target["method"] == "username":
             entity = await _join_username(client, target["value"])
         else:
-            entity = await client.get_entity(
-                int(target["value"]) if target["value"].lstrip("-").isdigit() else target["value"]
-            )
+            # Только числовой id / @name из chat_id: по id вступить нельзя, если чат не в
+            # диалогах аккаунта (иначе Telethon: «Could not find the input entity»).
+            raw_target = target["value"]
+            if raw_target.lstrip("-").isdigit():
+                entity = await lookup_entity(client, chat)
+                if entity is None:
+                    return JoinResult(
+                        title,
+                        chat.id,
+                        "needs_manual",
+                        "нет ссылки вступления и @username — по числовому id вступить нельзя "
+                        "(ссылку возьмут у аккаунта, который уже в чате, или добавьте её в карточке)",
+                    )
+            else:
+                entity = await client.get_entity(raw_target)
             if isinstance(entity, types.Channel):
                 try:
                     await client(functions.channels.JoinChannelRequest(entity))
@@ -548,7 +562,7 @@ async def join_one(
         await asyncio.sleep(wait)
         return JoinResult(title, chat.id, "failed", f"FloodWait {getattr(e, 'seconds', '?')}s")
     except Exception as e:
-        return JoinResult(title, chat.id, "failed", f"{type(e).__name__}: {e}")
+        return JoinResult(title, chat.id, "failed", f"{short_error(e)}")
 
     if entity is None:
         try:

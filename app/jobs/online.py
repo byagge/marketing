@@ -11,6 +11,7 @@ from app.notify import safe_send
 from app.store import Store
 from app.tg.client import telethon_client
 from app.tg.online import bump_online
+from app.utils.errfmt import short_error
 
 log = logging.getLogger("marketing.online")
 
@@ -80,7 +81,7 @@ async def run_online_ping(
             log.info("online ping ok | %s (#%s)", acc.label, acc.id)
         except Exception as e:
             fail += 1
-            err = f"{acc.label}: {type(e).__name__}: {e}"
+            err = f"{acc.label}: {short_error(e)}"
             errors.append(err)
             log.warning("online ping fail | %s", err)
 

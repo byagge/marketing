@@ -16,6 +16,7 @@ from app.ui.screens import prompt_html
 from session_maker.api import normalize_phone, sanitize_session_name
 from session_maker.bot_flow import begin_login, submit_code, submit_password
 from session_maker.pending import clear_pending
+from app.utils.errfmt import short_error
 
 router = Router()
 
@@ -107,7 +108,7 @@ async def on_phone(message: Message, state: FSMContext) -> None:
         await state.clear()
         await clear_pending(_uid(message))
         await message.answer(
-            prompt_html("Ошибка", f"{type(e).__name__}: {e}", "warn"),
+            prompt_html("Ошибка", f"{short_error(e)}", "warn"),
             parse_mode=ParseMode.HTML,
         )
         return
@@ -140,7 +141,7 @@ async def on_code(message: Message, state: FSMContext) -> None:
         status, path = await submit_code(_uid(message), code)
     except Exception as e:
         # Keep state so user can retry code; only clear on fatal
-        err = f"{type(e).__name__}: {e}"
+        err = f"{short_error(e)}"
         if "Invalid" in type(e).__name__ or "invalid" in str(e).lower():
             await message.answer(
                 prompt_html("Код", f"Неверный код. Попробуйте ещё раз.\n<code>{err}</code>", "warn"),
@@ -191,7 +192,7 @@ async def on_password(message: Message, state: FSMContext) -> None:
         await state.clear()
         await clear_pending(_uid(message))
         await message.answer(
-            prompt_html("Ошибка", f"{type(e).__name__}: {e}", "warn"),
+            prompt_html("Ошибка", f"{short_error(e)}", "warn"),
             parse_mode=ParseMode.HTML,
         )
         return

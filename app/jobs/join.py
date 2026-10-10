@@ -12,6 +12,7 @@ from app.tg.join import JoinResult, check_membership, join_many
 from app.tg.resolve import lookup_entity
 from app.tg.restrictions import classify_text, record_restriction
 from app.utils.chat_ids import canon_chat_id
+from app.utils.errfmt import short_error
 
 
 async def _enabled_chats(store: Store) -> list[Chat]:
@@ -80,7 +81,7 @@ async def run_membership_check(
         await log.emit(summary)
         return payload
     except Exception as e:
-        err = f"{type(e).__name__}: {e}"
+        err = f"{short_error(e)}"
         await store.finish_job(job.id, "error", err)
         await log.emit(err, "error")
         return {
@@ -303,7 +304,7 @@ async def run_join_missing_all(
         await log.emit("Вступление в недостающие завершено.\n" + report)
         return report
     except Exception as e:  # noqa: BLE001
-        err = f"{type(e).__name__}: {e}"
+        err = f"{short_error(e)}"
         await store.finish_job(job.id, "error", err)
         await log.emit(err, "error")
         return err
@@ -353,7 +354,7 @@ async def run_folder_join(
             await log.emit(f"Папка: {err}", "error")
         return result
     except Exception as e:
-        err = f"{type(e).__name__}: {e}"
+        err = f"{short_error(e)}"
         await store.finish_job(job.id, "error", err)
         await log.emit(err, "error")
         return {"ok": False, "error": err}
@@ -394,7 +395,7 @@ async def run_join_all_accounts(
                 await log.emit(f"✓ {line}", notify=False)
                 return line
             except Exception as e:
-                line = f"{acc.label}: {type(e).__name__}: {e}"
+                line = f"{acc.label}: {short_error(e)}"
                 await log.emit(f"✗ {line}", "error")
                 return line
 
@@ -419,7 +420,7 @@ async def run_join_all_accounts(
         await log.emit("Массовое вступление завершено.\n" + report)
         return report
     except Exception as e:
-        err = f"{type(e).__name__}: {e}"
+        err = f"{short_error(e)}"
         await store.finish_job(job.id, "error", err)
         await log.emit(err, "error")
         return err

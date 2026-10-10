@@ -37,6 +37,7 @@ from app.utils.balance import (
     positions,
 )
 from app.utils.schedule import posts_count_for_interval
+from app.utils.errfmt import short_error
 
 MAX_JOBS = 3000
 MAX_LOGS = 25000
@@ -107,7 +108,7 @@ async def _sender_live(accounts: list[Any]) -> list[dict[str, Any]]:
     try:
         health = await api.health()
     except Exception as e:
-        return [{"error": f"Autoposter недоступен: {type(e).__name__}: {e}"}]
+        return [{"error": f"Autoposter недоступен: {short_error(e)}"}]
     rows.append({"autoposter_health": health})
     for a in accounts:
         sid = (a.sender_account_id or "").strip()
@@ -118,13 +119,13 @@ async def _sender_live(accounts: list[Any]) -> list[dict[str, Any]]:
             info = await api.get_account(sid)
             row["live"] = info.get("live")
         except Exception as e:
-            row["error"] = f"{type(e).__name__}: {e}"
+            row["error"] = f"{short_error(e)}"
         try:
             cloak = await api.get_cloak(sid)
             row["cloak_enabled"] = bool(cloak.get("enabled"))
             row["cloak_text_len"] = len(str(cloak.get("text") or ""))
         except Exception as e:
-            row["cloak_error"] = f"{type(e).__name__}: {e}"
+            row["cloak_error"] = f"{short_error(e)}"
         rows.append(row)
     return rows
 

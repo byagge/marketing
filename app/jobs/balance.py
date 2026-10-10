@@ -35,6 +35,7 @@ from app.utils.balance import (
     classify_pair,
     plan_chat,
 )
+from app.utils.errfmt import short_error
 
 log = logging.getLogger("marketing.balance")
 
@@ -286,7 +287,7 @@ async def run_smart_rebalance(
                         return True
                     except Exception as e:
                         await sink.emit(
-                            f"✗ acc#{aid}: {type(e).__name__}: {e}", "error", notify=False
+                            f"✗ acc#{aid}: {short_error(e)}", "error", notify=False
                         )
                         return False
 
@@ -318,7 +319,7 @@ async def run_smart_rebalance(
                     pass
             return report
         except Exception as e:
-            err = f"{type(e).__name__}: {e}"
+            err = f"{short_error(e)}"
             await store.finish_job(job.id, "error", err)
             log.exception("smart rebalance failed")
             return f"Ошибка перераспределения: {err}"

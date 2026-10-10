@@ -687,3 +687,51 @@ async def test_several_unproductive_accounts_counted_in_one_mention(store, world
     bot = FakeBot()
     await autopilot.run_autopilot(store, bot, 5, force=True)
     assert bot.sent[0][1].startswith("@arxixx аккаунты не приносят клиентов — нужно переоформить: 2")
+
+
+async def test_link_found_by_member_wakes_others_who_could_not_join(store, world, monkeypatch):
+    """Чат известен только по id: аккаунт, который в нём, отдаёт ссылку — остальные вступают."""
+    from types import SimpleNamespace
+
+    from app.tg.linkharvest import HarvestedLink
+
+    insider = await _acc(store, "insider")
+    outsider = await _acc(store, "outsider")
+    chat = await store.add_chat("GSC | ЧАТ | WS Project", "-1001995593406", kind="schedule")
+    world.member.add(("insider", chat.id))
+    await store.record_setup_ok(insider.id, chat.id)
+
+    async def fake_lookup(client, c):
+        return SimpleNamespace(id=1)
+
+    async def fake_harvest(client, entity):
+        return HarvestedLink(invite="https://t.me/+found")
+
+    monkeypatch.setattr(autopilot, "lookup_entity", fake_lookup)
+    monkeypatch.setattr(autopilot, "harvest_join_link", fake_harvest)
+    bot = FakeBot()
+
+    await autopilot.run_autopilot(store, bot, 5, force=True)
+    assert (await store.get_chat(chat.id)).invite_link == "https://t.me/+found"
+    st = await store.get_join_state(outsider.id, chat.id)
+    assert st.status in {"manual", "member", "pending"}
+
+    await autopilot.run_autopilot(store, bot, 5, force=True)
+    assert ("outsider", chat.id) in world.joins
+    assert (await store.get_join_state(outsider.id, chat.id)).status == "member"
+    assert any("взял" in text and "вступят сами" in text for _id, text in bot.sent)
+
+
+async def test_spamblock_with_sender_is_switched_to_dead_not_just_reported(store, world):
+    acc = await _acc(store, "faraon", spam_status="limited", sender_account_id="s-1")
+    chat = await store.add_chat("C", "-1001", kind="schedule", invite_link="https://t.me/+a")
+    world.member.add(("faraon", chat.id))
+    await store.record_setup_ok(acc.id, chat.id)
+    bot = FakeBot()
+
+    await autopilot.run_autopilot(store, bot, 5, force=True)
+
+    fresh = await store.get_account(acc.id)
+    assert fresh.is_dead and fresh.sender_forbidden
+    assert acc.id in world.sync_calls  # sender в Autoposter остановлен
+    assert any("перевёл в dead" in text for _id, text in bot.sent)

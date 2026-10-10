@@ -14,6 +14,7 @@ from app.utils.entities import to_telethon_entities
 from datetime import timedelta
 
 from app.utils.schedule import MAX_SCHEDULED, build_schedule_times, posts_count_for_interval
+from app.utils.errfmt import short_error
 
 log = logging.getLogger(__name__)
 
@@ -408,7 +409,7 @@ async def schedule_chat_posts(
                 except RPCError as e2:
                     last_error = f"{type(e2).__name__}: {e2}"
                     break
-            last_error = f"{type(e).__name__}: {e}"
+            last_error = f"{short_error(e)}"
             break
 
     return {
@@ -500,7 +501,7 @@ async def schedule_chat_forwards(
             success += 1
             await asyncio.sleep(pause)
         except RPCError as e:
-            last_error = f"{type(e).__name__}: {e}"
+            last_error = f"{short_error(e)}"
             break
 
     return {

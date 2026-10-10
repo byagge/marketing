@@ -109,6 +109,14 @@ class Settings(BaseSettings):
     advisor_stop_share: float = 0.6
     advisor_warn_share: float = 0.35
 
+    # Советник: «польза против вреда» по аккаунту (см. app/jobs/advisor.py).
+    # Спамблок + активный sender → сразу dead (sender выключен, остаётся schedule).
+    spam_auto_dead: bool = True
+    # «Отключить» — только если пользы нет (клиентов 0, отправок нет) и вред ≥ порога.
+    advisor_min_harm: float = 4.0
+    # Автопилот: через сколько часов пробовать вступить заново после «сдался».
+    autopilot_abandoned_retry_hours: float = 72.0
+
     # Автопилот: сам вступает в чаты, настраивает отправку, фиксирует баны.
     autopilot_interval_min: int = 60
     # Не более N вступлений на аккаунт за один проход (анти-Flood).
