@@ -372,9 +372,11 @@ async def collect_account_facts(
     facts: list[PairFact] = []
     async with telethon_client(account.telethon_session) as client:
         me = await client.get_me()
+        from app.tg.premium import refresh_account_premium
+
+        await refresh_account_premium(store, client, account)
         await store.update_account(
             account.id,
-            is_premium=1 if getattr(me, "premium", False) else 0,
             username=getattr(me, "username", None) or None,
         )
         member = await member_schedule_chats(client, chats)

@@ -135,6 +135,12 @@ async def main() -> None:
         admin_id = next(iter(settings.admins), None)
         await run_advisor(store, bot, admin_id)
 
+    async def premium_watch_tick():
+        from app.jobs.premium_watch import run_premium_watch
+
+        admin_id = next(iter(settings.admins), None)
+        log.info("%s", await run_premium_watch(store, bot, admin_id))
+
     async def restr_events_tick():
         # новые муты/баны: найти причину в чате и один раз написать админу
         from app.jobs.restr_events import run_restr_events
@@ -268,6 +274,16 @@ async def main() -> None:
         misfire_grace_time=3600,
         coalesce=True,
     )
+    scheduler.add_job(
+        premium_watch_tick,
+        "interval",
+        id="premium_watch",
+        replace_existing=True,
+        hours=6,
+        coalesce=True,
+        max_instances=1,
+        next_run_time=datetime.now(scheduler.timezone) + timedelta(minutes=8),
+    )
     # Interval comes from bot UI (DB). Tick every 15 min and run when due.
     scheduler.add_job(
         online_tick,
@@ -351,12 +367,18 @@ async def main() -> None:
     )
     scheduler.start()
 
+    api_task = None
+    if settings.api_enabled:
+        from app.api.server import start_api_server
+
+        api_task = asyncio.create_task(start_api_server(store), name="marketing-api")
+
     online_cfg = await store.online_ping_settings()
     log.info(
         "Marketing bot starting (weekly=%s %s:00, setup_retry=daily %s:00, "
         "nonpremium_reschedule=daily %s:00, online_ping=%s every %sh±%ss, "
         "marketer=every %smin + morning %02d:%02d, retry_days=%s, max_attempts=%s, "
-        "auto_rebalance=%s every %sh)",
+        "auto_rebalance=%s every %sh, api=%s)",
         settings.weekly_health_dow,
         settings.weekly_health_hour,
         settings.setup_retry_hour,
@@ -371,8 +393,17 @@ async def main() -> None:
         settings.setup_max_attempts,
         "on" if settings.auto_rebalance else "off",
         settings.rebalance_every_hours,
+        f"{settings.api_host}:{settings.api_port}" if settings.api_enabled else "off",
     )
-    await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+    try:
+        await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+    finally:
+        if api_task is not None:
+            api_task.cancel()
+            try:
+                await api_task
+            except asyncio.CancelledError:
+                pass
 
 
 if __name__ == "__main__":

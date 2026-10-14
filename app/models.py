@@ -16,6 +16,11 @@ class Account:
     sender_bot_token: str = ""
     sender_account_id: str = ""
     is_premium: int = 0
+    # Оценка срока Premium (Telegram не отдаёт точный expires в User).
+    premium_since: str = ""
+    premium_until: str = ""
+    premium_until_source: str = ""  # promo|estimate|estimate_renew|kept|cleared
+    premium_warned_at: str = ""
     online_ping: int = 1
     sender_enabled: int = 1  # 0 = sender (Autoposter) для аккаунта выключен
     # 1 = dead-режим: sender выключен навсегда, работает только schedule

@@ -72,6 +72,16 @@ async def run_marketer_once(
     result = MarketerResult(cycle=cycle, actions=list(cycle.actions))
     now_iso = to_iso(datetime.now(timezone.utc))
 
+    # Аутрич: клоакинг в ЛС шлёт маркетолог (sender у аутрича не запускается).
+    try:
+        from app.jobs.outreach_cloak import run_outreach_cloak
+
+        cloak = await run_outreach_cloak(store)
+        if cloak.sent or cloak.errors:
+            log.info("%s", cloak.line())
+    except Exception:  # noqa: BLE001
+        log.exception("outreach cloak failed")
+
     if morning:
         result.digest = await build_brief(store, cycle, morning=True)
         if bot and admin_chat_id:

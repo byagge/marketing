@@ -48,6 +48,10 @@ CREATE TABLE IF NOT EXISTS accounts (
     sender_bot_token TEXT NOT NULL DEFAULT '',
     sender_account_id TEXT NOT NULL DEFAULT '',
     is_premium INTEGER NOT NULL DEFAULT 0,
+    premium_since TEXT NOT NULL DEFAULT '',
+    premium_until TEXT NOT NULL DEFAULT '',
+    premium_until_source TEXT NOT NULL DEFAULT '',
+    premium_warned_at TEXT NOT NULL DEFAULT '',
     online_ping INTEGER NOT NULL DEFAULT 1,
     status TEXT NOT NULL DEFAULT 'idle',
     last_error TEXT NOT NULL DEFAULT '',
@@ -373,6 +377,8 @@ CREATE TABLE IF NOT EXISTS dm_people (
     last_msg_at TEXT NOT NULL DEFAULT '',
     in_count INTEGER NOT NULL DEFAULT 0,
     unread INTEGER NOT NULL DEFAULT 0,
+    cloak_state TEXT NOT NULL DEFAULT '',
+    cloak_at TEXT NOT NULL DEFAULT '',
     PRIMARY KEY (account_id, user_id)
 );
 
@@ -562,6 +568,16 @@ async def _migrate_accounts_premium(db: aiosqlite.Connection) -> None:
         await db.execute("ALTER TABLE accounts ADD COLUMN dead INTEGER NOT NULL DEFAULT 0")
     if "outreach" not in cols:
         await db.execute("ALTER TABLE accounts ADD COLUMN outreach INTEGER NOT NULL DEFAULT 0")
+    for name in (
+        "premium_since",
+        "premium_until",
+        "premium_until_source",
+        "premium_warned_at",
+    ):
+        if name not in cols:
+            await db.execute(
+                f"ALTER TABLE accounts ADD COLUMN {name} TEXT NOT NULL DEFAULT ''"
+            )
 
 
 async def _migrate_chat_facts(db: aiosqlite.Connection) -> None:
@@ -636,6 +652,21 @@ async def _migrate_join_states(db: aiosqlite.Connection) -> None:
             await db.execute(sql)
 
 
+async def _migrate_dm_people(db: aiosqlite.Connection) -> None:
+    cur = await db.execute("PRAGMA table_info(dm_people)")
+    cols = {row[1] for row in await cur.fetchall()}
+    if not cols:
+        return
+    if "cloak_state" not in cols:
+        await db.execute(
+            "ALTER TABLE dm_people ADD COLUMN cloak_state TEXT NOT NULL DEFAULT ''"
+        )
+    if "cloak_at" not in cols:
+        await db.execute(
+            "ALTER TABLE dm_people ADD COLUMN cloak_at TEXT NOT NULL DEFAULT ''"
+        )
+
+
 def _account_dead_flag(row: aiosqlite.Row, keys) -> int:
     """Колонки dead и is_dead — одна семантика; берём любую ненулевую."""
     dead = int(row["dead"] or 0) if "dead" in keys and row["dead"] is not None else 0
@@ -662,6 +693,16 @@ def _account(row: aiosqlite.Row) -> Account:
         sender_bot_token=row["sender_bot_token"] or "",
         sender_account_id=row["sender_account_id"] or "",
         is_premium=int(row["is_premium"] if "is_premium" in keys else 0) or 0,
+        premium_since=(row["premium_since"] if "premium_since" in keys else "") or "",
+        premium_until=(row["premium_until"] if "premium_until" in keys else "") or "",
+        premium_until_source=(
+            row["premium_until_source"] if "premium_until_source" in keys else ""
+        )
+        or "",
+        premium_warned_at=(
+            row["premium_warned_at"] if "premium_warned_at" in keys else ""
+        )
+        or "",
         online_ping=online_ping,
         sender_enabled=(
             int(row["sender_enabled"])
@@ -813,6 +854,7 @@ class Store:
             await _migrate_setup_states(db)
             await _migrate_chat_facts(db)
             await _migrate_join_states(db)
+            await _migrate_dm_people(db)
             for key, value in DEFAULT_SETTINGS.items():
                 await db.execute(
                     "INSERT OR IGNORE INTO settings(key, value) VALUES(?, ?)",
@@ -2855,6 +2897,57 @@ class Store:
             await db.executemany(
                 "INSERT OR IGNORE INTO dm_activity(account_id, user_id, day) VALUES(?,?,?)",
                 [(account_id, user_id, d) for d in days],
+            )
+            await db.commit()
+
+    async def list_dm_cloak_pending(
+        self,
+        account_id: int,
+        *,
+        limit: int = 40,
+        since: str = "",
+    ) -> list[dict[str, Any]]:
+        """Люди, написавшие первыми, которым аутрич-клоакинг ещё не отправляли.
+
+        since — ISO-время: берём только тех, у кого last_in_at/first_at не старше
+        (чтобы не разослать клоак всей старой истории после деплоя).
+        """
+        args: list[Any] = [account_id]
+        time_sql = ""
+        if since:
+            time_sql = "AND (last_in_at>=? OR first_at>=? OR unread>0) "
+            args.extend([since, since])
+        args.append(max(1, int(limit)))
+        async with self._connect() as db:
+            cur = await db.execute(
+                "SELECT user_id, username, name, first_at, last_in_at, unread "
+                "FROM dm_people WHERE account_id=? AND started_by='them' "
+                "AND COALESCE(cloak_state,'')='' "
+                f"{time_sql}"
+                "ORDER BY last_in_at DESC, first_at DESC LIMIT ?",
+                tuple(args),
+            )
+            rows = await cur.fetchall()
+        return [
+            {
+                "user_id": int(r[0]),
+                "username": r[1] or "",
+                "name": r[2] or "",
+                "first_at": r[3] or "",
+                "last_in_at": r[4] or "",
+                "unread": int(r[5] or 0),
+            }
+            for r in rows
+        ]
+
+    async def set_dm_cloak_state(
+        self, account_id: int, user_id: int, state: str, *, at: str = ""
+    ) -> None:
+        async with self._connect() as db:
+            await db.execute(
+                "UPDATE dm_people SET cloak_state=?, cloak_at=? "
+                "WHERE account_id=? AND user_id=?",
+                (state or "", at or "", account_id, user_id),
             )
             await db.commit()
 

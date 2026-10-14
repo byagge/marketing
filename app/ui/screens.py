@@ -81,6 +81,25 @@ def accounts_html(accounts: list[Account]) -> str:
     return "\n".join(lines)
 
 
+def _premium_line(acc: Account) -> str:
+    from app.tg.premium import hours_left, needs_warn
+    from app.utils.timefmt import fmt_local, parse_utc
+
+    if not acc.is_premium:
+        return f"{pe('block')} нет · суточный cron без repeat"
+    until = parse_utc(acc.premium_until)
+    if until is None:
+        return f"{pe('check')} да"
+    until_s = fmt_local(until, "%d.%m.%Y")
+    left = hours_left(acc.premium_until)
+    if needs_warn(acc.premium_until):
+        h = max(0, int(left or 0))
+        return f"{pe('warn')} да · <b>заканчивается</b> {escape(until_s)} (≈{h} ч)"
+    if left is not None and left <= 0:
+        return f"{pe('warn')} да · срок {escape(until_s)} (истёк? перепроверю)"
+    return f"{pe('check')} да · до {escape(until_s)}"
+
+
 def _spam_line(acc: Account) -> str:
     label = {"clean": "чист", "limited": "ограничен", "unknown": "не определён"}.get(
         acc.spam_status, "не проверялся"
@@ -141,8 +160,7 @@ def account_html(acc: Account, ru=None, en=None, campaign: str = "") -> str:
         f"{' ' + pe('robot') + ' в фоне' if run else ''}"
         f"{post_line}\n\n"
         f"{pe('lock')} Telethon: {on_off(bool(acc.telethon_session))}\n"
-        f"{pe('star')} Premium: {on_off(bool(acc.is_premium))}"
-        f"{'' if acc.is_premium else ' · суточный cron без repeat'}\n"
+        f"{pe('star')} Premium: {_premium_line(acc)}\n"
         f"{pe('monitor')} Pyrogram: {on_off(bool(acc.pyrogram_session))}\n"
         f"{pe('shield')} SpamBot: {_spam_line(acc)}\n"
         f"{pe('up')} Online ping: {on_off(bool(acc.online_ping_enabled))}"

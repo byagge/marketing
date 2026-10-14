@@ -29,6 +29,14 @@ class Settings(BaseSettings):
     sender_api_url: str = "http://127.0.0.1:8787"
     sender_api_key: str = ""
 
+    # HTTP API отчётов/каталога (в том же процессе, что и бот).
+    api_enabled: bool = True
+    api_host: str = "127.0.0.1"
+    # 8790 на сервере занят outreachchats (node) — marketing API: 8791
+    api_port: int = 8791
+    api_key: str = ""  # пусто → ключ в data/api_key.txt
+    api_public_url: str = ""  # например https://marketingapi.arix.vu
+
     timezone: str = "Asia/Bishkek"
     start_hour: int = 9
     # Daily Telegram repeat for Premium accounts only (seconds). 0 = never send.
