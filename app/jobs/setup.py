@@ -45,7 +45,6 @@ async def ensure_minute(store: Store, chat: Chat, account: Account) -> int:
         return existing.start_minute
 
     period = period_for_interval(chat.interval_minutes)
-    occupied = await store.occupied_minutes(chat.id)
     all_slots = await store.all_slots()
     schedule_ids = {
         c.id for c in await store.list_chats(kind="schedule") if c.enabled
@@ -56,9 +55,18 @@ async def ensure_minute(store: Store, chat: Chat, account: Account) -> int:
             continue
         global_counts[slot.start_minute] = global_counts.get(slot.start_minute, 0) + 1
 
-    minute = suggest_minute(period, occupied, global_counts)
-    await store.set_slot(chat.id, account.id, minute)
-    return minute
+    # Параллельные аккаунты могут занять минуту между чтением occupied и записью:
+    # при конфликте перечитываем занятые минуты и берём следующую свободную.
+    tried: set[int] = set()
+    while True:
+        occupied = set(await store.occupied_minutes(chat.id)) | tried
+        minute = suggest_minute(period, occupied, global_counts)  # TableFullError, если мест нет
+        try:
+            await store.set_slot(chat.id, account.id, minute)
+        except ValueError:
+            tried.add(minute)
+            continue
+        return minute
 
 
 async def ensure_sender_account(store: Store, account: Account, api: SenderAPI, log: LogSink) -> str:
