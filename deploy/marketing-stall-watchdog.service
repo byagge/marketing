@@ -1,0 +1,7 @@
+[Unit]
+Description=Marketing stall watchdog
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/marketing/venv/bin/python /opt/marketing/scripts/stall_watchdog.py

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 from pathlib import Path
@@ -32,12 +33,16 @@ from app.jobs.spam import account_load
 from app.utils.schedule import dead_interval, phase_offset_minutes, resolve_repeat_period
 from app.utils.send_policy import (
     classify_failure,
+    dead_post_mode,
     effective_interval_minutes,
     effective_interval_seconds,
     is_send_allowed,
     matches_stoplist,
     pick_text_override,
 )
+
+# Один чат не должен держать настройку: зависший schedule пропускаем и идём дальше.
+CHAT_STEP_TIMEOUT_SEC = 180
 from app.utils.spamstate import scale_parallel, scale_seconds
 from app.utils.templates import pick_post_for_chat, render_post
 from app.tg.sender_push import (
@@ -452,7 +457,13 @@ async def schedule_one_chat(
     interval = chat.interval_minutes
     offset = 0
     if dead:
-        interval = dead_interval(chat.interval_minutes, settings.dead_interval_minutes)
+        mode = dead_post_mode(chat.title)
+        if mode == "skip":
+            return "skipped"
+        if mode == "plan":
+            interval = effective_interval_minutes(chat)
+        else:
+            interval = dead_interval(chat.interval_minutes, settings.dead_interval_minutes)
         minute = (account.id * 7) % 60
     else:
         interval = effective_interval_minutes(chat)
@@ -714,19 +725,31 @@ async def schedule_chats_batch(
         # setup:cancel по account.id; глобальные jobs (fix_minutes и т.п.) — :0
         if runtime.cancelled(job_kind, account.id) or runtime.cancelled(job_kind, 0):
             raise SetupError("Остановлено")
-        outcome = await schedule_one_chat(
-            store,
-            client,
-            account,
-            chat,
-            posts,
-            log,
-            skip_abandoned=skip_abandoned,
-            is_premium=is_premium,
-            dead=dead,
-            entity=(entities or {}).get(chat.id),
-            sync=sync,
-        )
+        try:
+            outcome = await asyncio.wait_for(
+                schedule_one_chat(
+                    store,
+                    client,
+                    account,
+                    chat,
+                    posts,
+                    log,
+                    skip_abandoned=skip_abandoned,
+                    is_premium=is_premium,
+                    dead=dead,
+                    entity=(entities or {}).get(chat.id),
+                    sync=sync,
+                ),
+                timeout=CHAT_STEP_TIMEOUT_SEC,
+            )
+        except asyncio.TimeoutError:
+            await log.emit(
+                f"{account.label}: «{chat.title}» не ответил за "
+                f"{CHAT_STEP_TIMEOUT_SEC // 60} мин — пропуск, остальные чаты продолжаю",
+                notify=False,
+            )
+            buckets.setdefault("skipped", []).append(chat.title)
+            continue
         if outcome == "stopped":
             raise SetupError("Остановлено")
         buckets.setdefault(outcome, []).append(chat.title)
@@ -1178,6 +1201,10 @@ async def run_setup(store: Store, account_id: int, bot: Bot, admin_chat_id: int)
         await store.finish_job(job.id, "error", err)
         await store.update_account(account.id, status="error", last_error=err)
         await log.emit(f"Ошибка настройки {account.label}: {err}", "error")
+    except asyncio.CancelledError:
+        await store.finish_job(job.id, "error", "timeout: задача прервана")
+        await store.update_account(account.id, status="idle", last_error="timeout")
+        raise
     finally:
         current = await store.get_account(account_id)
         if current and current.status == "running":
@@ -1259,6 +1286,9 @@ async def run_setup_chats_only(
     except SetupError as e:
         await store.finish_job(job.id, "cancelled" if str(e) == "Остановлено" else "error", str(e))
         return empty
+    except asyncio.CancelledError:
+        await store.finish_job(job.id, "error", "timeout: задача прервана")
+        raise
     except Exception as e:
         await store.finish_job(job.id, "error", f"{short_error(e)}")
         return empty
@@ -1347,7 +1377,11 @@ async def run_dead_schedule(
             await store.update_account(account.id, is_premium=1 if is_premium else 0)
             account = await store.get_account(account.id) or account
             member = await member_schedule_chats(client, schedule_chats)
-            targets = [c for c in schedule_chats if c.id in member]
+            targets = [
+                c
+                for c in schedule_chats
+                if c.id in member and dead_post_mode(c.title) != "skip"
+            ]
             buckets = await schedule_chats_batch(
                 store,
                 client,
@@ -1375,6 +1409,9 @@ async def run_dead_schedule(
             job.id, "cancelled" if str(e) == "Остановлено" else "error", str(e)
         )
         return empty
+    except asyncio.CancelledError:
+        await store.finish_job(job.id, "error", "timeout: задача прервана")
+        raise
     except Exception as e:
         await store.finish_job(job.id, "error", f"{short_error(e)}")
         return empty

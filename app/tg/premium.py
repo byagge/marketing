@@ -79,6 +79,29 @@ def needs_warn(until_iso: str, *, now: datetime | None = None) -> bool:
     return left is not None and 0 < left <= WARN_HOURS
 
 
+def promo_lapsed(account: Account, *, now: datetime | None = None) -> bool:
+    """Срок из promo уже в прошлом. Оценку estimate не трогаем — её продлевает probe."""
+    if not account.is_premium or not (account.premium_until or "").strip():
+        return False
+    src = (account.premium_until_source or "").strip()
+    if src.startswith("estimate"):
+        return False
+    left = hours_left(account.premium_until, now=now)
+    return left is not None and left <= 0
+
+
+async def expire_lapsed_premium(store: Store, *, now: datetime | None = None) -> list[str]:
+    """Снять is_premium, если premium_until уже прошёл. Возвращает метки аккаунтов."""
+    now = _aware(now or datetime.now(timezone.utc))
+    ended: list[str] = []
+    for acc in await store.list_accounts():
+        if not promo_lapsed(acc, now=now):
+            continue
+        await store.update_account(acc.id, is_premium=0, premium_until_source="expired")
+        ended.append(acc.label)
+    return ended
+
+
 async def probe_premium(client: Any) -> PremiumInfo:
     me = await client.get_me()
     is_prem = bool(getattr(me, "premium", False))
@@ -151,8 +174,22 @@ async def refresh_account_premium(
         source = "estimate"
         probed.months = months
     else:
-        # ещё Premium, until в прошлом → похоже на автопродление
+        # until в прошлом и новой даты из promo нет.
+        # Промо-Premium так и зависал: get_me().premium ещё true, а срок уже вышел,
+        # и старая ветка рисовала новое until. Оценку (estimate) можно продлить,
+        # дату из promo — нет.
         u = parse_utc(until)
+        src = (source or "").strip()
+        promo_lapsed = u is not None and u <= now and not src.startswith("estimate")
+        if promo_lapsed:
+            fields["is_premium"] = 0
+            fields["premium_until_source"] = "expired"
+            await store.update_account(account.id, **fields)
+            probed.is_premium = False
+            probed.since = since
+            probed.until = until
+            probed.source = "expired"
+            return probed
         if u is not None and u <= now:
             months = probed.months or DEFAULT_MONTHS
             until = to_iso(now + timedelta(days=30 * months))

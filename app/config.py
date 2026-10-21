@@ -133,7 +133,7 @@ class Settings(BaseSettings):
     # занимал больше часа и накладывался на следующий) и сколько минут даём одному аккаунту:
     # зависший аккаунт не должен держать весь проход.
     autopilot_parallel: int = 6
-    autopilot_account_timeout_min: float = 30.0
+    autopilot_account_timeout_min: float = 20.0
     autopilot_join_pause_min_sec: float = 20.0
     autopilot_join_pause_max_sec: float = 45.0
     autopilot_retry_hours: float = 6.0

@@ -1734,6 +1734,38 @@ class Store:
             account_label=row["account_label"] or "",
         )
 
+    async def fail_stale_jobs(self, older_than_minutes: float = 20) -> int:
+        """Running старше N минут → error.
+
+        Суточная настройка и health могут идти дольше 20 минут: их гасим только
+        если за это окно не было ни одной строки в job_logs.
+        """
+        cutoff = (
+            datetime.now(timezone.utc) - timedelta(minutes=older_than_minutes)
+        ).isoformat(timespec="seconds")
+        now = _now()
+        report_hard = f"timeout: running > {older_than_minutes:.0f} min"
+        report_soft = f"timeout: нет прогресса {older_than_minutes:.0f} мин"
+        soft = ("setup_daily_nonpremium", "setup", "setup_retry", "health")
+        async with self._connect() as db:
+            cur = await db.execute(
+                "UPDATE jobs SET status='error', finished_at=?, report=? "
+                "WHERE status='running' AND started_at < ? "
+                "AND kind NOT IN (?,?,?,?)",
+                (now, report_hard, cutoff, *soft),
+            )
+            hard_n = int(cur.rowcount or 0)
+            cur = await db.execute(
+                "UPDATE jobs SET status='error', finished_at=?, report=? "
+                "WHERE status='running' AND started_at < ? "
+                "AND kind IN (?,?,?,?) "
+                "AND id NOT IN (SELECT job_id FROM job_logs WHERE created_at >= ?)",
+                (now, report_soft, cutoff, *soft, cutoff),
+            )
+            soft_n = int(cur.rowcount or 0)
+            await db.commit()
+        return hard_n + soft_n
+
     async def finish_job(self, job_id: int, status: str, report: str = "") -> None:
         async with self._connect() as db:
             await db.execute(

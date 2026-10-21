@@ -361,11 +361,16 @@ async def process_account(
         and c.id in in_chat
         and (c.id in new_pks or (c.id not in known_setup and c.id not in ok_setup))
     ]
-    # Спамблок не мешает закрытым чатам — schedule настраиваем как обычно. Открытые
-    # (публичные) чаты в блоке недоступны: их откладываем, чтобы не жечь попытки.
-    if (await store.get_spam_state(acc.id)).is_limited:
-        by_pk = {c.id: c for c in eligible}
-        schedule_need = [pk for pk in schedule_need if is_closed_chat(by_pk[pk])]
+    # Спамблок: открытые чаты всё равно не примут schedule, а зависший
+    # autopilot_setup (loyalty above money) держал весь цикл. Пока limited —
+    # настройку не запускаем, вступление в закрытые чаты выше уже сделано.
+    spam_now = await store.get_spam_state(acc.id)
+    if spam_now.is_limited or acc.is_spam_limited:
+        if schedule_need:
+            res.notes.append(
+                f"{acc.label}: autopilot_setup пропущен — spam limited"
+            )
+        schedule_need = []
     if schedule_need and not is_cancelled():
         try:
             buckets = await run_setup_chats_only(

@@ -101,6 +101,21 @@ def pick_text_override(pref: AccountChatPref | None) -> str | None:
     return None
 
 
+def dead_post_mode(title: str) -> str:
+    """Куда dead-аккаунт пишет: skip | plan | dense.
+
+    skip — чат исключён из добивания (антиспам без лидов).
+    plan — только интервал расписания, без уплотнения до 15 мин.
+    dense — обычный dead-интервал.
+    """
+    t = (title or "").casefold()
+    if "скамн" in t or "scam court" in t:
+        return "skip"
+    if "plush" in t:
+        return "plan"
+    return "dense"
+
+
 _BAN_MARKERS = (
     "userbannedinchannel",
     "user_banned_in_channel",

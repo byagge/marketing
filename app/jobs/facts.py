@@ -34,7 +34,7 @@ from app.utils.errfmt import short_error
 
 log = logging.getLogger("marketing.facts")
 
-MAX_PER_CHAT = 400
+FACTS_ACCOUNT_TIMEOUT_SEC = 8 * 60
 
 
 async def dialog_entities(client: TelegramClient, chats: list[Chat]) -> dict[int, Any]:
@@ -191,13 +191,16 @@ async def run_facts_collection(
     async def _one(acc: Account) -> dict[str, Any]:
         acc_chats = [c for c in chats if (acc.id, c.id) not in banned]
         try:
-            res = await collect_account(
-                store,
-                acc,
-                acc_chats,
-                since,
-                scan_restrictions=scan_restrictions,
-                scan_dms=scan_dms,
+            res = await asyncio.wait_for(
+                collect_account(
+                    store,
+                    acc,
+                    acc_chats,
+                    since,
+                    scan_restrictions=scan_restrictions,
+                    scan_dms=scan_dms,
+                ),
+                timeout=FACTS_ACCOUNT_TIMEOUT_SEC,
             )
         except Exception as e:  # noqa: BLE001
             await store.set_setting(
@@ -447,7 +450,10 @@ async def run_collect_facts(
         if runtime.cancelled(job_kind, 0):
             return False
         try:
-            facts = await collect_account_facts(store, acc, chats)
+            facts = await asyncio.wait_for(
+                collect_account_facts(store, acc, chats),
+                timeout=FACTS_ACCOUNT_TIMEOUT_SEC,
+            )
         except Exception as e:
             # сессия не читается и т.п.: старые факты не трогаем (станут UNKNOWN по возрасту)
             await sink.emit(f"✗ {acc.label}: {short_error(e)}", "error", notify=False)
@@ -458,19 +464,26 @@ async def run_collect_facts(
         await sink.emit(f"✓ {acc.label}: {len(facts)} пар", notify=False)
         return True
 
-    results = await map_batches(
-        accounts,
-        _one,
-        batch_size=batch_size,
-        batch_pause=batch_pause,
-        is_cancelled=lambda: runtime.cancelled(job_kind, 0),
-    )
-    stats["ok"] = sum(1 for r in results if r is True)
-    stats["failed"] = len(results) - stats["ok"]
-    await store.finish_job(
-        job.id,
-        "done",
-        f"аккаунтов {stats['ok']}/{stats['accounts']}, пар {stats['pairs']}, "
-        f"ошибок {stats['failed']}",
-    )
-    return stats
+    try:
+        results = await map_batches(
+            accounts,
+            _one,
+            batch_size=batch_size,
+            batch_pause=batch_pause,
+            is_cancelled=lambda: runtime.cancelled(job_kind, 0),
+        )
+        stats["ok"] = sum(1 for r in results if r is True)
+        stats["failed"] = len(results) - stats["ok"]
+        await store.finish_job(
+            job.id,
+            "done",
+            f"аккаунтов {stats['ok']}/{stats['accounts']}, пар {stats['pairs']}, "
+            f"ошибок {stats['failed']}",
+        )
+        return stats
+    except asyncio.CancelledError:
+        await store.finish_job(job.id, "error", "timeout: задача прервана")
+        raise
+    except Exception as e:
+        await store.finish_job(job.id, "error", f"{short_error(e)}")
+        raise

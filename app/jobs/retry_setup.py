@@ -12,6 +12,7 @@ from app.jobs.health import run_health_all
 from app.jobs.parallel import map_batches, setup_parallel_defaults
 from app.jobs.setup import run_dead_schedule, run_setup_chats_only
 from app.notify import safe_send
+from app.tg.premium import expire_lapsed_premium, refresh_account_premium
 from app.utils.chat_ids import canon_chat_id
 from app.store import Store
 from app.tg.scheduler import flood_snapshot
@@ -206,12 +207,14 @@ async def _run_nonpremium_daily_reschedule(
         return "Суточный schedule (non-Premium): нет аккаунтов с Telethon"
 
     chat_pks = [c.id for c in schedule_chats]
+    lapsed = await expire_lapsed_premium(store)
     if bot and admin_chat_id:
         try:
             await safe_send(bot, 
                 admin_chat_id,
                 f"Суточный schedule (non-Premium) | проверка {len(accounts)} аккаунтов, "
-                f"{len(chat_pks)} чатов | час={settings.nonpremium_hour}:00",
+                f"{len(chat_pks)} чатов | час={settings.nonpremium_hour}:00"
+                + (f" | снят Premium: {', '.join(lapsed)}" if lapsed else ""),
             )
         except Exception:
             pass
@@ -227,9 +230,8 @@ async def _run_nonpremium_daily_reschedule(
         nonlocal skipped_premium
         try:
             async with telethon_client(acc.telethon_session) as client:
-                me = await client.get_me()
-                is_premium = bool(getattr(me, "premium", False))
-            await store.update_account(acc.id, is_premium=1 if is_premium else 0)
+                info = await refresh_account_premium(store, client, acc)
+            is_premium = bool(info.is_premium)
             if is_premium:
                 return ("premium", None)
             if acc.is_dead:

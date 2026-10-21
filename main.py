@@ -62,6 +62,9 @@ async def main() -> None:
     store = Store()
     await store.init()
     ctx.store = store
+    closed = await store.fail_stale_jobs(20)
+    if closed:
+        log.warning("закрыл зависшие задачи: %s", closed)
 
     bot = Bot(token=settings.bot_token)
     ctx.bot = bot
@@ -189,6 +192,39 @@ async def main() -> None:
     async def online_tick():
         summary = await run_online_ping_tick(store)
         log.info("%s", summary)
+
+    async def stall_tick():
+        from app.jobs.stall_guard import run_stall_guard
+
+        admin_id = next(iter(settings.admins), None)
+        log.info("%s", await run_stall_guard(store, bot, admin_id))
+
+    async def daily_catchup():
+        # После простоя очереди в Telegram уже пустые: не ждать следующие сутки.
+        from app.jobs.retry_setup import run_nonpremium_daily_reschedule
+
+        if runtime.is_running("reconfigure_all", 0):
+            return
+        rows = await store.raw_rows(
+            "SELECT finished_at FROM jobs WHERE kind='setup_daily_nonpremium' "
+            "AND status='done' ORDER BY id DESC LIMIT 1"
+        )
+        last = (rows[0]["finished_at"] if rows else "") or ""
+        stale = True
+        if last:
+            try:
+                dt = datetime.fromisoformat(last)
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                stale = (datetime.now(timezone.utc) - dt).total_seconds() > 18 * 3600
+            except ValueError:
+                stale = True
+        if not stale:
+            log.info("daily catchup: суточная настройка свежая, пропуск")
+            return
+        admin_id = next(iter(settings.admins), None)
+        log.info("daily catchup: запускаю суточную настройку")
+        log.info("%s", await run_nonpremium_daily_reschedule(store, bot, admin_id))
 
     async def autopilot_tick():
         if runtime.is_running("autopilot", 0):
@@ -364,6 +400,23 @@ async def main() -> None:
         coalesce=True,
         misfire_grace_time=300,
         **morning_args,
+    )
+    scheduler.add_job(
+        stall_tick,
+        "interval",
+        id="stall_guard",
+        replace_existing=True,
+        minutes=10,
+        coalesce=True,
+        max_instances=1,
+        next_run_time=datetime.now(scheduler.timezone) + timedelta(minutes=4),
+    )
+    scheduler.add_job(
+        daily_catchup,
+        "date",
+        id="daily_catchup_startup",
+        replace_existing=True,
+        run_date=datetime.now(scheduler.timezone) + timedelta(minutes=2),
     )
     scheduler.start()
 

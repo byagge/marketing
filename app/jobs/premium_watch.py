@@ -13,7 +13,7 @@ from app.jobs.parallel import map_batches, setup_parallel_defaults
 from app.notify import safe_send
 from app.store import Store
 from app.tg.client import telethon_client
-from app.tg.premium import needs_warn, refresh_account_premium
+from app.tg.premium import expire_lapsed_premium, needs_warn, refresh_account_premium
 from app.ui.emoji import pe
 from app.utils.errfmt import short_error
 from app.utils.timefmt import fmt_local, parse_utc, to_iso
@@ -29,15 +29,22 @@ async def run_premium_watch(store: Store, bot: Bot | None = None, admin_id: int 
     """Пройти аккаунты с Telethon: обновить Premium и предупредить админа."""
     settings = get_settings()
     admin_id = admin_id or next(iter(settings.admins), None)
+    now = datetime.now(timezone.utc)
+    # Флаг не ждёт Telethon: промо с прошедшим premium_until снимается сразу.
+    lapsed = await expire_lapsed_premium(store, now=now)
     accounts = [a for a in await store.list_accounts() if a.telethon_session]
     if not accounts:
-        return "premium_watch: нет аккаунтов"
+        return "premium_watch: нет аккаунтов" + (
+            f", снято: {', '.join(lapsed)}" if lapsed else ""
+        )
 
     batch_size, batch_pause = setup_parallel_defaults()
-    now = datetime.now(timezone.utc)
     warns: list[str] = []
     ended: list[str] = []
     errors = 0
+    lapsed_labels = set(lapsed)
+    for label in lapsed:
+        ended.append(f"{_mark(label)} — Premium <b>закончился</b> (срок в базе уже прошёл)")
 
     async def _one(acc):
         nonlocal errors
@@ -50,7 +57,7 @@ async def run_premium_watch(store: Store, bot: Bot | None = None, admin_id: int 
             log.info("premium_watch %s: %s", acc.label, short_error(e))
             return None
         fresh = await store.get_account(acc.id) or acc
-        if was_prem and not info.is_premium:
+        if was_prem and not info.is_premium and acc.label not in lapsed_labels:
             was_until = parse_utc(acc.premium_until)
             was_s = fmt_local(was_until, "%d.%m.%Y") if was_until else "—"
             ended.append(
