@@ -34,6 +34,7 @@ from app.utils.errfmt import short_error
 
 log = logging.getLogger("marketing.facts")
 
+MAX_PER_CHAT = 400
 FACTS_ACCOUNT_TIMEOUT_SEC = 8 * 60
 
 
@@ -184,8 +185,21 @@ async def run_facts_collection(
     if not accounts or not chats:
         return "Факты: нет аккаунтов с Telethon или чатов"
 
+    # После простоя окно 3 ч оставляет дыру: дочитываем от последней отправки, не дольше 72 ч.
+    window_h = float(hours)
+    latest = await store.raw_rows("SELECT MAX(sent_at) AS t FROM send_events")
+    last_sent = (latest[0]["t"] if latest else "") or ""
+    if last_sent:
+        last_dt = datetime.fromisoformat(last_sent)
+        if last_dt.tzinfo is None:
+            last_dt = last_dt.replace(tzinfo=timezone.utc)
+        gap_h = (datetime.now(timezone.utc) - last_dt).total_seconds() / 3600
+        if gap_h > window_h:
+            window_h = min(72.0, gap_h + 1)
+            log.info("facts: окно расширено до %.1f ч, последняя отправка %s", window_h, last_sent)
+
     banned = await store.banned_pairs()
-    since = datetime.now(timezone.utc) - timedelta(hours=hours)
+    since = datetime.now(timezone.utc) - timedelta(hours=window_h)
     batch_size, batch_pause = setup_parallel_defaults()
 
     async def _one(acc: Account) -> dict[str, Any]:
@@ -244,7 +258,7 @@ async def run_facts_collection(
     await store.prune_send_events(90)
     took = time.monotonic() - started
     summary = (
-        f"Факты за {hours:g} ч: аккаунтов {len(accounts) - failed}/{len(accounts)}, "
+        f"Факты за {window_h:g} ч: аккаунтов {len(accounts) - failed}/{len(accounts)}, "
         f"новых отправок {total['new']}, пар «аккаунт×чат» в чате {total['chats']}, "
         f"не состоит {total['not_member']}"
     )
