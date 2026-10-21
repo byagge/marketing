@@ -84,7 +84,9 @@ async def stall_reasons(store: Store) -> list[str]:
         if silent:
             reasons.append(f"нет отправок больше {SEND_GAP_MIN} мин в рабочее окно")
 
-    facts = await store.raw_rows("SELECT MAX(checked_at) AS checked FROM chat_facts")
+    facts = await store.raw_rows(
+        "SELECT MAX(scanned_at) AS checked FROM send_scans WHERE status='ok'"
+    )
     checked = (facts[0]["checked"] if facts else "") or ""
     facts_old = True
     if checked:

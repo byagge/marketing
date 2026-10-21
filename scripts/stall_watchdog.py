@@ -94,7 +94,9 @@ def _reasons(now: datetime) -> list[str]:
             if not fresh:
                 reasons.append("нет отправок 30 мин")
 
-    checked = db.execute("SELECT MAX(checked_at) FROM chat_facts").fetchone()[0] or ""
+    checked = db.execute(
+        "SELECT MAX(scanned_at) FROM send_scans WHERE status='ok'"
+    ).fetchone()[0] or ""
     fact = _parse(checked)
     if fact is None or (now - fact).total_seconds() > 2 * 3600:
         reasons.append("факты старше 2 ч")
