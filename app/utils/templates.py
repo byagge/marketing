@@ -63,11 +63,14 @@ def render_post(
     entities: list[dict[str, Any]] | None,
     tag: str | None,
 ) -> tuple[str, list[dict[str, Any]]]:
-    """Заменяет плейсхолдеры. Нет тега — плейсхолдер выкидывается (пропуск)."""
+    """Заменяет {{GARANT}}/{{TAG}}. Если плейсхолдера нет, а тег — @бот и его ещё нет
+    в тексте, дописывает в конец (иначе чаты вроде Arena удаляют пост без гаранта).
+    """
     ents = [dict(e) for e in (entities or [])]
     value = (tag or "").strip()
     matches = list(PLACEHOLDER_RE.finditer(text))
     result = text
+    had_placeholder = bool(matches)
 
     for match in reversed(matches):
         start, end = match.start(), match.end()
@@ -81,5 +84,16 @@ def render_post(
     if not value:
         result = re.sub(r"[ \t]+\n", "\n", result)
         result = re.sub(r"\n{3,}", "\n\n", result).strip("\n")
+        return result, ents
+
+    # tag='+' у Plush/MARKET — не тег гаранта, в пост не клеим.
+    if (
+        not had_placeholder
+        and value.startswith("@")
+        and len(value) > 1
+        and value.casefold() not in result.casefold()
+    ):
+        suffix = ("\n\n" if result.strip() else "") + value
+        result = result.rstrip() + suffix
 
     return result, ents
