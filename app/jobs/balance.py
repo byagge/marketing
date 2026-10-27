@@ -143,7 +143,6 @@ async def analyze_state(
                 silent_after=silent_after,
                 chat_alive=chat_alive,
             )
-            statuses[aid] = status
             acc = accounts.get(aid)
             # Premium держит расписание на repeat: должно стоять ровно полные сутки.
             # Меньше (старые 23 слота с дырой ~40 мин) → пересобрать один раз.
@@ -153,8 +152,19 @@ async def analyze_state(
                 and f.scheduled_count is not None
                 and f.scheduled_count < need
             )
-            if status == WORKING and (not (st and st.status == "ok") or low):
+            # «молчит» из‑за пустой очереди / неверного текста — не выгонять из слота,
+            # а пересобрать. Иначе rebalance только освобождает слоты и чат затихает.
+            if status == SILENT and (
+                f is None
+                or f.scheduled_count is None
+                or int(f.scheduled_count or 0) < need
+            ):
+                status = WORKING
                 unscheduled.append(aid)
+            statuses[aid] = status
+            if status == WORKING and (not (st and st.status == "ok") or low):
+                if aid not in unscheduled:
+                    unscheduled.append(aid)
         # слоты мёртвых/удалённых/без сессии — всегда освобождаем
         for aid in current:
             if aid not in accounts:
